@@ -1,0 +1,3 @@
+[submodule "vendored/walgit"]
+	path = vendored/walgit
+	url = https://github.com/tobi/walgit
