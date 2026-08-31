@@ -16,6 +16,15 @@
           pkgs.lldb
           pkgs.sccache
           pkgs.cargo-nextest
+          # walgit: web build + git server + dev tooling
+          pkgs.just
+          pkgs.git
+          pkgs.git-lfs
+          pkgs.nodejs_24
+          pkgs.pnpm
+          pkgs.jq
+          pkgs.ripgrep
+          pkgs.fd
         ]
         ++ lib.optionals pkgs.stdenv.isLinux [pkgs.wild];
 
