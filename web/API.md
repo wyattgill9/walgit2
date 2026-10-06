@@ -355,7 +355,7 @@ Directory listing (one round trip for the repo home).
   "path": "proto",
   "entries": [
     { "name": "pb", "type": "tree", "mode": "040000", "size": -1, "sha": "…" },
-    { "name": "gitwal.proto", "type": "blob", "mode": "100644", "size": 4821, "sha": "…" }
+    { "name": "gitwal.proto", "type": "blob", "mode": "100644", "size": 4821, "sha": "…", "updated": "2026-10-05T19:01:02-07:00" }
   ],
   "commit": { …Commit… },
   "readme": { "name": "README.md", "contents": "# …" }
@@ -366,6 +366,10 @@ Directory listing (one round trip for the repo home).
 - `entries`: sorted **directories first**, then by name (byte order).
   `type` is `blob | tree | commit` (submodule). `mode` is the git mode
   string. `size` is `-1` for trees/submodules. `[]` for an empty tree.
+  `updated` (optional, per entry): committer date (ISO 8601) of the newest
+  commit on `ref` that changed anything under the entry, from one bounded
+  history walk for the whole listing (§5: never a call per entry). Omitted
+  when the walk did not reach it.
 - `commit` (optional): the newest commit touching `path` on `ref`
   (`git log -1 ref -- path`); shown in the tree header. Omit if unknown.
 - `readme` (optional): contents of the first entry named (case-insensitive)

@@ -83,6 +83,8 @@ export interface TreeEntry {
   mode: string;
   size: number;
   sha: string;
+  /** Committer date (ISO 8601) of the newest commit that changed this entry, when known. */
+  updated?: string;
 }
 export interface Tree {
   ref: string;

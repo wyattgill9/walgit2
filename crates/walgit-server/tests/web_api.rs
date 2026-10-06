@@ -378,6 +378,18 @@ async fn api_md_conformance() -> TestResult {
         .to_string();
     conformance(&server, &src, &head, &feature, &v1_peeled).await?;
 
+    // Local repos date every entry (`updated`, optional in API.md, so not in `conformance`):
+    // one bounded log walk, newest commit under each entry. Attribution order is unit-tested in
+    // api.rs (`attribute_dates`); the fixture's commits share one second.
+    let tree = json(&server, "/o/r/api/tree/main").await?;
+    for e in tree["entries"].as_array().unwrap() {
+        assert!(e["updated"].is_string(), "undated entry: {e}");
+    }
+    let inner = json(&server, "/o/r/api/tree/main/src/inner").await?;
+    let src_entry = &tree["entries"][1];
+    assert_eq!(src_entry["name"], "src");
+    assert_eq!(src_entry["updated"], inner["commit"]["commit_date"]);
+
     // unknown repo
     assert_eq!(get(&server, "/o/nope/api/refs").await?.0, 404);
     // page route -> index.html

@@ -3,7 +3,7 @@ import { api } from "../api";
 import { useResolved } from "../use-resolved";
 import { useRepo } from "./RepoLayout";
 import { Box } from "../components/Layout";
-import { fmtSize, relTime } from "../format";
+import { relTime } from "../format";
 import { RefBar } from "../components/RefBar";
 import { Markdown } from "../components/Markdown";
 import { Avatar } from "../components/CommitRow";
@@ -74,7 +74,9 @@ function TreeView({ full, rest }: { full: string; rest: string }) {
                     </Link>
                   )}
                 </td>
-                <td className="muted small right">{e.size >= 0 ? fmtSize(e.size) : ""}</td>
+                <td className="muted small right" title={e.updated}>
+                  {e.updated ? relTime(e.updated) : ""}
+                </td>
               </tr>
             ))}
           </tbody>

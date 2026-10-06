@@ -130,6 +130,10 @@ struct TreeEntry {
     mode: String,
     size: i64,
     sha: String,
+    /// Committer date (ISO 8601) of the newest commit that changed this entry; omitted when the
+    /// bounded history walk did not reach it (and, for now, on remote-pack repositories).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated: Option<String>,
 }
 #[derive(Serialize)]
 struct Blob {
@@ -907,9 +911,11 @@ async fn render_tree(
             mode: String::from_utf8_lossy(fields[0]).to_string(),
             size,
             sha: String::from_utf8_lossy(fields[2]).to_string(),
+            updated: None,
         });
     }
     sort_entries(&mut entries);
+    date_entries(local, &res.sha, &res.path, &mut entries).await;
     let commit = newest_commit(local, &res.sha, &res.path)
         .await
         .ok()
@@ -932,6 +938,79 @@ async fn render_tree(
         commit,
         readme,
     }))
+}
+
+/// Commits scanned to date a listing's entries; entries not reached stay undated.
+const UPDATED_BUDGET: usize = 3_000;
+
+/// Date each entry by the newest commit that changed anything under it: one bounded
+/// `git log --name-only` over `path`'s history (API.md §5: one batched call, never one per entry).
+/// Best effort — a failed or exhausted walk leaves entries undated.
+async fn date_entries(
+    local: &walgit_git::LocalRepo,
+    sha: &str,
+    path: &str,
+    entries: &mut [TreeEntry],
+) {
+    let mut a: Vec<String> = vec![
+        // Unquoted names, so non-ASCII paths match their entry.
+        "-c".into(),
+        "core.quotePath=false".into(),
+        "log".into(),
+        format!("-n{UPDATED_BUDGET}"),
+        "--format=%x1e%cI".into(),
+        "--name-only".into(),
+        "--no-renames".into(),
+        sha.into(),
+    ];
+    if !path.is_empty() {
+        a.push("--".into());
+        a.push(path.into());
+    }
+    let Ok(out) = git(local, a).await else {
+        return;
+    };
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    let dates = attribute_dates(&String::from_utf8_lossy(&out), path, &names);
+    for (e, d) in entries.iter_mut().zip(dates) {
+        e.updated = d;
+    }
+}
+
+/// `log` is `git log --format=%x1e%cI --name-only` output (newest first) for `path`; returns,
+/// per name in `names`, the date of the first commit that names a file under it.
+fn attribute_dates(log: &str, path: &str, names: &[&str]) -> Vec<Option<String>> {
+    let prefix = if path.is_empty() {
+        String::new()
+    } else {
+        format!("{path}/")
+    };
+    let index: std::collections::HashMap<&str, usize> =
+        names.iter().enumerate().map(|(i, n)| (*n, i)).collect();
+    let mut dates = vec![None; names.len()];
+    let mut left = names.len();
+    for record in log.split('\x1e').skip(1) {
+        let mut lines = record.lines();
+        let Some(date) = lines.next() else {
+            continue;
+        };
+        for file in lines.filter(|l| !l.is_empty()) {
+            let Some(rest) = file.strip_prefix(prefix.as_str()) else {
+                continue;
+            };
+            let name = rest.split('/').next().unwrap_or(rest);
+            if let Some(&i) = index.get(name)
+                && dates[i].is_none()
+            {
+                dates[i] = Some(date.to_string());
+                left -= 1;
+            }
+        }
+        if left == 0 {
+            break;
+        }
+    }
+    dates
 }
 
 fn sort_entries(entries: &mut [TreeEntry]) {
@@ -999,6 +1078,9 @@ async fn render_tree_remote(remote: &Remote, res: &Resolved) -> Result<bytes::By
                 mode: format!("{:06o}", e.mode.kind() as u16),
                 size,
                 sha: e.oid.to_string(),
+                // ponytail: undated on remote-pack repos; dating every entry means faulting a
+                // tree per walked commit from the bucket. Generalize newest_touching if wanted.
+                updated: None,
             }
         })
         .buffer_unordered(32)
@@ -1435,5 +1517,28 @@ mod tests {
         assert_eq!(super::normalize_rename("a/{ => sub}/x.rs"), "a/sub/x.rs");
         assert_eq!(super::normalize_rename("old.rs => new.rs"), "new.rs");
         assert_eq!(super::normalize_rename("plain.rs"), "plain.rs");
+    }
+
+    #[test]
+    fn attribute_dates_takes_the_newest_commit_under_each_entry() {
+        // Newest first, as `git log` prints it; `src` changes in commits 3 and 1, `a.txt` only in 1.
+        let log = "\x1e2026-03-03T00:00:00Z\n\nsrc/x.rs\n\
+                   \x1e2026-02-02T00:00:00Z\n\nREADME.md\n\
+                   \x1e2026-01-01T00:00:00Z\n\nsrc/y.rs\na.txt\nREADME.md\n";
+        assert_eq!(
+            super::attribute_dates(log, "", &["src", "README.md", "a.txt", "never"]),
+            vec![
+                Some("2026-03-03T00:00:00Z".into()),
+                Some("2026-02-02T00:00:00Z".into()),
+                Some("2026-01-01T00:00:00Z".into()),
+                None,
+            ]
+        );
+        // In a subdirectory, names are relative to it and siblings outside it are ignored.
+        let log = "\x1e2026-05-05T00:00:00Z\n\nsrc/inner/z.rs\nsrcx/q\n";
+        assert_eq!(
+            super::attribute_dates(log, "src", &["inner", "q"]),
+            vec![Some("2026-05-05T00:00:00Z".into()), None]
+        );
     }
 }
