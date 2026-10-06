@@ -127,6 +127,11 @@ export function RefBar({
               {list.loading && shown.length === 0 && <li className="muted">Loading…</li>}
               {list.more && <li className="muted small">Showing first {shown.length}; type to narrow</li>}
             </ul>
+            {tab === "branches" && (
+              <Link to={`/${full}/branches`} className="menu-foot" onClick={() => setOpen(false)}>
+                View all branches
+              </Link>
+            )}
           </div>
         )}
       </div>
