@@ -1,9 +1,9 @@
-//! HTTP serving of immutable store objects (bundles, LFS objects, packs) with
+//! HTTP serving of immutable store objects (LFS objects, packs) with
 //! the complete conditional/range contract a CDN or `git` expects:
 //!
-//! * strong `ETag` = the store version (GCS generation / S3 ETag), quoted;
+//! * strong `ETag` = the store version (GCS generation / S3 `ETag`), quoted;
 //! * `If-None-Match` (list or `*`) → `304` with the same validators;
-//! * `If-Range` (ETag or ignored date) gating `Range`;
+//! * `If-Range` (`ETag` or ignored date) gating `Range`;
 //! * single byte ranges incl. open-ended (`bytes=N-`) and suffix (`bytes=-N`),
 //!   `206` + `Content-Range`, `416` + `Content-Range: bytes */total`;
 //! * `HEAD` answered from metadata (no body download);
@@ -136,17 +136,13 @@ fn if_none_match_hit(headers: &HeaderMap, version: &Version) -> bool {
     tags.iter().any(|t| t == "*" || t == cur)
 }
 
-/// `If-Range`: if it names an ETag that does not match the current version the
+/// `If-Range`: if it names an `ETag` that does not match the current version the
 /// range is ignored and the full body is sent (RFC 9110 §13.1.5). Dates are
 /// not supported (we have no `Last-Modified`) and therefore also ignored.
 fn if_range_allows(headers: &HeaderMap, version: &Version) -> bool {
-    match headers.get(header::IF_RANGE).and_then(|v| v.to_str().ok()) {
+    match headers.get(header::IF_RANGE) {
         None => true,
-        Some(v) if v.contains('"') => {
-            v.trim().trim_start_matches("W/").trim_matches('"')
-                == version.as_str().trim_matches('"')
-        }
-        Some(_) => false,
+        Some(value) => value.to_str().is_ok_and(|v| v.trim() == etag_of(version)),
     }
 }
 
@@ -189,13 +185,13 @@ fn base_headers(resp: &mut Response, meta: &ObjectMeta, opts: &ServeOptions<'_>)
     h.insert(header::CACHE_CONTROL, cache_control(opts));
     h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     h.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
-    if let Some(name) = opts.filename {
-        if let Ok(v) = HeaderValue::from_str(&format!(
+    if let Some(name) = opts.filename
+        && let Ok(v) = HeaderValue::from_str(&format!(
             "attachment; filename=\"{}\"",
             name.replace('"', "")
-        )) {
-            h.insert(header::CONTENT_DISPOSITION, v);
-        }
+        ))
+    {
+        h.insert(header::CONTENT_DISPOSITION, v);
     }
 }
 
@@ -241,50 +237,48 @@ pub async fn serve(
     // Edge offload: the nginx in front told us it honours X-Accel-Redirect. We
     // still do auth (the caller did), existence, strong validators and 304 here;
     // nginx fetches the object with its own credentials, slices Range itself and
-    // caches the bytes on its disk, so a 32 GB bundle never ties up a worker on
+    // caches the bytes on its disk, so a large static object never ties up a worker on
     // this instance. HEAD stays local (metadata only, nothing to offload).
     if opts.accel
         && !head
         && accel_requested(headers)
         && opts.peer.is_some_and(|p| p.ip().is_loopback())
+        && let Some(target) = store.accel_target(key).await
     {
-        if let Some(target) = store.accel_target(key).await {
-            let meta = match store.head(key).await {
-                Ok(Some(m)) => m,
-                Ok(None) => return Err(ApiError::NotFound(format!("{key} not found"))),
-                Err(e) => return Err(e.into()),
-            };
-            if if_none_match_hit(headers, &meta.version) {
-                return Ok(not_modified(&meta.version, &opts));
-            }
-            let mut resp = StatusCode::OK.into_response();
-            base_headers(&mut resp, &meta, &opts);
-            let h = resp.headers_mut();
-            let hv = |s: &str| {
-                HeaderValue::from_str(s)
-                    .map_err(|e| ApiError::Internal(format!("accel header: {e}")))
-            };
-            h.insert("x-accel-redirect", HeaderValue::from_static(ACCEL_LOCATION));
-            // Where and how the edge fetches. nginx keeps the upstream headers of this answer
-            // across the internal redirect and never forwards them to the client.
-            h.insert("x-walgit-store-url", hv(&target.url)?);
-            if let Some(auth) = &target.authorization {
-                h.insert("x-walgit-store-authorization", hv(auth)?);
-            }
-            // The edge's cache key: the object, not the (possibly presigned, changing) URL.
-            h.insert(
-                "x-walgit-store-key",
-                hv(&walgit_store::util::encode_path(key))?,
-            );
-            h.insert("x-walgit-accel", HeaderValue::from_static(store.backend()));
-            // nginx keeps only Content-Type/Disposition, Accept-Ranges, Cache-Control and Expires
-            // of this answer across the internal redirect and would otherwise hand the client
-            // the bucket's ETag (md5/crc form) — different from the version ETag our HEAD/304 use,
-            // so `If-Range` would fail and a resumed download get the whole object. The edge
-            // re-emits this header as the response ETag and hides the bucket's.
-            h.insert("x-walgit-etag", etag_of(&meta.version));
-            return Ok(resp);
+        let meta = match store.head(key).await {
+            Ok(Some(m)) => m,
+            Ok(None) => return Err(ApiError::NotFound(format!("{key} not found"))),
+            Err(e) => return Err(e.into()),
+        };
+        if if_none_match_hit(headers, &meta.version) {
+            return Ok(not_modified(&meta.version, &opts));
         }
+        let mut resp = StatusCode::OK.into_response();
+        base_headers(&mut resp, &meta, &opts);
+        let h = resp.headers_mut();
+        let hv = |s: &str| {
+            HeaderValue::from_str(s).map_err(|e| ApiError::Internal(format!("accel header: {e}")))
+        };
+        h.insert("x-accel-redirect", HeaderValue::from_static(ACCEL_LOCATION));
+        // Where and how the edge fetches. nginx keeps the upstream headers of this answer
+        // across the internal redirect and never forwards them to the client.
+        h.insert("x-walgit-store-url", hv(&target.url)?);
+        if let Some(auth) = &target.authorization {
+            h.insert("x-walgit-store-authorization", hv(auth)?);
+        }
+        // The edge's cache key: the object, not the (possibly presigned, changing) URL.
+        h.insert(
+            "x-walgit-store-key",
+            hv(&walgit_store::util::encode_path(key))?,
+        );
+        h.insert("x-walgit-accel", HeaderValue::from_static(store.backend()));
+        // nginx keeps only Content-Type/Disposition, Accept-Ranges, Cache-Control and Expires
+        // of this answer across the internal redirect and would otherwise hand the client
+        // the bucket's ETag (md5/crc form) — different from the version ETag our HEAD/304 use,
+        // so `If-Range` would fail and a resumed download get the whole object. The edge
+        // re-emits this header as the response ETag and hides the bucket's.
+        h.insert("x-walgit-etag", etag_of(&meta.version));
+        return Ok(resp);
     }
 
     // HEAD and Range both need the size before deciding what to fetch. For
@@ -466,6 +460,10 @@ mod tests {
         h.insert(header::IF_RANGE, HeaderValue::from_static("\"123\""));
         assert!(if_range_allows(&h, &Version::new("123")));
         assert!(!if_range_allows(&h, &Version::new("124")));
+        for value in ["W/\"123\"", "123", "\"\"123\"\"", "\"123\", \"124\""] {
+            h.insert(header::IF_RANGE, HeaderValue::from_str(value).unwrap());
+            assert!(!if_range_allows(&h, &Version::new("123")), "{value}");
+        }
         h.insert(
             header::IF_RANGE,
             HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),

@@ -55,7 +55,12 @@ async fn assets_have_content_type_and_immutable_cache() -> Result<()> {
     let marker = "/_ui/assets/";
     let asset = index
         .split('"')
-        .find(|part| part.starts_with(marker) && part.ends_with(".js"))
+        .find(|part| {
+            part.starts_with(marker)
+                && std::path::Path::new(part)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("js"))
+        })
         .expect("built index references a JavaScript asset");
     let response = client
         .get(format!("{}{}", server.base_url, asset))
@@ -95,7 +100,6 @@ async fn overview_reports_push_and_unknown_repo_is_text_404() -> Result<()> {
     assert_eq!(body["repo"], "o/r");
     assert!(body["manifest"]["next_seq"].as_u64().unwrap() >= 2);
     assert!(body["packs"]["pushes"].as_u64().unwrap() >= 1);
-    assert!(body["bundles"].is_array());
     assert!(body["compactions"].is_array());
 
     let missing = client

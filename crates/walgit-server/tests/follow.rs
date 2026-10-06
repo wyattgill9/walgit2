@@ -9,7 +9,7 @@ use harness::{Server, git, git_in};
 
 macro_rules! step {
     ($name:literal, $e:expr) => {
-        tokio::time::timeout(std::time::Duration::from_secs(60), $e)
+        tokio::time::timeout(std::time::Duration::from_mins(1), $e)
             .await
             .unwrap_or_else(|_| panic!("step timed out: {}", $name))
     };
@@ -64,8 +64,7 @@ async fn follows_upstream_refs_through_the_wal_fast_forward_only() -> anyhow::Re
             c.server.roles = vec![walgit_config::Role::Serve, walgit_config::Role::Maintain];
             c.upstream.git = Some(up_url.clone());
             c.upstream.follow = vec!["refs/heads/main".into(), "refs/tags/v1".into()];
-            c.compaction.enabled = false;
-            c.bundles.enabled = false;
+            c.packs.enabled = false;
             c.wal.snapshot_every_entries = 0;
         })
     )?;
@@ -206,8 +205,7 @@ async fn start_op(
     )
     .await
     {
-        Ok(t) => Ok(t),
-        Err(walgit_server::ops::StartError::AlreadyRunning(t)) => Ok(t),
+        Ok(t) | Err(walgit_server::ops::StartError::AlreadyRunning(t)) => Ok(t),
         Err(walgit_server::ops::StartError::UnknownOp) => Err("unknown op".into()),
     }
 }

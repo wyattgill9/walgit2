@@ -6,7 +6,7 @@ use walgit_store::{GetOptions, GetResult, ObjectStore};
 use crate::error::WalError;
 use crate::handle::RepoHandle;
 
-/// Read log entries in [from_seq, to_seq]. If `to_seq` is None, read up to
+/// Read log entries in [`from_seq`, `to_seq`]. If `to_seq` is None, read up to
 /// `manifest.head_seq`.
 pub(crate) async fn read_log_impl(
     handle: &RepoHandle,
@@ -17,11 +17,20 @@ pub(crate) async fn read_log_impl(
     // lock-free conditional GET and use whichever manifest is newer. Taking
     // the repo's write lock here would deadlock callers that hold a read
     // guard (overview, tests), and freshness_ttl=0 makes that the common case.
-    let known = handle.manifest_version.lock().clone();
-    let manifest = match crate::sync::freshness_check(&handle.store, &known).await? {
-        crate::sync::SyncOutcome::Unchanged => handle.manifest.read().clone(),
-        crate::sync::SyncOutcome::Changed { manifest, .. } => std::sync::Arc::new(manifest),
+    let (held, known) = handle.manifest_pair();
+    let manifest = match crate::sync::freshness_check(&handle.store, known.as_ref()).await? {
+        crate::sync::SyncOutcome::Unchanged => held,
+        crate::sync::SyncOutcome::Changed { manifest, .. } => manifest,
     };
+    read_log_manifest(handle, &manifest, from_seq, to_seq).await
+}
+
+pub(crate) async fn read_log_manifest(
+    handle: &RepoHandle,
+    manifest: &walgit_proto::v1::Manifest,
+    from_seq: u64,
+    to_seq: Option<u64>,
+) -> Result<Vec<LogEntry>, WalError> {
     let head_seq = manifest.head_seq;
     let to = to_seq.unwrap_or(head_seq).min(head_seq);
 
@@ -41,7 +50,11 @@ pub(crate) async fn read_log_impl(
         let res = handle.store.get(&seg.key, GetOptions::default()).await?;
         let bytes = match res {
             GetResult::Object { meta, body } => {
-                walgit_store::util::collect(body, meta.size as usize).await?
+                walgit_store::util::collect(
+                    body,
+                    usize::try_from(meta.size).map_err(|e| WalError::Corrupt(e.to_string()))?,
+                )
+                .await?
             }
             GetResult::NotModified { .. } => continue,
         };
@@ -81,6 +94,9 @@ pub async fn refs_at_seq(
     seq: u64,
 ) -> Result<walgit_proto::v1::RefSnapshot, WalError> {
     let manifest = handle.manifest();
+    if seq > manifest.head_seq {
+        return Err(WalError::Corrupt(format!("future refs sequence {seq}")));
+    }
     let cp_ok = manifest.checkpoint.as_ref().is_some_and(|cp| cp.seq <= seq);
     if !cp_ok && manifest.min_seq > 1 && manifest.min_seq > seq {
         return Err(WalError::Corrupt(format!(
@@ -100,8 +116,6 @@ async fn replay_refs(
     handle: &super::handle::RepoHandle,
     cut: Cut,
 ) -> Result<(walgit_proto::v1::RefSnapshot, u64), WalError> {
-    use prost::Message;
-    use walgit_store::ObjectStoreExt;
     let manifest = handle.manifest();
     // Start point: checkpoint ≤ cut (checkpoint created_at on the ref; when
     // the ref has no timestamp, fall back to replaying from seq 0).
@@ -118,19 +132,14 @@ async fn replay_refs(
                 handle.learn_checkpoint_times().await?;
                 let times = handle.checkpoint_times();
                 let cp_time = times.and_then(|t| t.as_of.or(t.created_at));
-                cp_time.map(|t| t <= at).unwrap_or(false)
+                cp_time.is_some_and(|t| t <= at)
             }
         };
         if usable {
-            if let Some((_, bytes)) = handle.store().get_bytes(&cp.key).await? {
-                let cpo = walgit_proto::v1::Checkpoint::decode(bytes.as_ref())
-                    .map_err(|e| WalError::Corrupt(format!("checkpoint decode: {e}")))?;
-                if let Some((_, rb)) = handle.store().get_bytes(&cpo.refs_key).await? {
-                    snap = walgit_proto::v1::RefSnapshot::decode(rb.as_ref())
-                        .map_err(|e| WalError::Corrupt(format!("refs decode: {e}")))?;
-                    from_seq = cp.seq;
-                }
-            }
+            snap =
+                crate::snapshots::checkpoint_snapshot(handle.store(), cp, &manifest.object_format)
+                    .await?;
+            from_seq = cp.seq;
         } else if manifest.min_seq > 1 {
             // History before the checkpoint is folded and the checkpoint is
             // newer than the cut: the best we can do is the checkpoint state
@@ -142,7 +151,7 @@ async fn replay_refs(
         Cut::Seq(seq) => Some(seq),
         Cut::Time(_) => None,
     };
-    let entries = handle.read_log(from_seq + 1, to_seq).await?;
+    let entries = read_log_manifest(handle, &manifest, from_seq + 1, to_seq).await?;
     let mut map: std::collections::BTreeMap<String, walgit_proto::v1::Ref> =
         snap.refs.into_iter().map(|r| (r.name.clone(), r)).collect();
     let mut head_target = snap.head_target;
@@ -151,7 +160,7 @@ async fn replay_refs(
         match cut {
             Cut::Time(at) => {
                 let t = e.created_at.as_ref().map(walgit_proto::time::to_system);
-                if t.map(|t| t > at).unwrap_or(false) {
+                if t.is_some_and(|t| t > at) {
                     break;
                 }
             }
@@ -165,7 +174,7 @@ async fn replay_refs(
             for u in &txn.updates {
                 if !u.new_symbolic_target.is_empty() {
                     if u.name == "HEAD" {
-                        head_target = u.new_symbolic_target.clone();
+                        head_target.clone_from(&u.new_symbolic_target);
                     }
                     continue;
                 }

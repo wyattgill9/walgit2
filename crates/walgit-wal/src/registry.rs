@@ -1,4 +1,5 @@
-//! Registry: process-wide map of RepoId -> Arc<RepoHandle>.
+//! Registry: process-wide map of `RepoId` -> Arc<RepoHandle>.
+#![allow(clippy::unnecessary_wraps)]
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -95,24 +96,29 @@ impl Registry {
         let prefixed = Prefixed::new(self.store.clone(), prefix);
 
         // Read manifest (NotFound if absent)
-        let (meta, manifest) = match get_message::<Manifest>(&prefixed, keys::MANIFEST).await? {
-            Some(v) => v,
-            None => return Err(WalError::NotFound),
+        let Some((meta, manifest)) = get_message::<Manifest>(&prefixed, keys::MANIFEST).await?
+        else {
+            return Err(WalError::NotFound);
         };
 
+        crate::validate_manifest(&manifest)?;
+
         // Open or init local repo (LocalRepo joins owner/name.git onto the root).
-        let local = match LocalRepo::open(&self.cache_root, id)? {
-            Some(l) => l,
-            None => {
-                let format = parse_object_format(&manifest.object_format);
-                LocalRepo::init(&self.cache_root, id, format)?
-            }
+        let local = if let Some(l) = LocalRepo::open(&self.cache_root, id)? {
+            l
+        } else {
+            let format = parse_object_format(&manifest.object_format);
+            LocalRepo::init(&self.cache_root, id, format)?
         };
 
         // Load state
-        let state = load_state(local.path());
+        let mut state = load_state(local.path());
+        // A persisted readiness counter is not evidence that inherited files
+        // are intact. Reconcile nonempty inventories once after process open.
+        state.packs_revision = 0;
 
-        let state_is_behind = state.applied_seq < manifest.head_seq;
+        let state_is_behind =
+            state.applied_seq < manifest.head_seq || state.revision != manifest.revision;
         let manifest_version = meta.version.clone();
 
         let handle = RepoHandle::new(
@@ -138,6 +144,10 @@ impl Registry {
             crate::sync::apply_delta(&handle, &manifest, &manifest_version).await?;
         }
 
+        if manifest.packs.is_empty() {
+            let mut state = handle.state.lock();
+            state.packs_revision = state.revision;
+        }
         self.repos.insert(id.clone(), handle.clone());
         Ok(handle)
     }
@@ -183,7 +193,7 @@ impl Registry {
         Ok(())
     }
 
-    /// CAS-create manifest.pb (PutMode::Create). Err(AlreadyExists) on 412.
+    /// CAS-create manifest.pb (`PutMode::Create`). Err(AlreadyExists) on 412.
     pub async fn create(
         &self,
         id: &RepoId,
@@ -215,6 +225,7 @@ impl Registry {
             writer: crate::handle::instance_id(),
             revision: 1,
             settings: None,
+            retired_packs: Vec::new(),
         };
 
         let buf = manifest.encode_to_vec();
@@ -230,7 +241,12 @@ impl Registry {
                 // Init local repo
                 let local = LocalRepo::init(&self.cache_root, id, format)?;
 
-                let state = RepoState::default();
+                let state = RepoState {
+                    manifest_version: Some(meta.version.as_str().to_string()),
+                    revision: manifest.revision,
+                    packs_revision: manifest.revision,
+                    ..Default::default()
+                };
                 save_state(local.path(), &state)?;
 
                 let handle = RepoHandle::new(
@@ -341,8 +357,21 @@ impl Registry {
         Ok(repos)
     }
 
-    /// Disk cache maintenance: evict idle repos beyond cache.max_bytes / evict_idle_after.
-    pub async fn evict_idle(&self) -> Result<EvictReport, WalError> {
+    /// Disk cache maintenance: evict idle repos beyond `cache.max_bytes` / `evict_idle_after`.
+    pub async fn evict_idle(self: &Arc<Self>) -> Result<EvictReport, WalError> {
+        let registry = Arc::clone(self);
+        tokio::task::spawn_blocking(move || registry.evict_idle_blocking())
+            .await
+            .map_err(|e| WalError::Corrupt(format!("cache eviction task: {e}")))?
+    }
+
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "Disk watermarks are approximate nonnegative fractions, with truncation to whole bytes"
+    )]
+    fn evict_idle_blocking(&self) -> Result<EvictReport, WalError> {
         let evict_after = self.cfg.cache.evict_idle_after;
         // D25: budget mode evicts past `cache.max_bytes`; disk mode only under
         // disk pressure (filesystem of `cache.dir` above `disk_high_watermark`)
@@ -385,7 +414,7 @@ impl Registry {
 
         // Collect idle repos. In-use checks happen again while evicting: a
         // request may acquire a ReadGuard after this snapshot.
-        for entry in self.repos.iter() {
+        for entry in &self.repos {
             let handle = entry.value();
             let last_access = handle.last_access();
             if now.duration_since(last_access) > evict_after {
@@ -465,12 +494,20 @@ fn dir_size(path: &std::path::Path) -> u64 {
 }
 
 /// (used, total) bytes of the filesystem holding `path` (statvfs).
+// statvfs's block fields are u32 on macOS and u64 on Linux, so `as u64` is the one spelling
+// that is lossless on both; `From` would be a useless conversion on Linux.
+#[allow(clippy::cast_lossless)]
 fn disk_usage(path: &std::path::Path) -> Option<(u64, u64)> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let c = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs is a C integer struct; all-zero is a valid initialized value.
+    #[allow(unsafe_code)]
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+    // SAFETY: c is NUL-terminated and live; st is aligned writable storage for statvfs.
+    #[allow(unsafe_code)]
+    let result = unsafe { libc::statvfs(c.as_ptr(), &raw mut st) };
+    if result != 0 {
         return None;
     }
     let total = st.f_blocks as u64 * st.f_frsize as u64;

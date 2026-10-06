@@ -5,8 +5,8 @@
     lib,
     ...
   }: let
-    # Only the cargo inputs go into the rust build — vendored/ (the upstream
-    # submodule) and web/ are deliberately excluded so the sandbox stays lean.
+    # Only the cargo inputs go into the rust build — docs/ and web/ are
+    # deliberately excluded so the sandbox stays lean.
     src = lib.fileset.toSource {
       root = ../.;
       fileset = lib.fileset.unions [
@@ -95,7 +95,7 @@
         '';
 
         meta = {
-          description = "git hosting on an object store: smart HTTP, bundle-uri, LFS, web UI — one binary";
+          description = "git hosting on an object store: smart HTTP, packfile-uri, LFS, web UI — one binary";
           mainProgram = "walgit";
           license = lib.licenses.mit;
         };

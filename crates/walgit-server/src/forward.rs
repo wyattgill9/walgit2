@@ -2,9 +2,9 @@
 //! writer that batches the manifest CAS for many small repositories.
 //!
 //! The request body and broker response are deliberately kept as streams.  A
-//! front falls back to its local receive-pack path only when no broker response
-//! was obtained, or when the broker explicitly reports a gateway-unavailable
-//! status before a response body is consumed.
+//! front falls back only before delivery (preflight or connection failure).
+//! A gateway response or loss after connection can follow a committed push;
+//! neither permits local replay. Redirects and transport retries are disabled.
 //!
 //! The hop authenticates with `wal.push_broker_token` (or `WALGIT_BROKER_TOKEN`):
 //! a static token the broker lists under `server.auth.tokens` with `write = true`
@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use axum::{
     body::Body,
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, header},
     response::Response,
 };
 use futures::StreamExt;
@@ -26,11 +26,10 @@ use crate::{auth::Principal, repo::RepoRoute};
 pub enum ForwardOutcome {
     /// A broker response was obtained and can be returned to the Git client.
     Response(Response),
-    /// The broker was not reached or returned a gateway-unavailable response.
-    /// The caller still owns the body only when the broker was not reached before
-    /// any bytes were sent; smart.rs therefore buffers only the local fallback
-    /// path and never retries after an acknowledged broker request.
+    /// No request was delivered; a buffered body may be handled locally.
     Fallback,
+    /// Delivery may have occurred. Never replay the body locally.
+    Ambiguous,
 }
 
 /// Stream one receive-pack request to the broker and stream its response back.
@@ -51,10 +50,16 @@ pub async fn receive_pack(
         route.id.owner(),
         route.id.name()
     );
-    let client = reqwest::Client::new();
-    let stream = body.into_data_stream().map(|chunk| {
-        chunk.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-    });
+    let Ok(client) = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .build()
+    else {
+        return ForwardOutcome::Fallback;
+    };
+    let stream = body
+        .into_data_stream()
+        .map(|chunk| chunk.map_err(|e| std::io::Error::other(e.to_string())));
     let mut request = client
         .post(&endpoint)
         .body(reqwest::Body::wrap_stream(stream));
@@ -81,48 +86,41 @@ pub async fn receive_pack(
             .ok()
             .filter(|v| !v.is_empty())
             .or_else(|| broker_token.map(str::to_string).filter(|v| !v.is_empty()));
-        match token {
-            Some(token) => request = request.bearer_auth(token),
-            None => {
-                tracing::warn!(
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "push broker token unset (wal.push_broker_token / WALGIT_BROKER_TOKEN); falling back"
-                );
-                return ForwardOutcome::Fallback;
-            }
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        } else {
+            tracing::warn!(
+                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "push broker token unset (wal.push_broker_token / WALGIT_BROKER_TOKEN); falling back"
+            );
+            return ForwardOutcome::Fallback;
         }
     }
 
     let response = match request.send().await {
         Ok(response) => response,
         Err(error) => {
-            tracing::warn!(%error, elapsed_ms = started.elapsed().as_millis() as u64, "push broker unavailable; falling back");
-            return ForwardOutcome::Fallback;
+            let before_delivery = error.is_connect();
+            tracing::warn!(%error, before_delivery, elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX), "push broker request failed");
+            return if before_delivery {
+                ForwardOutcome::Fallback
+            } else {
+                ForwardOutcome::Ambiguous
+            };
         }
     };
-    if matches!(
-        response.status(),
-        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
-    ) {
-        tracing::warn!(
-            status = response.status().as_u16(),
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "push broker gateway failure; falling back"
-        );
-        return ForwardOutcome::Fallback;
-    }
-
     let status = response.status();
     let response_headers = response.headers().clone();
-    let stream = response.bytes_stream().map(|chunk| {
-        chunk.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-    });
+    let stream = response
+        .bytes_stream()
+        .map(|chunk| chunk.map_err(|e| std::io::Error::other(e.to_string())));
     let mut builder = Response::builder().status(status);
     for name in [
         header::CONTENT_TYPE,
         header::CONTENT_ENCODING,
         header::CACHE_CONTROL,
         header::ETAG,
+        header::RETRY_AFTER,
     ] {
         if let Some(value) = response_headers.get(&name) {
             builder = builder.header(name, value);
@@ -135,7 +133,7 @@ pub async fn receive_pack(
     metrics::counter!("walgit_push_forwarded_total", "outcome" => outcome).increment(1);
     tracing::info!(
         status = status.as_u16(),
-        elapsed_ms = started.elapsed().as_millis() as u64,
+        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "push broker response streamed"
     );
     ForwardOutcome::Response(output)

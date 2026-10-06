@@ -23,8 +23,8 @@ web-build:
 # hung test blocks for the whole timeout. Use `just e2e` / `just ci` below.
 test:
     {{t5}} cargo test --workspace --lib --bins
-    {{t5}} cargo test -p walgit-store -p walgit-git -p walgit-wal -p walgit-bundle --tests
-    {{t5}} cargo test -p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test maintain --test routing_prefix --test lfs_upstream --test drain
+    {{t10}} cargo test -p walgit-store -p walgit-git -p walgit-wal --tests
+    {{t10}} cargo test -p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test packfile_uri --test forward --test maintain --test routing_prefix --test lfs_upstream --test drain --test events --test follow --test policy
 
 # Smart-HTTP end-to-end against real git (≈ 20 s) — run when touching smart.rs/receive/upload-pack/wal.
 e2e *ARGS:
@@ -38,8 +38,10 @@ warnings:
         printf '%s\n' "$out"
         echo; echo "cargo build failed — fix the errors above"; exit 1
     fi
-    if printf '%s\n' "$out" | grep -qE '^warning: (unused|function|variable|field|method|struct|enum|never|dead|irrefutable|unreachable|value assigned|deprecated|trait|type|constant|static|associated)'; then
-        printf '%s\n' "$out" | grep -E '^warning' -A4 | grep -vE '^warning: `walgit-[a-z]+`'
+    # Strip ANSI escapes (CARGO_TERM_COLOR=always) so the anchored `^warning:` still matches.
+    plain="$(printf '%s\n' "$out" | sed $'s/\x1b\\[[0-9;]*m//g')"
+    if printf '%s\n' "$plain" | grep -qE '^warning: (unused|function|variable|field|method|struct|enum|never|dead|irrefutable|unreachable|value assigned|deprecated|trait|type|constant|static|associated)'; then
+        printf '%s\n' "$plain" | grep -E '^warning' -A4 | grep -vE '^warning: `walgit-[a-z]+`'
         echo; echo "rustc warnings present — fix them"; exit 1
     fi
     echo "no rustc warnings"
@@ -51,7 +53,16 @@ clippy:
     {{t15}} cargo clippy --workspace --all-targets -- -D warnings
 
 # Everything that must be green before a merge.
-ci: warnings clippy test e2e
+ci: warnings clippy test e2e sim smoke
+
+# Fault injection and recovery share process-wide test hooks; run serially.
+sim:
+    {{t15}} cargo test -p walgit-server --test sim -- --test-threads=1
+
+# Standalone CLI/server against memory; add WALGIT_TEST_S3_ENDPOINT for the local rig.
+smoke:
+    {{t15}} cargo build -p walgit-cli
+    WALGIT="$(realpath "${CARGO_TARGET_DIR:-target}/debug/walgit")" {{t15}} tests/e2e.sh
 
 # Slow tier: #[ignore]d benches/soaks (20k-ref push, 466k-ref render, ...).
 test-slow:
@@ -60,3 +71,13 @@ test-slow:
 # walgit-store contract against the in-memory backend.
 store-test:
     cargo test -p walgit-store --test contract -- memory_contract
+
+# Bounded contract checks and exact negative controls (Java 11+).
+spec:
+    scripts/run-spec.sh fast
+
+spec-fragments:
+    scripts/run-spec.sh fragments
+
+spec-full:
+    scripts/run-spec.sh full

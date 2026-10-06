@@ -2,6 +2,11 @@
 //! `WALGIT__SECTION__KEY=value` (double underscore = nesting), applied after
 //! the file is parsed. `PORT` (a serverless host) overrides `server.listen` port.
 
+pub mod packs;
+pub use packs::{DeltaBudget, FoldInventory, FoldReason, FreezeReason, PacksConfig};
+pub mod refs;
+pub use refs::{PackGroupConfig, PackGroupKind, RefsConfig};
+
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
@@ -11,13 +16,15 @@ pub use std::str::FromStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
+#[derive(Default)]
 pub struct Config {
     pub server: ServerConfig,
     pub store: StoreConfig,
     pub cache: CacheConfig,
     pub wal: WalConfig,
-    pub compaction: CompactionConfig,
-    pub bundles: BundlesConfig,
+    pub packs: PacksConfig,
+    pub refs: RefsConfig,
+    pub packfile_uri: PackfileUriConfig,
     pub maintenance: MaintenanceConfig,
     pub placement: PlacementConfig,
     pub lfs: LfsConfig,
@@ -48,17 +55,17 @@ pub struct ServerConfig {
     pub drain_timeout: Duration,
     /// Max size of a single pushed pack accepted over HTTP.
     pub max_push_bytes: ByteSize,
-    /// Roles this instance performs. a serverless host: fronts get ["serve"], the
-    /// single maintenance instance ["maintain"] (checkpoint / bundle / compact
-    /// loops over every repo; `compact` and `bundle` are its sub-roles). Empty = all.
+    /// Roles this instance performs. a serverless host: fronts get `["serve"]`, the
+    /// single maintenance instance `["maintain"]` (checkpoint / compact
+    /// loops over every repo; `compact` is its sub-role). Empty = all.
     pub roles: Vec<Role>,
     pub auth: AuthConfig,
-    /// Public base URL used when rendering absolute URIs (bundle lists, LFS).
+    /// Public base URL used when rendering absolute URIs (LFS, clone recipes).
     pub public_url: Option<String>,
     /// Create a repo on the first receive-pack push if it does not exist.
     pub auto_create_on_push: bool,
     /// Honour `X-Walgit-Capabilities: accel-redirect` from an nginx edge
-    /// (`deploy/nginx.conf.example`): static objects (bundles, LFS) are answered with
+    /// (`deploy/nginx.conf.example`): static objects (LFS) are answered with
     /// `X-Accel-Redirect: /_store/` + `X-Walgit-Store-Url` (and `-Authorization`) and no
     /// body, so nginx streams (and caches) the bytes itself. Only turn it on behind an
     /// edge that strips the capability header from clients: the answer carries a store
@@ -122,10 +129,8 @@ impl Default for TlsConfig {
 pub enum Role {
     Serve,
     Compact,
-    Bundle,
-    /// Background maintenance loop: checkpoint-if-due (refs-level), bundles-if-
-    /// due, geometric compaction for repos whose pack set fits. Implies
-    /// `Compact` + `Bundle`.
+    /// Background maintenance loop: checkpoints and geometric compaction
+    /// for repos whose pack set fits. Implies `Compact`.
     Maintain,
     /// The events bridge (`docs/EVENTS.md`): tails every repo's WAL from a
     /// per-repo cursor and publishes `ref` events to the bus sinks (webhook,
@@ -138,14 +143,15 @@ pub enum Role {
 #[serde(deny_unknown_fields, default)]
 pub struct AuthConfig {
     pub mode: AuthMode,
-    /// Allow unauthenticated read (upload-pack, bundles, web UI) when mode != none.
+    /// Allow unauthenticated read (upload-pack, LFS, web UI) when mode != none.
     pub anonymous_read: bool,
     /// Static tokens (`token` mode, and accepted in `oidc` mode too — for robots): token → principal.
     /// Presented as `Authorization: Bearer <token>` or as the password of HTTP Basic.
     pub tokens: Vec<StaticToken>,
     /// OIDC issuer (`oidc` mode). Discovery at `<issuer>/.well-known/openid-configuration`
     /// supplies the JWKS, authorization and token endpoints. Any compliant provider works
-    /// (Google, Microsoft Entra, Okta, Auth0, Keycloak, Dex, GitLab, ...).
+    /// (Google, Microsoft Entra, Okta, Auth0, Keycloak, Dex, GitLab, ...). No default:
+    /// `Config::validate` refuses `oidc` mode until it is set.
     pub issuer: String,
     /// Email domains accepted by `oidc` (the `email` claim, `email_verified` required).
     pub allowed_domains: Vec<String>,
@@ -199,7 +205,7 @@ pub enum AuthMode {
     None,
     /// Static tokens from the config (`tokens`), bearer or basic.
     Token,
-    /// OpenID Connect: browser sign-in through the issuer, ID tokens as bearers, plus
+    /// `OpenID` Connect: browser sign-in through the issuer, ID tokens as bearers, plus
     /// walgit-issued access tokens for git — and `tokens` for robots.
     Oidc,
 }
@@ -209,6 +215,7 @@ pub enum AuthMode {
 pub struct StaticToken {
     pub principal: String,
     /// Read from env var if set, else literal.
+    #[serde(default)]
     pub token: String,
     #[serde(default)]
     pub token_env: Option<String>,
@@ -253,7 +260,7 @@ pub struct GcsConfig {
     /// Service account for signed URLs; None = ADC/IAM signBlob.
     pub signing_service_account: Option<String>,
     /// Separate data clients (own channels) for bulk traffic — pack/idx/side-
-    /// file/bundle/LFS bytes and ranged reads — so the control plane
+    /// file/LFS bytes and ranged reads — so the control plane
     /// (manifest, log, checkpoint, lease GETs/PUTs) never queues behind a
     /// multi-GB download on a shared HTTP/2 connection.
     #[serde(default = "default_bulk_clients")]
@@ -313,8 +320,6 @@ pub struct CacheConfig {
     pub ref_advert_entries: usize,
     /// Max entries in the object-info (size/has) cache.
     pub object_info_entries: usize,
-    /// Max entries in the bundle list render cache.
-    pub bundle_list_entries: usize,
     /// Process-wide LRU of pack data blocks (1 MiB range reads) used when a
     /// repo's pack set does not fit `max_bytes` and objects are read straight
     /// from the object store.
@@ -338,6 +343,10 @@ pub struct CacheConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Independent configuration switches, not mutually exclusive states"
+)]
 pub struct WalConfig {
     /// Coalesce concurrent publishes to one repo within this window into one index CAS.
     #[serde(with = "humantime_serde")]
@@ -369,7 +378,7 @@ pub struct WalConfig {
     /// Skip the index freshness GET if the last check was younger than this (0 = always check).
     #[serde(with = "humantime_serde")]
     pub freshness_ttl: Duration,
-    /// After a refs-only sync (info/refs, ls-refs, bundle-uri, web refs) on a
+    /// After a refs-only sync (info/refs, ls-refs, web refs) on a
     /// copy whose packs are not yet reconciled, start downloading the packs in
     /// the background so the first fetch does not pay for it.
     pub prefetch_packs: bool,
@@ -449,12 +458,12 @@ fn default_all_repos() -> Vec<String> {
 impl Default for MaintenanceConfig {
     fn default() -> Self {
         MaintenanceConfig {
-            interval: Duration::from_secs(60),
+            interval: Duration::from_mins(1),
             checkpoints: true,
             max_pack_bytes: ByteSize::b(0),
             disk: MaintainerDisk::Tmpfs,
             host: None,
-            fsck_interval: Duration::from_secs(7 * 24 * 3600),
+            fsck_interval: Duration::from_hours(168),
             follow_interval: Duration::from_secs(30),
         }
     }
@@ -465,10 +474,11 @@ impl Default for MaintenanceConfig {
 /// * **serve**: object work — `git-upload-pack`, `git-receive-pack`, LFS transfer. A
 ///   host that does not serve a repo answers those with 503 + `Retry-After` (+ a band-3
 ///   line naming the host that does) *before* any sync or materialize; refs-level
-///   reads (info/refs, the API via the remote reader, UI, bundle list) stay available
+///   reads (info/refs, the API via the remote reader, UI) stay available
 ///   everywhere, so the edge's read-only fallback (D29) works.
-/// * **maintain**: the maintainer loop's units (checkpoints, bundles, compaction,
+/// * **maintain**: the maintainer loop's units (checkpoints, compaction,
 ///   fsck/repair) — only on hosts with the `maintain` role.
+///
 /// Placement is by rule, not by capacity: a repo is either this host's or not.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -502,152 +512,19 @@ impl PlacementConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct CompactionConfig {
-    pub enabled: bool,
-    /// Geometric factor between tiers.
-    pub factor: u32,
-    /// Compact when this many fresh (tier 0) packs exist.
-    pub trigger_packs: usize,
-    /// Or when fresh pack bytes exceed this.
-    pub trigger_bytes: ByteSize,
-    #[serde(with = "humantime_serde")]
-    pub lease_ttl: Duration,
-    /// Keep superseded packs and old index generations for this long (provenance/rewind).
-    #[serde(with = "humantime_serde")]
-    pub retention_superseded: Duration,
-    /// Use upstream git for delta compression (`git repack`); gix does not delta-compress.
-    pub engine: RepackEngine,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum RepackEngine {
-    #[default]
-    Git,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct BundlesConfig {
-    pub enabled: bool,
-    pub strategy: Vec<BundleStrategy>,
-    /// Minimum-size gate for **incremental** slots: a slot whose content
-    /// (commits on the bundle's refs since its base bundle's tips) has fewer
-    /// commits than this is not built (plan state `too-small`; the next slot of
-    /// the strategy is built on the same base, so nothing is lost). Fulls are
-    /// never gated. 0 = no gate. Per-strategy `min_commits` overrides.
-    #[serde(default = "default_min_commits")]
-    pub min_commits: u64,
-    /// Optional second guard: skip incrementals whose pack would be smaller
-    /// than this (0 = off).
-    #[serde(default)]
-    pub min_bytes: ByteSize,
-    pub serve_via: BundleServe,
-    #[serde(with = "humantime_serde")]
-    pub signed_url_ttl: Duration,
-    /// Advertise `bundle-uri` in protocol v2 capabilities.
-    pub advertise: bool,
-    /// Put the filtered families INTO the plain `bundles/list` and the v2
-    /// advertisement (with their `bundle.<id>.filter` lines) instead of only
-    /// at `bundles/list?filter=…`. Only for clients whose git matches
-    /// `bundle.<id>.filter` against the clone's filter (a patched Git client
-    /// patch, `docs/patches/`): stock git ignores the key and a full clone
-    /// would swallow the blobless bundles (design §6b). Default false.
-    #[serde(default)]
-    pub advertise_filtered: bool,
-    /// Repositories (`owner/name`, or `owner/*`) whose clones **must** go
-    /// through bundle-uri: a fetch with zero `have`s gets a pkt ERR / band-3
-    /// message with the exact fix instead of an impossible full pack. Fetches
-    /// with haves proceed normally.
-    #[serde(default)]
-    pub require: Vec<String>,
-    /// Repositories (`owner/name` | `owner/*`) whose bundle URIs are always
-    /// signed store URLs regardless of `serve_via`: clone bytes of the biggest
-    /// repos bypass the fronts entirely.
-    #[serde(default)]
-    pub signed_url_for: Vec<String>,
-    /// Default ref set of a bundle when a strategy has no `refs`: `HEAD` +
-    /// `refs/heads/main` when true (branches are tiny per-fetch deltas on top
-    /// of main; bundling every branch makes rebased branches *slower* to
-    /// fetch, not faster), `refs/heads/*` + `refs/tags/*` + `HEAD` when false.
-    #[serde(default = "default_true")]
-    pub main_only: bool,
-    /// Extra ref globs added to every bundle's default ref set (e.g. `refs/tags/v*`).
-    #[serde(default)]
-    pub extra_refs: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum BundleServe {
+pub enum LfsServe {
     #[default]
     Proxy,
     SignedUrl,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BundleStrategy {
-    pub name: String,
-    pub kind: BundleKind,
-    /// Cron expression (6 or 7 fields, `cron` crate syntax) or "@hourly"/"@daily"/"@weekly".
-    pub schedule: String,
-    /// For incremental: name of the strategy this one is based on.
-    #[serde(default)]
-    pub base: Option<String>,
-    /// Full strategies only: how many newest fulls stay listed (>= 1). Incrementals have
-    /// no knob — always the 2 newest whose base is kept (`walgit_bundle::slots::INCREMENTALS_KEPT`,
-    /// D21 amended 2026-08-22); setting `keep` on one is a configuration error.
-    #[serde(default)]
-    pub keep: usize,
-    /// Ref globs included in the bundle. Default: see `bundles.main_only`.
-    #[serde(default)]
-    pub refs: Vec<String>,
-    /// Backfill horizon: how many missing slots (oldest first) one maintainer
-    /// pass may build for this strategy (0 = unlimited). Keeps a long outage
-    /// from turning into hours of catch-up in one pass.
-    #[serde(default)]
-    pub backfill_max: usize,
-    /// Override of `bundles.min_commits` for this strategy (None = inherit).
-    #[serde(default)]
-    pub min_commits: Option<u64>,
-    /// Object filter of the bundles this strategy builds (`"blob:none"` is the
-    /// only supported value): a **blobless family** for `--filter=blob:none`
-    /// clones. A full strategy with a filter composes the D18 history pack
-    /// (commits + trees) under a `@filter=blob:none` header; incrementals pack
-    /// with `--filter=blob:none`. Whole chains share one filter. Filtered
-    /// bundles are advertised only at `bundles/list?filter=blob:none` — never
-    /// in the protocol-advertised list: git (2.47 … master) does not match
-    /// `bundle.<id>.filter` against the clone's filter, so a full clone would
-    /// swallow them and end up with promisor packs it cannot complete.
-    #[serde(default)]
-    pub filter: Option<String>,
-    /// Incrementals only. `false` (default, D21): every slot is cut on its **base** (a daily on the
-    /// weekly, an hourly on the newest daily), so the newest one subsumes the older ones and only the
-    /// 2 newest are listed — a fresh clone is 5 downloads, a catch-up ≤ 2, bytes overlap.
-    /// `true`: a slot is cut on this strategy's **own previous bundle** when that one is newer than
-    /// the newest base bundle at or before the slot (dailies chain from the weekly, hourlies restart
-    /// from each daily); every slot since the base is listed (≤ 7 dailies, ≤ 24 hourlies) and each
-    /// carries exactly its delta — more downloads, no overlapping bytes, a catch-up is exactly the
-    /// slots missed. `walgit_bundle::slots` is the one place that knows either rule.
-    #[serde(default)]
-    pub chain: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BundleKind {
-    Full,
-    Incremental,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct LfsConfig {
     pub enabled: bool,
-    pub serve_via: BundleServe,
+    pub serve_via: LfsServe,
     #[serde(with = "humantime_serde")]
     pub signed_url_ttl: Duration,
     pub max_object_bytes: ByteSize,
@@ -683,8 +560,12 @@ pub struct UpstreamConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Independent configuration switches, not mutually exclusive states"
+)]
 pub struct GitConfig {
-    /// Path to the upstream git binary (repack, bundle, optional upload-pack engine).
+    /// Path to the upstream git binary (repack, optional upload-pack engine).
     pub binary: PathBuf,
     pub upload_pack_engine: UploadPackEngine,
     pub allow_filter: bool,
@@ -763,7 +644,7 @@ impl Default for EventsConfig {
         EventsConfig {
             webhook_url: None,
             webhook_secret: None,
-            sweep_interval: Duration::from_secs(300),
+            sweep_interval: Duration::from_mins(5),
         }
     }
 }
@@ -796,15 +677,13 @@ pub enum LogFormat {
     Pretty,
 }
 
-fn default_min_commits() -> u64 {
-    25
-}
 fn default_true() -> bool {
     true
 }
 
 /// D24: the top-level sections a repository's settings may override.
-pub const SETTINGS_SECTIONS: &[&str] = &["bundles", "maintenance", "compaction", "upstream"];
+pub const SETTINGS_SECTIONS: &[&str] =
+    &["maintenance", "packs", "upstream", "refs", "packfile_uri"];
 /// D24: maximum size of a settings document.
 pub const SETTINGS_MAX_BYTES: usize = 16 * 1024;
 
@@ -814,6 +693,16 @@ impl Config {
     /// Only [`SETTINGS_SECTIONS`] may appear; the result is validated like a
     /// config file. Empty settings = `self` unchanged.
     pub fn with_settings(&self, settings_toml: &str) -> Result<Config> {
+        fn merge(into: &mut toml::Table, from: &toml::Table) {
+            for (k, v) in from {
+                match (into.get_mut(k), v) {
+                    (Some(toml::Value::Table(a)), toml::Value::Table(b)) => merge(a, b),
+                    _ => {
+                        into.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
         if settings_toml.trim().is_empty() {
             return Ok(self.clone());
         }
@@ -836,16 +725,6 @@ impl Config {
             );
         }
         let mut doc: toml::Table = toml::Table::try_from(self).context("serializing config")?;
-        fn merge(into: &mut toml::Table, from: &toml::Table) {
-            for (k, v) in from {
-                match (into.get_mut(k), v) {
-                    (Some(toml::Value::Table(a)), toml::Value::Table(b)) => merge(a, b),
-                    _ => {
-                        into.insert(k.clone(), v.clone());
-                    }
-                }
-            }
-        }
         merge(&mut doc, &overrides);
         let cfg: Config = doc.try_into().context("settings: applying")?;
         cfg.validate()
@@ -857,7 +736,7 @@ impl Config {
     /// never `upstream.token_env` (that name is host-only).
     pub fn public_settings_toml(&self) -> Result<String> {
         let mut doc: toml::Table = toml::Table::try_from(self).context("serializing config")?;
-        doc.retain(|k, _| SETTINGS_SECTIONS.iter().any(|s| *s == k));
+        doc.retain(|k, _| SETTINGS_SECTIONS.contains(&k));
         if let Some(toml::Value::Table(u)) = doc.get_mut("upstream") {
             u.remove("token_env");
         }
@@ -882,102 +761,6 @@ impl Config {
             CacheMode::Auto => self.maintenance.disk == MaintainerDisk::Ssd,
         }
     }
-    /// Bundle strategies form chains of calendar slots (docs/BUNDLE_URI_DESIGN.md §4):
-    /// every `schedule` is a 6-field UTC cron (or an `@alias`) that parses; an
-    /// incremental names a `base` that exists and whose chain ends in a full
-    /// strategy; each chain has exactly one full root; `keep >= 1` on fulls.
-    fn validate_bundle_strategies(&self) -> Result<()> {
-        use std::collections::HashMap;
-        let strategies = &self.bundles.strategy;
-        let by_name: HashMap<&str, &BundleStrategy> =
-            strategies.iter().map(|s| (s.name.as_str(), s)).collect();
-        anyhow::ensure!(
-            by_name.len() == strategies.len(),
-            "bundles.strategy: duplicate strategy names"
-        );
-        for s in strategies {
-            let expr = s.schedule.trim();
-            let fields = expr.split_whitespace().count();
-            anyhow::ensure!(
-                expr.starts_with('@') || fields == 6 || fields == 7,
-                "bundles.strategy {}: schedule {:?} must be a 6-field UTC cron (sec min hour dom mon dow) or @hourly/@daily/@weekly",
-                s.name,
-                s.schedule
-            );
-            cron::Schedule::from_str(expr).map_err(|e| {
-                anyhow::anyhow!(
-                    "bundles.strategy {}: schedule {:?} does not parse: {e}",
-                    s.name,
-                    s.schedule
-                )
-            })?;
-            if let Some(f) = &s.filter {
-                anyhow::ensure!(
-                    f == "blob:none",
-                    "bundles.strategy {}: filter {f:?} is not supported (only \"blob:none\")",
-                    s.name
-                );
-            }
-            match s.kind {
-                BundleKind::Full => {
-                    anyhow::ensure!(
-                        s.base.is_none(),
-                        "bundles.strategy {}: a full strategy has no base",
-                        s.name
-                    );
-                    anyhow::ensure!(
-                        !s.chain,
-                        "bundles.strategy {}: `chain` is an incremental knob",
-                        s.name
-                    );
-                    anyhow::ensure!(
-                        s.keep >= 1,
-                        "bundles.strategy {}: keep must be >= 1 on a full strategy",
-                        s.name
-                    );
-                }
-                BundleKind::Incremental => {
-                    anyhow::ensure!(
-                        s.keep == 0,
-                        "bundles.strategy {}: `keep` is not a knob on an incremental strategy — the 2 newest whose base is kept are always listed (D21, 2026-08-22); remove it",
-                        s.name
-                    );
-                    let mut cur = s;
-                    let mut hops = 0;
-                    loop {
-                        let base = cur.base.as_deref().ok_or_else(|| {
-                            anyhow::anyhow!("bundles.strategy {}: incremental needs base", cur.name)
-                        })?;
-                        let b = by_name.get(base).ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "bundles.strategy {}: base {base} is not a strategy",
-                                cur.name
-                            )
-                        })?;
-                        anyhow::ensure!(
-                            b.filter == s.filter,
-                            "bundles.strategy {}: filter {:?} differs from its base {}'s {:?} (a chain shares one filter)",
-                            s.name,
-                            s.filter,
-                            b.name,
-                            b.filter
-                        );
-                        if b.kind == BundleKind::Full {
-                            break;
-                        }
-                        cur = b;
-                        hops += 1;
-                        anyhow::ensure!(
-                            hops < 16,
-                            "bundles.strategy {}: base chain has a cycle",
-                            s.name
-                        );
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 /// `owner/name` matches an entry of `list` (`owner/name`, `owner/*`, `*`; `.git` tolerated).
@@ -987,7 +770,7 @@ fn env_placement_overrides(doc: &toml::Table, vars_seen: &[String]) -> Option<to
     let keys: Vec<String> = vars_seen
         .iter()
         .filter_map(|k| k.strip_prefix("WALGIT__PLACEMENT__"))
-        .map(|k| k.to_ascii_lowercase())
+        .map(str::to_ascii_lowercase)
         .collect();
     if keys.is_empty() {
         return None;
@@ -1009,33 +792,14 @@ pub fn repo_listed(list: &[String], owner: &str, name: &str) -> bool {
     })
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            server: ServerConfig::default(),
-            store: StoreConfig::default(),
-            cache: CacheConfig::default(),
-            wal: WalConfig::default(),
-            compaction: CompactionConfig::default(),
-            maintenance: MaintenanceConfig::default(),
-            bundles: BundlesConfig::default(),
-            placement: PlacementConfig::default(),
-            lfs: LfsConfig::default(),
-            upstream: UpstreamConfig::default(),
-            git: GitConfig::default(),
-            telemetry: TelemetryConfig::default(),
-            events: EventsConfig::default(),
-        }
-    }
-}
 impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
-            listen: "127.0.0.1:8080".parse().unwrap(),
+            listen: std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
             http2: true,
             max_concurrent_requests: 512,
             max_concurrent_per_repo: 64,
-            request_timeout: Duration::from_secs(3600),
+            request_timeout: Duration::from_hours(1),
             drain_timeout: Duration::from_secs(20),
             max_push_bytes: ByteSize::gib(64),
             roles: vec![],
@@ -1054,7 +818,7 @@ impl Default for AuthConfig {
             mode: AuthMode::None,
             anonymous_read: true,
             tokens: vec![],
-            issuer: "https://accounts.google.com".into(),
+            issuer: String::new(),
             allowed_domains: vec![],
             allowed_emails: vec![],
             audiences: vec![],
@@ -1063,8 +827,8 @@ impl Default for AuthConfig {
             admin_emails: vec![],
             admin_domains: vec![],
             session_secret: None,
-            session_ttl: Duration::from_secs(30 * 24 * 3600),
-            access_token_ttl: Duration::from_secs(90 * 24 * 3600),
+            session_ttl: Duration::from_hours(720),
+            access_token_ttl: Duration::from_hours(2160),
             oauth_client_id: None,
             oauth_client_secret: None,
         }
@@ -1113,13 +877,12 @@ impl Default for CacheConfig {
             mode: CacheMode::Auto,
             max_bytes: ByteSize::gib(20),
             disk_high_watermark: 0.9,
-            evict_idle_after: Duration::from_secs(6 * 3600),
+            evict_idle_after: Duration::from_hours(6),
             prewarm: vec![],
             prewarm_parallelism: 2,
             prewarm_ready_timeout: Duration::ZERO,
             ref_advert_entries: 256,
             object_info_entries: 4096,
-            bundle_list_entries: 128,
             remote_block_bytes: ByteSize::gib(1),
             remote_object_bytes: ByteSize::mib(256),
             shared_render_cache: true,
@@ -1136,7 +899,7 @@ impl Default for WalConfig {
             push_broker_token: None,
             push_broker_buffer_bytes: ByteSize::mib(64),
             snapshot_every_entries: 256,
-            checkpoint_interval: Duration::from_secs(3600),
+            checkpoint_interval: Duration::from_hours(1),
             checkpoint_tail_bytes: ByteSize::mib(8),
             cas_max_retries: 16,
             fsck_objects: true,
@@ -1148,81 +911,12 @@ impl Default for WalConfig {
         }
     }
 }
-impl Default for CompactionConfig {
-    fn default() -> Self {
-        CompactionConfig {
-            enabled: true,
-            factor: 2,
-            trigger_packs: 16,
-            trigger_bytes: ByteSize::gib(1),
-            lease_ttl: Duration::from_secs(600),
-            retention_superseded: Duration::from_secs(7 * 24 * 3600),
-            engine: RepackEngine::Git,
-        }
-    }
-}
-impl Default for BundlesConfig {
-    fn default() -> Self {
-        BundlesConfig {
-            enabled: true,
-            strategy: vec![
-                BundleStrategy {
-                    name: "weekly".into(),
-                    kind: BundleKind::Full,
-                    // Sunday 23:00 UTC (slot = fire time; backfilled when missed).
-                    schedule: "0 0 23 * * Sun".into(),
-                    base: None,
-                    keep: 2,
-                    refs: vec![],
-                    backfill_max: 0,
-                    min_commits: None,
-                    filter: None,
-                    chain: false,
-                },
-                BundleStrategy {
-                    name: "daily".into(),
-                    kind: BundleKind::Incremental,
-                    schedule: "0 0 23 * * *".into(),
-                    base: Some("weekly".into()),
-                    keep: 0,
-                    refs: vec![],
-                    backfill_max: 0,
-                    min_commits: None,
-                    filter: None,
-                    chain: true,
-                },
-                BundleStrategy {
-                    name: "hourly".into(),
-                    kind: BundleKind::Incremental,
-                    schedule: "@hourly".into(),
-                    base: Some("daily".into()),
-                    keep: 0,
-                    refs: vec![],
-                    backfill_max: 0,
-                    min_commits: None,
-                    filter: None,
-                    chain: false,
-                },
-            ],
-            serve_via: BundleServe::Proxy,
-            signed_url_ttl: Duration::from_secs(3600),
-            advertise: true,
-            advertise_filtered: false,
-            require: Vec::new(),
-            signed_url_for: Vec::new(),
-            main_only: true,
-            extra_refs: Vec::new(),
-            min_commits: 25,
-            min_bytes: ByteSize::b(0),
-        }
-    }
-}
 impl Default for LfsConfig {
     fn default() -> Self {
         LfsConfig {
             enabled: true,
-            serve_via: BundleServe::Proxy,
-            signed_url_ttl: Duration::from_secs(3600),
+            serve_via: LfsServe::Proxy,
+            signed_url_ttl: Duration::from_hours(1),
             max_object_bytes: ByteSize::gib(16),
         }
     }
@@ -1304,8 +998,8 @@ impl Config {
                 continue;
             };
             vars_seen.push(k.clone());
-            let path: Vec<String> = rest.split("__").map(|s| s.to_ascii_lowercase()).collect();
-            if path.is_empty() || path.iter().any(|p| p.is_empty()) {
+            let path: Vec<String> = rest.split("__").map(str::to_ascii_lowercase).collect();
+            if path.is_empty() || path.iter().any(std::string::String::is_empty) {
                 continue;
             }
             let value: toml::Value = v
@@ -1320,16 +1014,19 @@ impl Config {
                     path: &[String],
                     value: toml::Value,
                 ) -> std::result::Result<(), String> {
-                    if path.len() == 1 {
-                        cur.insert(path[0].clone(), value);
+                    let Some((key, rest)) = path.split_first() else {
+                        return Err("empty configuration path".into());
+                    };
+                    if rest.is_empty() {
+                        cur.insert(key.clone(), value);
                         return Ok(());
                     }
                     let next = cur
-                        .entry(path[0].clone())
-                        .or_insert_with(|| toml::Value::Table(Default::default()))
+                        .entry(key.clone())
+                        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
                         .as_table_mut()
-                        .ok_or_else(|| format!("{} is not a table", path[0]))?;
-                    set(next, &path[1..], value)
+                        .ok_or_else(|| format!("{key} is not a table"))?;
+                    set(next, rest, value)
                 }
                 match set(&mut trial, &path, value) {
                     Err(why) => Some(why),
@@ -1342,12 +1039,11 @@ impl Config {
                     }),
                 }
             };
-            match bad {
-                Some(why) => ignored.push((k, why)),
-                None => {
-                    doc = trial;
-                    touched = true;
-                }
+            if let Some(why) = bad {
+                ignored.push((k, why));
+            } else {
+                doc = trial;
+                touched = true;
             }
         }
         // `[placement]` is a host fact set as a GROUP: any WALGIT__PLACEMENT__* override
@@ -1371,16 +1067,26 @@ impl Config {
             self.server.listen.set_port(port);
             // Standalone / `dev server`: public_url is the origin the browser hits. Keep its
             // port in lockstep with PORT. A real public_url is left alone.
-            if let Some(u) = self.server.public_url.as_mut() {
-                if origin_is_loopback(u) {
-                    *u = rewrite_origin_port(u, port);
-                }
+            if let Some(u) = self.server.public_url.as_mut()
+                && origin_is_loopback(u)
+            {
+                *u = rewrite_origin_port(u, port);
             }
         }
         Ok(ignored)
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.refs.validate()?;
+        self.packs.validate()?;
+        anyhow::ensure!(
+            self.packfile_uri.uri_min_bytes.as_u64() > 0,
+            "packfile_uri.uri_min_bytes must be positive"
+        );
+        anyhow::ensure!(
+            (1..=64).contains(&self.packfile_uri.max_uris_per_fetch),
+            "packfile_uri.max_uris_per_fetch must be 1..=64"
+        );
         anyhow::ensure!(!self.store.bucket.is_empty(), "store.bucket must be set");
         let t = &self.server.tls;
         match t.mode {
@@ -1406,7 +1112,6 @@ impl Config {
                 "server.public_url must be an http(s) origin (got {u})"
             );
         }
-        self.validate_bundle_strategies()?;
         // You cannot maintain what you refuse to serve: a host with the serve role
         // whose maintain rules name a repository its serve rules exclude is a config
         // error (the SSD host 2026-08-21 07:00Z: maintain = ["acme/monorepo"], inherited
@@ -1530,46 +1235,7 @@ impl Config {
                 "server.auth.session_secret is required with oauth_client_id (it signs sessions and access tokens)"
             );
         }
-        anyhow::ensure!(
-            self.compaction.factor >= 2,
-            "compaction.factor must be >= 2"
-        );
         anyhow::ensure!(self.wal.max_batch >= 1, "wal.max_batch must be >= 1");
-        let names: std::collections::HashSet<&str> = self
-            .bundles
-            .strategy
-            .iter()
-            .map(|s| s.name.as_str())
-            .collect();
-        anyhow::ensure!(
-            names.len() == self.bundles.strategy.len(),
-            "bundle strategy names must be unique"
-        );
-        for s in &self.bundles.strategy {
-            match (s.kind, &s.base) {
-                (BundleKind::Incremental, None) => {
-                    anyhow::bail!("bundle strategy {} is incremental but has no base", s.name)
-                }
-                (BundleKind::Incremental, Some(b)) => {
-                    anyhow::ensure!(
-                        names.contains(b.as_str()),
-                        "bundle strategy {} base {b} does not exist",
-                        s.name
-                    )
-                }
-                (BundleKind::Full, Some(_)) => {
-                    anyhow::bail!("bundle strategy {} is full but has a base", s.name)
-                }
-                _ => {}
-            }
-            if matches!(s.kind, BundleKind::Full) {
-                anyhow::ensure!(
-                    s.keep >= 1,
-                    "bundle strategy {}: keep must be >= 1 on a full strategy",
-                    s.name
-                );
-            }
-        }
         if let Some(u) = &self.events.webhook_url {
             anyhow::ensure!(
                 u.starts_with("http://") || u.starts_with("https://"),
@@ -1586,21 +1252,6 @@ impl Config {
             String::new()
         } else {
             format!("{p}/")
-        }
-    }
-
-    /// Whether `owner/name` is listed in `bundles.require` (exact or `owner/*`).
-    pub fn bundles_required(&self, owner: &str, name: &str) -> bool {
-        repo_listed(&self.bundles.require, owner, name)
-    }
-
-    /// How `owner/name`'s bundle URIs are served: `bundles.serve_via`, or
-    /// signed URLs when listed in `bundles.signed_url_for`.
-    pub fn bundle_serve_via(&self, owner: &str, name: &str) -> BundleServe {
-        if repo_listed(&self.bundles.signed_url_for, owner, name) {
-            BundleServe::SignedUrl
-        } else {
-            self.bundles.serve_via
         }
     }
 
@@ -1622,7 +1273,7 @@ impl Config {
         }
         let mut v: Vec<String> = ["localhost", "*.localhost", "127.0.0.1", "::1"]
             .iter()
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
             .collect();
         if let Some(u) = &self.server.public_url {
             let host = u
@@ -1634,8 +1285,7 @@ impl Config {
                 .trim_start_matches('[');
             let host = host
                 .rsplit_once(']')
-                .map(|(h, _)| h)
-                .unwrap_or_else(|| host.split(':').next().unwrap_or(host));
+                .map_or_else(|| host.split(':').next().unwrap_or(host), |(h, _)| h);
             if !host.is_empty() && !v.iter().any(|h| h == host) {
                 v.push(host.to_string());
             }
@@ -1646,8 +1296,7 @@ impl Config {
     pub fn has_role(&self, role: Role) -> bool {
         self.server.roles.is_empty()
             || self.server.roles.contains(&role)
-            || (matches!(role, Role::Compact | Role::Bundle)
-                && self.server.roles.contains(&Role::Maintain))
+            || (matches!(role, Role::Compact) && self.server.roles.contains(&Role::Maintain))
     }
 }
 
@@ -1655,10 +1304,9 @@ fn origin_host(origin: &str) -> &str {
     let rest = origin
         .trim_end_matches('/')
         .split_once("://")
-        .map(|(_, r)| r)
-        .unwrap_or(origin);
+        .map_or(origin, |(_, r)| r);
     if let Some(inside) = rest.strip_prefix('[') {
-        return inside.split_once(']').map(|(h, _)| h).unwrap_or(inside);
+        return inside.split_once(']').map_or(inside, |(h, _)| h);
     }
     rest.split([':', '/']).next().unwrap_or(rest)
 }
@@ -1675,8 +1323,7 @@ fn rewrite_origin_port(origin: &str, port: u16) -> String {
     };
     let host = if rest.starts_with('[') {
         rest.split_once(']')
-            .map(|(h, _)| format!("{h}]"))
-            .unwrap_or_else(|| rest.to_string())
+            .map_or_else(|| rest.to_string(), |(h, _)| format!("{h}]"))
     } else {
         rest.split([':', '/']).next().unwrap_or(rest).to_string()
     };
@@ -1700,12 +1347,17 @@ mod tests {
     fn defaults_parse_and_validate() {
         let c = Config::parse("").unwrap();
         assert_eq!(c.server.listen.port(), 8080);
-        assert_eq!(c.bundles.strategy.len(), 3);
         c.validate().unwrap();
         // Round trip through TOML.
         let text = toml::to_string(&c).unwrap();
         let back = Config::parse(&text).unwrap();
         assert_eq!(back.store.bucket, c.store.bucket);
+    }
+
+    #[test]
+    fn example_configurations_parse_and_validate() {
+        Config::parse(include_str!("../../../walgit.example.toml")).unwrap();
+        Config::parse(include_str!("../../../walgit.standalone.toml")).unwrap();
     }
 
     #[test]
@@ -1754,7 +1406,7 @@ mod tests {
 
     /// `[placement]` is set as a group: one PLACEMENT env key replaces the whole
     /// section (unset keys = defaults), never merges with the file's values.
-    /// The SSD host 2026-08-21 07:00Z: the baked toml's serve_exclude = ["acme/monorepo"]
+    /// The SSD host 2026-08-21 07:00Z: the baked toml's `serve_exclude` = `["acme/monorepo"]`
     /// leaked under an env that set only MAINTAIN* → the host refused its own repo.
     #[test]
     fn env_placement_override_replaces_the_whole_section() {
@@ -1863,26 +1515,58 @@ mod tests {
     }
 
     #[test]
+    fn removed_bundle_configuration_is_rejected() {
+        for input in [
+            "[bundles]\nenabled = true\n",
+            "[server]\nroles = [\"bundle\"]\n",
+            "[cache]\nbundle_list_entries = 128\n",
+        ] {
+            assert!(Config::parse(input).is_err(), "{input}");
+        }
+        let mut base = Config::default();
+        base.store.bucket = "b".into();
+        assert!(base.with_settings("[bundles]\nenabled = false\n").is_err());
+        assert!(!base.public_settings_toml().unwrap().contains("[bundles]"));
+    }
+
+    #[test]
+    fn removed_compaction_configuration_is_rejected() {
+        for input in [
+            "[compaction]\nenabled = true\n",
+            "[packs]\nfactor = 2\n",
+            "[packs]\ntrigger_bytes = \"1GiB\"\n",
+            "[packs]\nretention_superseded = \"7d\"\n",
+            "[packs]\nengine = \"git\"\n",
+        ] {
+            assert!(Config::parse(input).is_err(), "{input}");
+            assert!(Config::default().with_settings(input).is_err(), "{input}");
+        }
+        assert!(
+            !Config::default()
+                .public_settings_toml()
+                .unwrap()
+                .contains("[compaction]")
+        );
+    }
+
+    #[test]
     fn settings_merge_over_config_and_are_restricted() {
         let mut base = Config::default();
         base.store.bucket = "b".into();
         let eff = base
             .with_settings(
-                r#"
-[bundles]
-min_commits = 3
-main_only = false
+                r"
+[packs]
+geometric_factor = 3
 [maintenance]
 checkpoints = false
-"#,
+",
             )
             .unwrap();
-        assert_eq!(eff.bundles.min_commits, 3);
-        assert!(!eff.bundles.main_only);
+        assert_eq!(eff.packs.geometric_factor, 3);
         assert!(!eff.maintenance.checkpoints);
         assert_eq!(
-            eff.bundles.strategy.len(),
-            base.bundles.strategy.len(),
+            eff.packs.fold_when_fresh_packs_reach, base.packs.fold_when_fresh_packs_reach,
             "untouched keys keep the host's values"
         );
         // Forbidden section.
@@ -1894,17 +1578,19 @@ listen = \"0.0.0.0:1\"\n",
             .unwrap_err()
             .to_string();
         assert!(e.contains("[server]"), "{e}");
+        // A section the docs once promised but the code never accepted.
+        assert!(base.with_settings("[integrations]\nx = 1\n").is_err());
         // Unknown key inside an allowed section.
-        assert!(base.with_settings("[bundles]\nnope = 1\n").is_err());
-        // Invalid effective config (incremental without a base).
+        assert!(base.with_settings("[packs]\nnope = 1\n").is_err());
+        // Invalid effective config (geometric factor below two).
         let e = base
-            .with_settings("[[bundles.strategy]]\nname = \"x\"\nkind = \"incremental\"\nschedule = \"@hourly\"\n")
+            .with_settings("[packs]\ngeometric_factor = 1\n")
             .unwrap_err()
             .to_string();
         assert!(e.contains("settings"), "{e}");
         assert_eq!(
-            base.with_settings("  ").unwrap().bundles.min_commits,
-            base.bundles.min_commits
+            base.with_settings("  ").unwrap().packs.geometric_factor,
+            base.packs.geometric_factor
         );
         let e = base
             .with_settings("[upstream]\ntoken_env = \"AWS_SECRET_ACCESS_KEY\"\n")
@@ -1912,7 +1598,7 @@ listen = \"0.0.0.0:1\"\n",
             .to_string();
         assert!(e.contains("token_env"), "{e}");
         let pub_toml = base.public_settings_toml().unwrap();
-        assert!(pub_toml.contains("[bundles]"), "{pub_toml}");
+        assert!(pub_toml.contains("[packs]"), "{pub_toml}");
         assert!(!pub_toml.contains("session_secret"), "{pub_toml}");
         assert!(!pub_toml.contains("[server]"), "{pub_toml}");
         assert!(!pub_toml.contains("token_env"), "{pub_toml}");
@@ -1938,22 +1624,45 @@ audiences = ["walgit-cli", "https://git.example.com"]
         let err = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\n")
             .unwrap_err();
         assert!(err.to_string().contains("tokens"), "{err}");
-        // oidc: anonymous_read off, an allowlist, and a way in.
-        let err = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"oidc\"\nanonymous_read = false\nallowed_domains = [\"example.com\"]\n").unwrap_err();
+        // `token_env` alone is a whole entry: the README quick start writes exactly this.
+        let readme = Config::parse(
+            "[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\ntokens = [{ principal = \"me\", token_env = \"WALGIT_TOKEN_ME\", write = true }]\n",
+        )
+        .unwrap();
+        let t = &readme.server.auth.tokens[0];
+        assert_eq!(t.principal, "me");
+        assert!(t.token.is_empty(), "{:?}", t.token);
+        assert_eq!(t.token_env.as_deref(), Some("WALGIT_TOKEN_ME"));
+        assert!(t.write && !t.admin);
+        // Neither key names a secret, so the entry could never let anyone in.
+        let err = Config::parse(
+            "[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\ntokens = [{ principal = \"me\", write = true }]\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("needs `token` or `token_env`"),
+            "{err}"
+        );
+        // oidc: an issuer, anonymous_read off, an allowlist, and a way in.
+        let err = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"oidc\"\nanonymous_read = false\nallowed_domains = [\"example.com\"]\noauth_client_id = \"x\"\noauth_client_secret = \"y\"\nsession_secret = \"0123456789abcdef0123456789abcdef\"\n").unwrap_err();
+        assert!(err.to_string().contains("issuer"), "{err}");
+        let err = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"oidc\"\nissuer = \"https://login.example.com\"\nanonymous_read = false\nallowed_domains = [\"example.com\"]\n").unwrap_err();
         assert!(err.to_string().contains("way in"), "{err}");
-        let err = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"oidc\"\nanonymous_read = false\nallowed_domains = [\"example.com\"]\noauth_client_id = \"x\"\noauth_client_secret = \"y\"\n").unwrap_err();
+        let err = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"oidc\"\nissuer = \"https://login.example.com\"\nanonymous_read = false\nallowed_domains = [\"example.com\"]\noauth_client_id = \"x\"\noauth_client_secret = \"y\"\n").unwrap_err();
         assert!(err.to_string().contains("session_secret"), "{err}");
         let ok = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"oidc\"\nissuer = \"https://login.example.com\"\nanonymous_read = false\nallowed_domains = [\"example.com\"]\noauth_client_id = \"x\"\noauth_client_secret = \"y\"\nsession_secret = \"0123456789abcdef0123456789abcdef\"\n").unwrap();
         assert_eq!(ok.server.auth.issuer, "https://login.example.com");
-        assert_eq!(
-            ok.server.auth.access_token_ttl,
-            Duration::from_secs(90 * 86400)
-        );
+        assert_eq!(ok.server.auth.access_token_ttl, Duration::from_hours(2160));
         let err = Config::parse(
             "[store]\nbucket = \"b\"\n[server]\nlisten = \"0.0.0.0:8080\"\n[server.auth]\nmode = \"none\"\n",
         )
         .unwrap_err();
         assert!(err.to_string().contains("loopback-only"), "{err}");
+        // The issuer is an oidc-only requirement: none and token mode validate without one.
+        let none = Config::parse("[store]\nbucket = \"b\"\n").unwrap();
+        assert_eq!(none.server.auth.issuer, "");
+        let tok = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\ntokens = [{ principal = \"ci\", token = \"s\" }]\n").unwrap();
+        assert_eq!(tok.server.auth.issuer, "");
     }
 
     #[test]
@@ -1967,67 +1676,25 @@ webhook_secret = "s"
 "#,
         )
         .unwrap();
-        assert_eq!(c.events.sweep_interval, Duration::from_secs(60));
+        assert_eq!(c.events.sweep_interval, Duration::from_mins(1));
         assert_eq!(c.events.webhook_secret.as_deref(), Some("s"));
         let err = Config::parse("[events]\nwebhook_url = \"ftp://x\"\n").unwrap_err();
         assert!(err.to_string().contains("webhook_url"), "{err}");
     }
-
-    #[test]
-    fn rejects_bad_bundle_graph() {
-        let text = r#"
-[[bundles.strategy]]
-name = "daily"
-kind = "incremental"
-schedule = "@daily"
-keep = 3
-"#;
-        assert!(Config::parse(text).is_err());
-    }
 }
 
-#[cfg(test)]
-mod bundle_strategy_validation {
-    use super::*;
-
-    fn base() -> Config {
-        let mut c = Config::default();
-        c.store.bucket = "b".into();
-        c
-    }
-
-    #[test]
-    fn defaults_validate() {
-        base().validate().unwrap();
-    }
-
-    #[test]
-    fn bad_schedule_incremental_without_full_root_and_keep_zero_are_rejected() {
-        let mut c = base();
-        c.bundles.strategy[2].schedule = "every hour".into();
-        assert!(c.validate().unwrap_err().to_string().contains("schedule"));
-        let mut c = base();
-        c.bundles.strategy[1].base = Some("nope".into());
-        assert!(
-            c.validate()
-                .unwrap_err()
-                .to_string()
-                .contains("not a strategy")
-        );
-        let mut c = base();
-        c.bundles.strategy[0].keep = 0;
-        assert!(c.validate().unwrap_err().to_string().contains("keep"));
-        let mut c = base();
-        c.bundles.strategy[2].keep = 28;
-        assert!(
-            c.validate()
-                .unwrap_err()
-                .to_string()
-                .contains("not a knob on an incremental")
-        );
-        let mut c = base();
-        c.bundles.strategy[1].base = Some("hourly".into());
-        c.bundles.strategy[2].base = Some("daily".into());
-        assert!(c.validate().unwrap_err().to_string().contains("cycle"));
+/// Negotiated static delivery thresholds. Foundation only: no URI emission yet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PackfileUriConfig {
+    pub uri_min_bytes: ByteSize,
+    pub max_uris_per_fetch: usize,
+}
+impl Default for PackfileUriConfig {
+    fn default() -> Self {
+        Self {
+            uri_min_bytes: ByteSize::mib(32),
+            max_uris_per_fetch: 64,
+        }
     }
 }

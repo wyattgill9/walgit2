@@ -1,3 +1,6 @@
+// Test fixtures use panics to fail the test, including shared helper functions.
+#![allow(clippy::unwrap_used, clippy::case_sensitive_file_extension_comparisons)]
+
 mod common;
 
 use walgit_git::pkt::Protocol;
@@ -127,6 +130,7 @@ async fn fetch_no_haves_produces_valid_pack() {
             shallow: vec![],
             want_refs: vec![],
             packfile_uris_protocols: vec![],
+            packfile_indexes: false,
         };
         let resp = run_fetch(&repo, engine, &req).await;
         assert!(!resp.is_empty(), "empty response for {engine:?}");
@@ -169,6 +173,7 @@ async fn fetch_with_haves_smaller_pack_and_ack() {
             shallow: vec![],
             want_refs: vec![],
             packfile_uris_protocols: vec![],
+            packfile_indexes: false,
         };
         let req_ack = UploadPackRequest {
             wants: vec![oid(&b)],
@@ -220,6 +225,7 @@ async fn fetch_filter_blob_none_no_blobs() {
             shallow: vec![],
             want_refs: vec![],
             packfile_uris_protocols: vec![],
+            packfile_indexes: false,
         };
         let resp = run_fetch(&repo, engine, &req).await;
         let pack = cm::extract_packfile(&resp);
@@ -285,6 +291,7 @@ async fn fetch_filter_blob_limit_excludes_large_blobs() {
             shallow: vec![],
             want_refs: vec![],
             packfile_uris_protocols: vec![],
+            packfile_indexes: false,
         };
         let resp = run_fetch(&repo, engine, &req).await;
         let pack = cm::extract_packfile(&resp);
@@ -321,6 +328,7 @@ async fn fetch_filter_tree_0_only_root_tree() {
             shallow: vec![],
             want_refs: vec![],
             packfile_uris_protocols: vec![],
+            packfile_indexes: false,
         };
         let resp = run_fetch(&repo, engine, &req).await;
         let pack = cm::extract_packfile(&resp);
@@ -398,6 +406,7 @@ async fn fetch_include_tag_sends_annotated_tag() {
             shallow: vec![],
             want_refs: vec![],
             packfile_uris_protocols: vec![],
+            packfile_indexes: false,
         };
         let resp = run_fetch(&repo, engine, &req).await;
         let pack = cm::extract_packfile(&resp);
@@ -470,6 +479,7 @@ async fn fetch_deepen_shallow_info() {
             shallow: vec![],
             want_refs: vec![],
             packfile_uris_protocols: vec![],
+            packfile_indexes: false,
         };
         let resp = run_fetch(&repo, engine, &req).await;
         // For gix engine: check shallow-info section is present.
@@ -512,6 +522,7 @@ async fn fetch_haves_shrink_pack() {
             shallow: vec![],
             want_refs: vec![],
             packfile_uris_protocols: vec![],
+            packfile_indexes: false,
         };
         // Incremental fetch (have A, want B).
         let req_inc = UploadPackRequest {
@@ -557,6 +568,7 @@ async fn fetch_fsck_rejects_corrupt_pack() {
         shallow: vec![],
         want_refs: vec![],
         packfile_uris_protocols: vec![],
+        packfile_indexes: false,
     };
     let resp = run_fetch(&repo, Engine::Gix, &req).await;
     let pack = cm::extract_packfile(&resp);
@@ -653,6 +665,7 @@ async fn fetch_skips_gitlink_entries() {
             shallow: vec![],
             want_refs: vec![],
             packfile_uris_protocols: vec![],
+            packfile_indexes: false,
         };
         let resp = run_fetch(&repo, Engine::Gix, &req).await;
         let pack = cm::extract_packfile(&resp);
@@ -672,10 +685,10 @@ async fn fetch_skips_gitlink_entries() {
         // present.
         let (_blobs, commits, trees, _tags) = cm::pack_object_types(&pack);
         assert_eq!(commits, 2, "unexpected commit count ({filter:?})");
-        if filter != Some("tree:0") {
-            assert!(trees >= 1, "tree missing ({filter:?})");
-        } else {
+        if filter == Some("tree:0") {
             assert_eq!(trees, 0, "tree:0 sends no trees");
+        } else {
+            assert!(trees >= 1, "tree missing ({filter:?})");
         }
         let tmp = cm::fresh_bare();
         let pack_path = tmp.path().join("objects/pack/pack-test.pack");
@@ -699,7 +712,7 @@ async fn fetch_skips_gitlink_entries() {
 /// diff-sized fetch (want HEAD, have HEAD~50) and a full clone, both engines.
 /// `cargo test -p walgit-git --test upload_pack bench_fetch_engines -- --ignored --nocapture`
 #[tokio::test]
-#[ignore]
+#[ignore = "benchmark requires WALGIT_BENCH_REPO"]
 async fn bench_fetch_engines() {
     let Ok(src_path) = std::env::var("WALGIT_BENCH_REPO") else {
         eprintln!("WALGIT_BENCH_REPO not set; skipping");
@@ -792,6 +805,7 @@ async fn bench_fetch_engines() {
         shallow: vec![],
         want_refs: vec![],
         packfile_uris_protocols: vec![],
+        packfile_indexes: false,
     };
     for (label, req) in [
         (

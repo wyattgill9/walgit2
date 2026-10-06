@@ -1,7 +1,8 @@
 //! Publish path: linearizable CAS with batching.
+#![allow(clippy::needless_continue)]
 //!
 //! Design:
-//!   Each RepoHandle has a single-flight publisher task. `publish_push` and
+//!   Each `RepoHandle` has a single-flight publisher task. `publish_push` and
 //!   `publish_ref_update` enqueue a [`PublishRequest`] onto an mpsc channel
 //!   and await a oneshot response. The publisher collects requests within
 //!   `cfg.wal.batch_window` (up to `max_batch`), then processes them as one
@@ -50,6 +51,7 @@ use walgit_store::{ObjectStore, Prefixed, PutBody, PutMode, PutOptions, StoreErr
 
 /// Per-ref result within a publish.
 pub struct PublishResult {
+    /// Committed entry, or zero for a no-op/rejection (inspect `per_ref`).
     pub seq: u64,
     pub per_ref: Vec<(String, Result<(), RefError>)>,
 }
@@ -62,7 +64,7 @@ pub(crate) struct PublishRequest {
     /// True when receive-pack already performed the request freshness check.
     pub(crate) synced: bool,
     /// Explicit entry time (history replay); None = now. Validated monotonic
-    /// (>= the head entry's created_at) before the batch is written.
+    /// (>= the head entry's `created_at`) before the batch is written.
     pub(crate) created_at: Option<prost_types::Timestamp>,
     pub(crate) response: oneshot::Sender<Result<PublishResult, WalError>>,
 }
@@ -82,6 +84,8 @@ pub(crate) fn pack_ref_from_ingested(p: &IngestedPack, seq: u64) -> PackRef {
         tier: 0,
         kind: PackKind::Objects as i32,
         derived_from: String::new(),
+        published_at: Some(time::now()),
+        ..Default::default()
     }
 }
 
@@ -102,6 +106,8 @@ pub(crate) fn pack_ref_from_info(p: &PackInfo, seq: u64, tier: u32) -> PackRef {
             PackKind::Objects as i32
         },
         derived_from: p.history_of.clone().unwrap_or_default(),
+        published_at: Some(time::now()),
+        ..Default::default()
     }
 }
 
@@ -138,10 +144,7 @@ pub(crate) async fn put_immutable_create(
     // Big packs go up striped (parts + server-side compose, ~8 × 100 MB/s):
     // a large repository's rebuilt base (32.4 GB) took 431 s single-stream at 75 MB/s in the
     // weekly dry run of 2026-08-21. Small packs (every push) stay one PUT.
-    let size = tokio::fs::metadata(&path)
-        .await
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let size = tokio::fs::metadata(&path).await.map_or(0, |m| m.len());
     let put = if size >= PARALLEL_PUT_MIN_BYTES && store.supports_compose() {
         walgit_store::util::put_file_parallel(store, &key, &path, opts(), PARALLEL_PUT_STRIPES)
             .await
@@ -160,27 +163,26 @@ pub(crate) async fn put_immutable_create(
             // hiccup) must not leave a referenced object missing. Rare path,
             // one HEAD; on a miss, write it unconditionally (content-addressed:
             // whoever wins wrote the same bytes).
-            match store.head(&key).await? {
-                Some(_) => Ok(()),
-                None => {
-                    tracing::warn!(
-                        key,
-                        "create-if-absent reported the object present but HEAD finds nothing; writing it"
-                    );
-                    store
-                        .put(
-                            &key,
-                            PutBody::File(path),
-                            PutOptions {
-                                mode: PutMode::Overwrite,
-                                immutable: true,
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                        .map(|_| ())
-                        .map_err(WalError::Store)
-                }
+            if store.head(&key).await?.is_some() {
+                Ok(())
+            } else {
+                tracing::warn!(
+                    key,
+                    "create-if-absent reported the object present but HEAD finds nothing; writing it"
+                );
+                store
+                    .put(
+                        &key,
+                        PutBody::File(path),
+                        PutOptions {
+                            mode: PutMode::Overwrite,
+                            immutable: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(WalError::Store)
             }
         }
         Err(e) => Err(WalError::Store(e)),
@@ -194,6 +196,8 @@ pub(crate) struct LogSlot {
     pub(crate) key: String,
     pub(crate) version: walgit_store::Version,
     pub(crate) first_seq: u64,
+    /// Exact attempt-unique immutable bytes, retained until the CAS resolves.
+    pub(crate) bytes: bytes::Bytes,
     /// Orphan segments (key, version as observed) whose seqs were burned to
     /// get here; CAS-deleted after our commit.
     pub(crate) burned: Vec<(String, walgit_store::Version)>,
@@ -213,16 +217,17 @@ const ORPHAN_GRACE_PROBES: u32 = 3;
 const ORPHAN_GRACE_STEP: std::time::Duration = std::time::Duration::from_millis(100);
 /// Never burn more than this many seqs in one claim (a pile of orphans means
 /// something else is wrong).
-const MAX_BURN: u32 = 8;
+const MAX_BURN: usize = 8;
 
 /// Unconditional fresh read of the manifest (not the handle's cached view).
 pub(crate) async fn read_manifest_fresh(store: &Prefixed) -> Result<Option<Manifest>, WalError> {
     use walgit_store::ObjectStoreExt;
     match store.get_bytes(keys::MANIFEST).await? {
         Some((_, b)) => {
-            Ok(Some(Manifest::decode(b.as_ref()).map_err(|e| {
-                WalError::Corrupt(format!("manifest decode: {e}"))
-            })?))
+            let manifest = Manifest::decode(b.as_ref())
+                .map_err(|e| WalError::Corrupt(format!("manifest decode: {e}")))?;
+            crate::validate_manifest(&manifest)?;
+            Ok(Some(manifest))
         }
         None => Ok(None),
     }
@@ -239,9 +244,23 @@ pub(crate) async fn claim_log_slot(
     let mut burned: Vec<(String, walgit_store::Version)> = Vec::new();
     loop {
         let key = keys::log_segment_key(seq);
-        let bytes = encode(seq);
+        let encoded = encode(seq);
+        let (mut entries, consumed) = frame::decode_entries(&encoded)
+            .map_err(|error| WalError::Corrupt(format!("candidate log: {error}")))?;
+        if consumed != encoded.len() || entries.is_empty() {
+            return Err(WalError::Corrupt("incomplete candidate log".into()));
+        }
+        // Content-based version tokens can repeat after delete/recreate. A
+        // fresh nonce prevents a delayed delete from matching a later attempt.
+        if let Some(first) = entries.first_mut() {
+            first.meta.insert(
+                "walgit.publication_nonce".into(),
+                uuid::Uuid::new_v4().to_string(),
+            );
+        }
+        let bytes = frame::encode_entries(&entries);
         match store
-            .put(&key, PutBody::Bytes(bytes), PutMode::Create.into())
+            .put(&key, PutBody::Bytes(bytes.clone()), PutMode::Create.into())
             .await
         {
             Ok(meta) => {
@@ -249,6 +268,7 @@ pub(crate) async fn claim_log_slot(
                     key,
                     version: meta.version,
                     first_seq: seq,
+                    bytes,
                     burned,
                 }));
             }
@@ -259,7 +279,7 @@ pub(crate) async fn claim_log_slot(
         let mut probes = 0u32;
         let orphan_version = loop {
             let fresh = read_manifest_fresh(store).await?;
-            let fresh_head = fresh.as_ref().map(|m| m.head_seq).unwrap_or(0);
+            let fresh_head = fresh.as_ref().map_or(0, |m| m.head_seq);
             if fresh_head >= seq {
                 return Ok(ClaimOutcome::Contended);
             }
@@ -285,7 +305,7 @@ pub(crate) async fn claim_log_slot(
                     "orphaned log segment at the head (writer crashed between log PUT and manifest CAS); burning the seq"
                 );
                 burned.push((key, v));
-                if burned.len() as u32 >= MAX_BURN {
+                if burned.len() >= MAX_BURN {
                     return Err(WalError::Corrupt(format!(
                         "{MAX_BURN} consecutive orphaned log segments from seq {}",
                         head_seq + 1
@@ -312,17 +332,29 @@ pub(crate) async fn drop_own_slot(store: &Prefixed, slot: &LogSlot) {
 
 /// After a manifest CAS failed with a non-412 error: did the write land?
 /// `Ok(Some(manifest))` when the fresh manifest lists our segment (committed),
-/// `Ok(None)` when it does not (not committed; leave the orphan alone).
+/// `Ok(None)` when evidence is absent (unknown, not rejection; leave it alone).
 pub(crate) async fn cas_landed(
     store: &Prefixed,
     slot: &LogSlot,
-) -> Result<Option<Manifest>, WalError> {
-    let fresh = read_manifest_fresh(store).await?;
-    Ok(fresh.filter(|m| {
-        m.log_segments
-            .iter()
-            .any(|s| s.key == slot.key && s.first_seq == slot.first_seq)
-    }))
+) -> Result<Option<(Manifest, walgit_store::Version)>, WalError> {
+    use walgit_store::ObjectStoreExt;
+    let Some((meta, manifest)) =
+        crate::store_proto::get_message::<Manifest>(store, keys::MANIFEST).await?
+    else {
+        return Ok(None);
+    };
+    crate::validate_manifest(&manifest)?;
+    let listed = manifest.log_segments.iter().any(|s| {
+        s.key == slot.key && s.first_seq == slot.first_seq && s.size == slot.bytes.len() as u64
+    });
+    if !listed {
+        return Ok(None);
+    }
+    let exact = store
+        .get_bytes(&slot.key)
+        .await?
+        .is_some_and(|(_, bytes)| bytes == slot.bytes);
+    Ok(exact.then_some((manifest, meta.version)))
 }
 
 /// Verify a ref transaction against a working ref map. Returns per-ref results.
@@ -416,10 +448,7 @@ pub(crate) async fn publisher_task(
     let max_batch = handle.cfg.wal.max_batch;
 
     loop {
-        let first = match rx.recv().await {
-            Some(r) => r,
-            None => break,
-        };
+        let Some(first) = rx.recv().await else { break };
 
         let mut batch = Vec::with_capacity(max_batch.min(64));
         batch.push(first);
@@ -439,7 +468,7 @@ pub(crate) async fn publisher_task(
                     tokio::pin!(deadline);
                     loop {
                         tokio::select! {
-                            _ = &mut deadline => break,
+                            () = &mut deadline => break,
                             maybe_req = rx.recv() => {
                                 match maybe_req {
                                     Some(r) => {
@@ -500,49 +529,74 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
         {
             return finish_all_errors(batch, e);
         }
-        let manifest = handle.manifest.read().clone();
-        let head_seq = manifest.head_seq;
-        let known_version = handle.manifest_version.lock().clone();
-
-        // O(log refs) lookups over the cached snapshot + an overlay of what this
-        // batch applied; never an O(refs) map per push.
-        let mut working_refs = match handle.local.ref_view() {
-            Ok(v) => v,
-            Err(e) => return finish_all_errors(batch, WalError::from(e)),
+        // Pair the O(1) cached ref view with the CAS basis under the same
+        // lock that applies refs. Release it before any store or bulk work.
+        let (manifest, known_version, mut working_refs) = {
+            let _sync = handle.sync_mutex.lock().await;
+            let (manifest, version) = handle.manifest_pair();
+            let refs = match handle.local.ref_view() {
+                Ok(v) => v,
+                Err(e) => return finish_all_errors(batch, WalError::from(e)),
+            };
+            (manifest, version, refs)
         };
+        let head_seq = manifest.head_seq;
 
         // 2. Verify each txn against working ref map (+ explicit created_at
         //    must be monotonic: >= the head entry's time, >= earlier explicit
         //    times in this batch — the WAL's created_at order is history).
         let mut verified: Vec<Verified> = Vec::with_capacity(batch.len());
-        let mut floor: Option<std::time::SystemTime> = handle.last_entry_time.lock().clone();
+        let mut floor: Option<std::time::SystemTime> = *handle.last_entry_time.lock();
         for req in &batch {
             let mut per_ref = verify_txn(&req.txn, &working_refs);
+            let changes = req.pack.is_some()
+                || req.txn.updates.iter().any(|update| {
+                    if !update.new_symbolic_target.is_empty() {
+                        return update.name != "HEAD"
+                            || update.new_symbolic_target != working_refs.head_target();
+                    }
+                    let current = working_refs.get(&update.name).unwrap_or_default();
+                    if is_null_oid(&update.new_oid) {
+                        !current.is_empty()
+                    } else {
+                        current != update.new_oid
+                    }
+                });
             if let Some(ts) = &req.created_at {
                 let t = time::to_system(ts);
-                if let Some(f) = floor {
-                    if t < f {
-                        let msg = format!(
-                            "created_at {} is before the WAL head's {} (entries must be monotonic)",
-                            chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339(),
-                            chrono::DateTime::<chrono::Utc>::from(f).to_rfc3339()
-                        );
-                        for (_, r) in per_ref.iter_mut() {
-                            *r = Err(RefError::Rejected(msg.clone()));
-                        }
+                if let Some(f) = floor
+                    && t < f
+                {
+                    let msg = format!(
+                        "created_at {} is before the WAL head's {} (entries must be monotonic)",
+                        chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339(),
+                        chrono::DateTime::<chrono::Utc>::from(f).to_rfc3339()
+                    );
+                    for (_, r) in &mut per_ref {
+                        *r = Err(RefError::Rejected(msg.clone()));
                     }
                 }
-                if per_ref.iter().all(|(_, r)| r.is_ok()) {
+                if changes && per_ref.iter().all(|(_, r)| r.is_ok()) {
                     floor = Some(t);
                 }
             }
             let all_ok = per_ref.iter().all(|(_, r)| r.is_ok());
             if all_ok {
                 apply_txn_to_map(&req.txn, &mut working_refs);
+            } else {
+                for (_, status) in &mut per_ref {
+                    if status.is_ok() {
+                        *status = Err(RefError::Rejected(
+                            "another ref in the submission was rejected".into(),
+                        ));
+                    }
+                }
             }
             verified.push(Verified {
                 per_ref,
-                valid: all_ok,
+                // A no-op still validates its preconditions and reports success,
+                // but must not manufacture a log entry or claim a sibling's seq.
+                valid: all_ok && changes,
             });
         }
 
@@ -555,7 +609,7 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
             .collect();
 
         if valid_indices.is_empty() {
-            // All rejected — send responses and return
+            // Only rejected/no-op submissions: settle without a bucket write.
             let responses: Vec<PublishResult> = verified
                 .iter()
                 .map(|v| PublishResult {
@@ -572,13 +626,22 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
         // 4. Build log entries for valid requests. Seqs are assigned by the
         // slot claim (an orphan at head+1 may push us forward), so building
         // is a function of `first_seq`.
+        let published_at = time::now();
         let build = |first_seq: u64| -> (Vec<LogEntry>, Vec<PackRef>) {
             let mut entries = Vec::with_capacity(valid_indices.len());
             let mut new_packs = Vec::new();
-            for (offset, &idx) in valid_indices.iter().enumerate() {
+            for (offset, (req, _)) in batch
+                .iter()
+                .zip(&verified)
+                .filter(|(_, v)| v.valid)
+                .enumerate()
+            {
                 let seq = first_seq + offset as u64;
-                let req = &batch[idx];
-                let pack_ref = req.pack.as_ref().map(|p| pack_ref_from_ingested(p, seq));
+                let pack_ref = req.pack.as_ref().map(|p| {
+                    let mut descriptor = pack_ref_from_ingested(p, seq);
+                    descriptor.published_at = Some(published_at);
+                    descriptor
+                });
                 if let Some(pr) = &pack_ref {
                     new_packs.push(pr.clone());
                 }
@@ -590,7 +653,7 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
                     Vec::new(),
                     &req.meta,
                     &writer,
-                    req.created_at.clone(),
+                    req.created_at,
                 ));
             }
             (entries, new_packs)
@@ -609,12 +672,10 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
             Ok::<(), WalError>(())
         }
         .instrument(span.clone());
-        let mut frame_len = 0usize;
+
         let claim = claim_log_slot(&handle.store, head_seq, |first_seq| {
             let (entries, _) = build(first_seq);
-            let b = frame::encode_entries(entries.iter());
-            frame_len = b.len();
-            b
+            frame::encode_entries(entries.iter())
         })
         .instrument(span.clone());
         let (pack_result, claim_result) = tokio::join!(pack_uploads, claim);
@@ -636,30 +697,35 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
             }
             Err(e) => {
                 let msg = e.to_string();
-                return finish_with_error_msg(batch, &valid_indices, msg, e);
+                return finish_with_error_msg(batch, &valid_indices, &msg, e);
             }
         };
         let first_seq = slot.first_seq;
         let (entries, new_packs) = build(first_seq);
-        let last_seq = entries.last().unwrap().seq;
+        let Some(last_seq) = entries.last().map(|e| e.seq) else {
+            return finish_with_error(
+                batch,
+                &valid_indices,
+                WalError::Corrupt("empty publish log batch".into()),
+            );
+        };
 
         // 6. Build updated manifest
         let mut updated: Manifest = (*manifest).clone();
         updated.head_seq = last_seq;
         updated.packs.extend(new_packs.iter().cloned());
         updated.packs.sort_by_key(|p| p.seq);
-
         let seg_ref = LogSegmentRef {
             key: slot.key.clone(),
             first_seq,
             last_seq,
-            size: frame_len as u64,
+            size: slot.bytes.len() as u64,
             sealed: true,
         };
         updated.log_segments.push(seg_ref);
         updated.log_segments.sort_by_key(|s| s.first_seq);
         updated.updated_at = Some(time::now());
-        updated.writer = writer.to_string();
+        updated.writer = writer.clone();
         updated.revision += 1;
 
         // CAS manifest
@@ -680,181 +746,173 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
             .await;
         // A non-412 error is ambiguous: the bucket may have applied the CAS and
         // lost the response. Look before deciding.
-        let committed: Option<(Manifest, Option<walgit_store::Version>)> = match cas {
-            Ok(meta) => Some((updated, Some(meta.version))),
+        let committed: Option<(Manifest, walgit_store::Version)> = match cas {
+            Ok(meta) => Some((updated, meta.version)),
             Err(StoreError::PreconditionFailed { .. }) => None,
             Err(e) => match cas_landed(&handle.store, &slot)
                 .instrument(span.clone())
                 .await
             {
-                Ok(Some(fresh)) => {
+                Ok(Some((fresh, version))) => {
                     tracing::warn!(repo = %handle.id, seq = last_seq, "manifest CAS errored but landed: {e}");
-                    Some((fresh, None))
+                    Some((fresh, version))
                 }
                 Ok(None) => {
-                    // Not committed. Leave the segment: a later writer burns past
+                    // Outcome unknown. Leave the segment: a later writer burns past
                     // it and sweeps it; deleting here could race a lost-response
                     // commit that `cas_landed` itself failed to observe.
                     let msg = e.to_string();
-                    return finish_with_error_msg(batch, &valid_indices, msg, WalError::Store(e));
+                    return finish_with_error_msg(batch, &valid_indices, &msg, WalError::Store(e));
                 }
                 Err(e2) => {
                     let msg = format!("{e} (and re-reading the manifest failed: {e2})");
-                    return finish_with_error_msg(batch, &valid_indices, msg, WalError::Store(e));
+                    return finish_with_error_msg(batch, &valid_indices, &msg, WalError::Store(e));
                 }
             },
         };
 
-        match committed {
-            Some((committed, version)) => {
-                // Success! Update handle state. A landed-but-errored CAS leaves
-                // us without the new version: drop our cached one so the next
-                // sync refetches unconditionally.
-                let version = match version {
-                    Some(v) => v,
-                    None => match handle.store.head(keys::MANIFEST).await? {
-                        Some(m) => m.version,
-                        None => {
-                            return finish_with_error(
-                                batch,
-                                &valid_indices,
-                                WalError::Corrupt("manifest vanished after commit".into()),
-                            );
-                        }
-                    },
-                };
-                // The local commit — ref txns applied, then the new manifest version advertised — happens
-                // under `sync_mutex`, the lock the refs phase of every sync holds: a sync that already read
-                // the committed manifest would otherwise replay the same entry concurrently (two
-                // `git update-ref` on one ref → a lock collision: rig round 2447 of 2450, 2026-08-23) and a
-                // reader between the two steps would see one without the other. Refs first: the
-                // advertisement/ls-refs caches are keyed by the manifest version, and the reverse order let
-                // a reader cache the OLD refs under the NEW version (1 round in 6 on the rig).
-                //
-                // The WAL commit already happened (CAS ok) and is the truth: whatever the local apply does,
-                // every waiter is answered `ok`. A failed apply leaves the version unadvertised, so the next
-                // sync sees a change and replays the entry — the copy repairs itself. (Answering an error
-                // here produced a durable push that git reported as failed — "0 winners", commit fetchable.)
-                let mut local_ok = true;
+        if let Some((committed, version)) = committed {
+            // The local commit — ref txns applied, then the new manifest version advertised — happens
+            // under `sync_mutex`, the lock the refs phase of every sync holds: a sync that already read
+            // the committed manifest would otherwise replay the same entry concurrently (two
+            // `git update-ref` on one ref → a lock collision: rig round 2447 of 2450, 2026-08-23) and a
+            // reader between the two steps would see one without the other. Refs first: the
+            // advertisement/ls-refs caches are keyed by the manifest version, and the reverse order let
+            // a reader cache the OLD refs under the NEW version (1 round in 6 on the rig).
+            //
+            // The WAL commit already happened (CAS ok) and is the truth: whatever the local apply does,
+            // every waiter is answered `ok`. A failed apply leaves the version unadvertised, so the next
+            // sync sees a change and replays the entry — the copy repairs itself. (Answering an error
+            // here produced a durable push that git reported as failed — "0 winners", commit fetchable.)
+            let mut local_ok = true;
+            {
+                let _sync_guard = crate::lockwait::timed(
+                    "sync_mutex",
+                    &handle.id,
+                    handle.cfg.telemetry.lock_wait_warn,
+                    || handle.sync_mutex.try_lock().ok(),
+                    handle.sync_mutex.lock(),
+                )
+                .await;
+                let applied_seq = handle.state.lock().applied_seq;
+                let already_applied = applied_seq >= last_seq;
+                if applied_seq < committed.head_seq
+                    && committed.head_seq > last_seq
+                    && let Err(e) = crate::sync::apply_delta(handle, &committed, &version).await
                 {
-                    let _sync_guard = crate::lockwait::timed(
-                        "sync_mutex",
-                        &handle.id,
-                        handle.cfg.telemetry.lock_wait_warn,
-                        || handle.sync_mutex.try_lock().ok(),
-                        handle.sync_mutex.lock(),
-                    )
-                    .await;
-                    for &idx in &valid_indices {
-                        if let Err(e) = handle.local.apply_ref_txn(&batch[idx].txn, false) {
-                            tracing::warn!(repo = %handle.id, seq = last_seq, error = %e, "published (CAS ok), but applying the ref txn to the local copy failed; the next sync replays it");
-                            metrics::counter!("walgit_publish_local_apply_failed_total")
-                                .increment(1);
-                            local_ok = false;
-                            break;
-                        }
-                    }
-                    if local_ok && let Err(e) = handle.local.refresh_async().await {
-                        tracing::warn!(repo = %handle.id, seq = last_seq, error = %e, "published (CAS ok), but refreshing the local copy failed; the next sync repairs it");
+                    tracing::warn!(error = %e, "landed push catch-up failed; next sync repairs it");
+                    local_ok = false;
+                }
+                for (req, _) in batch
+                    .iter()
+                    .zip(&verified)
+                    .filter(|(_, v)| v.valid && !already_applied && committed.head_seq == last_seq)
+                {
+                    if let Err(e) = handle.local.apply_ref_txn(&req.txn, false) {
+                        tracing::warn!(repo = %handle.id, seq = last_seq, error = %e, "published (CAS ok), but applying the ref txn to the local copy failed; the next sync replays it");
+                        metrics::counter!("walgit_publish_local_apply_failed_total").increment(1);
                         local_ok = false;
+                        break;
                     }
-                    // Test hook: widen the gap between the two local-commit steps (harmless in this order
-                    // and under this lock; the poison window with the steps reversed and no lock).
-                    if let Some(ms) = std::env::var("WALGIT_TEST_PUBLISH_GAP_MS")
-                        .ok()
-                        .and_then(|v| v.parse::<u64>().ok())
+                }
+                if local_ok && let Err(e) = handle.local.refresh_async().await {
+                    tracing::warn!(repo = %handle.id, seq = last_seq, error = %e, "published (CAS ok), but refreshing the local copy failed; the next sync repairs it");
+                    local_ok = false;
+                }
+                // Test hook: widen the gap between the two local-commit steps (harmless in this order
+                // and under this lock; the poison window with the steps reversed and no lock).
+                if let Some(ms) = std::env::var("WALGIT_TEST_PUBLISH_GAP_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                }
+                if local_ok && handle.adopt_manifest(Arc::new(committed.clone()), version.clone()) {
                     {
-                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-                    }
-                    if local_ok {
-                        *handle.manifest.write() = Arc::new(committed.clone());
-                        *handle.manifest_version.lock() = Some(version.clone());
-                        {
-                            let mut state = handle.state.lock();
-                            state.manifest_version = Some(version.as_str().to_string());
-                            state.applied_seq = last_seq;
-                            let ready = state.packs_ready();
-                            state.revision = committed.revision;
-                            if ready {
-                                state.packs_revision = committed.revision;
-                            }
+                        let mut state = handle.state.lock();
+                        state.manifest_version = Some(version.as_str().to_string());
+                        state.applied_seq = committed.head_seq;
+                        let ready = state.packs_ready()
+                            && state.revision == manifest.revision
+                            && committed.revision == manifest.revision + 1;
+                        state.revision = committed.revision;
+                        if ready {
+                            state.packs_revision = committed.revision;
                         }
-                        if let Err(e) = crate::state::save_state(
-                            handle.local.path(),
-                            &handle.state.lock().clone(),
-                        ) {
-                            tracing::warn!(repo = %handle.id, error = %e, "published (CAS ok), but saving local state failed; the next sync repairs it");
-                        }
-                    } else {
-                        // Forget the known version so the next sync performs an unconditional GET and
-                        // replays from the last applied seq.
-                        handle.manifest_version.lock().take();
                     }
-                }
-                sweep_burned(&handle.store, &slot)
-                    .instrument(span.clone())
-                    .await;
-
-                for e in &entries {
-                    if let Some(t) = e.created_at.as_ref() {
-                        note_entry_time(handle, e.seq, t);
+                    if let Err(e) =
+                        crate::state::save_state(handle.local.path(), &handle.state.lock().clone())
+                    {
+                        tracing::warn!(repo = %handle.id, error = %e, "published (CAS ok), but saving local state failed; the next sync repairs it");
                     }
+                } else if !local_ok {
+                    // Forget the known version so the next sync performs an unconditional GET and
+                    // replays from the last applied seq.
+                    handle.manifest_version.lock().take();
                 }
-                // Fold the pushed packs' commits into the local commit-graph
-                // chain (cheap, incremental; off the client's critical path).
-                if !new_packs.is_empty() {
-                    if let Some(arc) = handle.self_arc.get().cloned() {
-                        let packs = new_packs.clone();
-                        tokio::spawn(async move {
-                            let manifest = arc.manifest();
-                            crate::sync::maintain_commit_graph(&arc, &manifest, &packs).await;
-                        });
-                    }
-                }
-
-                // Build all responses (success for valid, rejection for invalid)
-                let mut responses: Vec<PublishResult> = Vec::with_capacity(batch.len());
-                for (i, v) in verified.iter().enumerate() {
-                    if v.valid {
-                        let offset = valid_indices.iter().position(|&vi| vi == i).unwrap();
-                        let seq = first_seq + offset as u64;
-                        responses.push(PublishResult {
-                            seq,
-                            per_ref: v.per_ref.clone(),
-                        });
-                    } else {
-                        responses.push(PublishResult {
-                            seq: 0,
-                            per_ref: v.per_ref.clone(),
-                        });
-                    }
-                }
-
-                // Consume batch and send responses
-                for (req, resp) in batch.into_iter().zip(responses) {
-                    let _ = req.response.send(Ok(resp));
-                }
-
-                // Maybe trigger checkpoint
-                maybe_trigger_checkpoint(handle, last_seq);
-
-                span.record("seq", last_seq);
-                span.record("cas_retries", attempts);
-                return Ok(());
             }
-            None => {
-                // Lost the CAS: drop exactly the segment we wrote, re-sync, retry.
-                drop_own_slot(&handle.store, &slot)
-                    .instrument(span.clone())
-                    .await;
-                attempts += 1;
-                if attempts >= max_retries {
-                    span.record("cas_retries", attempts);
-                    return finish_with_error(batch, &valid_indices, WalError::Retry { attempts });
+            sweep_burned(&handle.store, &slot)
+                .instrument(span.clone())
+                .await;
+
+            for e in &entries {
+                if let Some(t) = e.created_at.as_ref() {
+                    note_entry_time(handle, e.seq, t);
                 }
-                continue;
             }
+            // Fold the pushed packs' commits into the local commit-graph
+            // chain (cheap, incremental; off the client's critical path).
+            if !new_packs.is_empty()
+                && let Some(arc) = handle.self_arc.get().cloned()
+            {
+                let packs = new_packs.clone();
+                tokio::spawn(async move {
+                    let manifest = arc.manifest();
+                    crate::sync::maintain_commit_graph(&arc, &manifest, &packs).await;
+                });
+            }
+
+            // Build all responses (success for valid, rejection for invalid)
+            let mut responses: Vec<PublishResult> = Vec::with_capacity(batch.len());
+            let mut valid_offset = 0u64;
+            for v in &verified {
+                if v.valid {
+                    let seq = first_seq + valid_offset;
+                    valid_offset += 1;
+                    responses.push(PublishResult {
+                        seq,
+                        per_ref: v.per_ref.clone(),
+                    });
+                } else {
+                    responses.push(PublishResult {
+                        seq: 0,
+                        per_ref: v.per_ref.clone(),
+                    });
+                }
+            }
+
+            // Consume batch and send responses
+            for (req, resp) in batch.into_iter().zip(responses) {
+                let _ = req.response.send(Ok(resp));
+            }
+
+            // Maybe trigger checkpoint
+            maybe_trigger_checkpoint(handle, last_seq);
+
+            span.record("seq", last_seq);
+            span.record("cas_retries", attempts);
+            return Ok(());
         }
+        // Lost the CAS: drop exactly the segment we wrote, re-sync, retry.
+        drop_own_slot(&handle.store, &slot)
+            .instrument(span.clone())
+            .await;
+        attempts += 1;
+        if attempts >= max_retries {
+            span.record("cas_retries", attempts);
+            return finish_with_error(batch, &valid_indices, WalError::Retry { attempts });
+        }
+        continue;
     }
 }
 
@@ -868,7 +926,7 @@ fn finish_all_errors(batch: Vec<PublishRequest>, err: WalError) -> Result<(), Wa
     Err(err)
 }
 /// Send error responses to valid request senders, then return the error.
-/// Converts the error to a string for each sender since WalError is not Clone.
+/// Converts the error to a string for each sender since `WalError` is not Clone.
 fn finish_with_error(
     batch: Vec<PublishRequest>,
     valid_indices: &[usize],
@@ -880,7 +938,7 @@ fn finish_with_error(
     // batch error too rather than dropping the channel ("publisher dropped
     // response" told the caller nothing).
     let _ = valid_indices;
-    for req in batch.into_iter() {
+    for req in batch {
         let _ = req.response.send(Err(WalError::Corrupt(msg.clone())));
     }
     Err(err)
@@ -889,12 +947,14 @@ fn finish_with_error(
 fn finish_with_error_msg(
     batch: Vec<PublishRequest>,
     valid_indices: &[usize],
-    msg: String,
+    msg: &str,
     err: WalError,
 ) -> Result<(), WalError> {
     let _ = valid_indices;
-    for req in batch.into_iter() {
-        let _ = req.response.send(Err(WalError::Corrupt(msg.clone())));
+    for req in batch {
+        let _ = req
+            .response
+            .send(Err(WalError::CommitUnknown(msg.to_owned())));
     }
     Err(err)
 }
@@ -903,19 +963,19 @@ fn maybe_trigger_checkpoint(handle: &RepoHandle, _head_seq: u64) {
     // Opportunistic: the writer that crossed a trigger folds the log. The
     // `maintain` role covers repos nobody pushes to (age trigger).
     let due = crate::checkpoint::checkpoint_due(&handle.manifest.read(), &handle.cfg.wal);
-    if let Some(trigger) = due {
-        if let Some(arc) = handle.self_arc.get().cloned() {
-            tokio::spawn(async move {
-                match crate::checkpoint::write_checkpoint_impl(&arc).await {
-                    Ok(cp) => {
-                        tracing::info!(repo = %arc.id, seq = cp.seq, %trigger, "auto checkpoint written")
-                    }
-                    Err(e) => {
-                        tracing::warn!(repo = %arc.id, %trigger, "auto checkpoint failed: {e}")
-                    }
+    if let Some(trigger) = due
+        && let Some(arc) = handle.self_arc.get().cloned()
+    {
+        tokio::spawn(async move {
+            match crate::checkpoint::write_checkpoint_impl(&arc).await {
+                Ok(cp) => {
+                    tracing::info!(repo = %arc.id, seq = cp.seq, %trigger, "auto checkpoint written");
                 }
-            });
-        }
+                Err(e) => {
+                    tracing::warn!(repo = %arc.id, %trigger, "auto checkpoint failed: {e}");
+                }
+            }
+        });
     }
 }
 
@@ -942,6 +1002,17 @@ pub(crate) async fn publish_compact_impl(
     new_pack: PackInfo,
     supersedes: Vec<gix_hash::ObjectId>,
     tier: u32,
+) -> Result<u64, WalError> {
+    publish_compact_classified(handle, new_pack, supersedes, tier, None, &[]).await
+}
+
+pub(crate) async fn publish_compact_classified(
+    handle: &RepoHandle,
+    new_pack: PackInfo,
+    supersedes: Vec<gix_hash::ObjectId>,
+    tier: u32,
+    classification: Option<&crate::PackClassification>,
+    candidates: &[crate::CoverageSnapshot],
 ) -> Result<u64, WalError> {
     let writer = crate::handle::instance_id();
     let max_retries = handle.cfg.wal.cas_max_retries;
@@ -984,7 +1055,10 @@ pub(crate) async fn publish_compact_impl(
     }
 
     let pack_ref = pack_ref_from_info(&new_pack, 0, tier); // seq set below
-    let supersedes_hex: Vec<String> = supersedes.iter().map(|o| o.to_string()).collect();
+    let supersedes_hex: Vec<String> = supersedes
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
 
     let mut attempts = 0u32;
 
@@ -993,9 +1067,23 @@ pub(crate) async fn publish_compact_impl(
             handle.sync_impl().await?;
         }
 
-        let manifest = handle.manifest.read().clone();
-        let known_version = handle.manifest_version.lock().clone();
+        let (manifest, known_version) = handle.manifest_pair();
 
+        let mut pack_ref = pack_ref.clone();
+        if let Some(classification) = classification {
+            if classification.checksum != pack_ref.checksum {
+                return Err(WalError::Invalid(
+                    "classification names another output".into(),
+                ));
+            }
+            classification.apply(&mut pack_ref);
+        } else if let Some(previous) = manifest
+            .packs
+            .iter()
+            .find(|p| p.checksum == pack_ref.checksum)
+        {
+            crate::PackClassification::from_pack(previous).apply(&mut pack_ref);
+        }
         let entry_time = time::now();
         let make_entry = |seq: u64| LogEntry {
             seq,
@@ -1008,15 +1096,13 @@ pub(crate) async fn publish_compact_impl(
             supersedes: supersedes_hex.clone(),
             checkpoint: None,
             created_at: Some(entry_time),
-            writer: writer.to_string(),
+            writer: writer.clone(),
             meta: HashMap::new(),
             settings: None,
         };
-        let mut frame_len = 0usize;
+
         let slot = match claim_log_slot(&handle.store, manifest.head_seq, |seq| {
-            let b = frame::encode_entries(std::iter::once(&make_entry(seq)));
-            frame_len = b.len();
-            b
+            frame::encode_entries(std::iter::once(&make_entry(seq)))
         })
         .await?
         {
@@ -1034,8 +1120,16 @@ pub(crate) async fn publish_compact_impl(
         // Build updated manifest
         let mut updated: Manifest = (*manifest).clone();
         updated.head_seq = seq;
-        let sup_set: std::collections::HashSet<&str> =
-            supersedes_hex.iter().map(|s| s.as_str()).collect();
+        let retired: Vec<_> = supersedes_hex
+            .iter()
+            .filter(|id| **id != pack_ref.checksum)
+            .cloned()
+            .collect();
+        updated.retire_packs(&retired, seq);
+        let sup_set: std::collections::HashSet<&str> = supersedes_hex
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
         updated
             .packs
             .retain(|p| !sup_set.contains(p.checksum.as_str()) && p.checksum != pack_ref.checksum);
@@ -1045,17 +1139,29 @@ pub(crate) async fn publish_compact_impl(
         });
         updated.packs.sort_by_key(|p| p.seq);
 
+        let changed = vec![pack_ref.checksum.clone()];
+        let cfg = handle.validated_config_for_manifest(&manifest)?;
+        crate::classification::prune_invalid_coverages(&mut updated, &cfg, &changed);
+        if let Err(e) = crate::classification::validate_certificates(
+            handle, &manifest, &updated, &changed, candidates,
+        )
+        .await
+        {
+            drop_own_slot(&handle.store, &slot).await;
+            return Err(e);
+        }
+
         let seg_ref = LogSegmentRef {
             key: slot.key.clone(),
             first_seq: seq,
             last_seq: seq,
-            size: frame_len as u64,
+            size: slot.bytes.len() as u64,
             sealed: true,
         };
         updated.log_segments.push(seg_ref);
         updated.log_segments.sort_by_key(|s| s.first_seq);
         updated.updated_at = Some(time::now());
-        updated.writer = writer.to_string();
+        updated.writer = writer.clone();
         updated.revision += 1;
 
         let buf = updated.encode_to_vec();
@@ -1076,58 +1182,58 @@ pub(crate) async fn publish_compact_impl(
             Ok(meta) => Some((updated, meta.version)),
             Err(StoreError::PreconditionFailed { .. }) => None,
             Err(e) => match cas_landed(&handle.store, &slot).await {
-                Ok(Some(fresh)) => {
+                Ok(Some((fresh, version))) => {
                     tracing::warn!(repo = %handle.id, seq, "compact manifest CAS errored but landed: {e}");
-                    let v = handle
-                        .store
-                        .head(keys::MANIFEST)
-                        .await?
-                        .map(|m| m.version)
-                        .ok_or_else(|| {
-                            WalError::Corrupt("manifest vanished after commit".into())
-                        })?;
-                    Some((fresh, v))
+                    Some((fresh, version))
                 }
-                Ok(None) => return Err(WalError::Store(e)),
-                Err(_) => return Err(WalError::Store(e)),
+                Ok(None) | Err(_) => return Err(WalError::Store(e)),
             },
         };
-        match committed {
-            Some((committed, version)) => {
-                *handle.manifest.write() = Arc::new(committed.clone());
-                *handle.manifest_version.lock() = Some(version.clone());
-                note_entry_time(handle, seq, &entry_time);
-                {
-                    let mut state = handle.state.lock();
-                    state.manifest_version = Some(version.as_str().to_string());
-                    state.applied_seq = seq;
-                    // The publisher's own superseded packs are removed by the next pack sync like
-                    // everyone else's (a scratch-copy base rebuild leaves them in the serving copy;
-                    // a geometric fold already deleted them — the removal is then a no-op).
-                    for s in &supersedes_hex {
-                        if !state.pending_pack_removals.contains(s) {
-                            state.pending_pack_removals.push(s.clone());
-                        }
-                    }
-                    let ready = state.packs_ready();
-                    state.revision = committed.revision;
-                    if ready {
-                        state.packs_revision = committed.revision;
-                    }
-                }
-                crate::state::save_state(handle.local.path(), &handle.state.lock().clone())?;
-                sweep_burned(&handle.store, &slot).await;
+        if let Some((committed, version)) = committed {
+            let _sync = handle.sync_mutex.lock().await;
+            let applied_seq = handle.state.lock().applied_seq;
+            if committed.head_seq > seq
+                && applied_seq < committed.head_seq
+                && let Err(e) = crate::sync::apply_delta(handle, &committed, &version).await
+            {
+                tracing::warn!(error = %e, "landed compact catch-up failed; next sync repairs it");
+                handle.manifest_version.lock().take();
                 return Ok(seq);
             }
-            None => {
-                drop_own_slot(&handle.store, &slot).await;
-                attempts += 1;
-                if attempts >= max_retries {
-                    return Err(WalError::Retry { attempts });
-                }
-                continue;
+            if !handle.adopt_manifest(Arc::new(committed.clone()), version.clone()) {
+                return Ok(seq);
             }
+            note_entry_time(handle, seq, &entry_time);
+            {
+                let mut state = handle.state.lock();
+                state.manifest_version = Some(version.as_str().to_string());
+                state.applied_seq = committed.head_seq;
+                // The publisher's own superseded packs are removed by the next pack sync like
+                // everyone else's (a scratch-copy base rebuild leaves them in the serving copy;
+                // a geometric fold already deleted them — the removal is then a no-op).
+                for s in &supersedes_hex {
+                    if !state.pending_pack_removals.contains(s) {
+                        state.pending_pack_removals.push(s.clone());
+                    }
+                }
+                let ready = state.packs_ready()
+                    && state.revision == manifest.revision
+                    && committed.revision == manifest.revision + 1;
+                state.revision = committed.revision;
+                if ready {
+                    state.packs_revision = committed.revision;
+                }
+            }
+            crate::state::save_state(handle.local.path(), &handle.state.lock().clone())?;
+            sweep_burned(&handle.store, &slot).await;
+            return Ok(seq);
         }
+        drop_own_slot(&handle.store, &slot).await;
+        attempts += 1;
+        if attempts >= max_retries {
+            return Err(WalError::Retry { attempts });
+        }
+        continue;
     }
 }
 
@@ -1183,8 +1289,7 @@ pub(crate) async fn annotate_pack_impl(
     }
     let mut attempts = 0u32;
     loop {
-        let current = handle.manifest.read().clone();
-        let known_version = handle.manifest_version.lock().clone();
+        let (current, known_version) = handle.manifest_pair();
         let mut updated: Manifest = (*current).clone();
         let Some(p) = updated.packs.iter_mut().find(|p| p.checksum == checksum) else {
             return Err(WalError::Corrupt(format!(
@@ -1202,7 +1307,7 @@ pub(crate) async fn annotate_pack_impl(
         }
         let pack_ref = p.clone();
         updated.updated_at = Some(time::now());
-        updated.writer = writer.to_string();
+        updated.writer = writer.clone();
         updated.revision += 1;
         let mode = match &known_version {
             Some(v) => PutMode::Update(v.clone()),
@@ -1218,8 +1323,10 @@ pub(crate) async fn annotate_pack_impl(
             .await
         {
             Ok(meta) => {
-                *handle.manifest.write() = Arc::new(updated.clone());
-                *handle.manifest_version.lock() = Some(meta.version.clone());
+                let _sync = handle.sync_mutex.lock().await;
+                if !handle.adopt_manifest(Arc::new(updated.clone()), meta.version.clone()) {
+                    return Ok(pack_ref);
+                }
                 {
                     let mut state = handle.state.lock();
                     state.manifest_version = Some(meta.version.as_str().to_string());
@@ -1263,7 +1370,10 @@ pub(crate) async fn add_pack_impl(
     let checksum = gix_hash::ObjectId::from_hex(hex.as_bytes())
         .map_err(|e| WalError::Corrupt(format!("bad pack name {name}: {e}")))?;
     let dest = handle.local.pack_path(&checksum);
-    std::fs::create_dir_all(dest.parent().unwrap())?;
+    std::fs::create_dir_all(
+        dest.parent()
+            .ok_or_else(|| WalError::Corrupt("destination has no parent".into()))?,
+    )?;
     for (src, dst) in [(pack, dest.clone()), (idx, dest.with_extension("idx"))] {
         if !dst.exists() && std::fs::hard_link(src, &dst).is_err() {
             std::fs::copy(src, &dst)?;
@@ -1297,9 +1407,8 @@ pub(crate) async fn publish_settings_impl(
     let mut attempts = 0u32;
     loop {
         handle.sync_impl_level(crate::sync::SyncLevel::Refs).await?;
-        let manifest = handle.manifest.read().clone();
-        let known_version = handle.manifest_version.lock().clone();
-        let revision = manifest.settings.as_ref().map(|s| s.revision).unwrap_or(0) + 1;
+        let (manifest, known_version) = handle.manifest_pair();
+        let revision = manifest.settings.as_ref().map_or(0, |s| s.revision) + 1;
         let settings = walgit_proto::v1::RepoSettings {
             toml: toml_text.to_string(),
             revision,
@@ -1316,18 +1425,16 @@ pub(crate) async fn publish_settings_impl(
             supersedes: Vec::new(),
             checkpoint: None,
             created_at: Some(entry_time),
-            writer: writer.to_string(),
+            writer: writer.clone(),
             meta: HashMap::from([
                 ("author".to_string(), author.to_string()),
                 ("message".to_string(), message.to_string()),
             ]),
             settings: Some(settings.clone()),
         };
-        let mut frame_len = 0usize;
+
         let slot = match claim_log_slot(&handle.store, manifest.head_seq, |seq| {
-            let b = frame::encode_entries(std::iter::once(&make_entry(seq)));
-            frame_len = b.len();
-            b
+            frame::encode_entries(std::iter::once(&make_entry(seq)))
         })
         .await?
         {
@@ -1348,12 +1455,12 @@ pub(crate) async fn publish_settings_impl(
             key: slot.key.clone(),
             first_seq: seq,
             last_seq: seq,
-            size: frame_len as u64,
+            size: slot.bytes.len() as u64,
             sealed: true,
         });
         updated.log_segments.sort_by_key(|s| s.first_seq);
         updated.updated_at = Some(time::now());
-        updated.writer = writer.to_string();
+        updated.writer = writer.clone();
         updated.revision += 1;
         let buf = updated.encode_to_vec();
         let mode = match &known_version {
@@ -1370,14 +1477,22 @@ pub(crate) async fn publish_settings_impl(
             .await
         {
             Ok(meta) => {
-                *handle.manifest.write() = Arc::new(updated.clone());
-                *handle.manifest_version.lock() = Some(meta.version.clone());
+                let _sync = handle.sync_mutex.lock().await;
+                if !handle.adopt_manifest(Arc::new(updated.clone()), meta.version.clone()) {
+                    return Ok(revision);
+                }
                 note_entry_time(handle, seq, &entry_time);
                 {
                     let mut state = handle.state.lock();
                     state.manifest_version = Some(meta.version.as_str().to_string());
+                    let ready = state.packs_ready()
+                        && state.revision == manifest.revision
+                        && manifest.packs == updated.packs;
                     state.applied_seq = seq;
                     state.revision = updated.revision;
+                    if ready {
+                        state.packs_revision = updated.revision;
+                    }
                 }
                 crate::state::save_state(handle.local.path(), &handle.state.lock().clone())?;
                 *handle.effective.lock() = None;
@@ -1395,5 +1510,59 @@ pub(crate) async fn publish_settings_impl(
             }
             Err(e) => return Err(WalError::Store(e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::*;
+    use walgit_store::ObjectStoreExt;
+
+    #[tokio::test]
+    async fn recreated_claims_have_distinct_bytes_and_resolution_checks_identity()
+    -> anyhow::Result<()> {
+        let truth = walgit_store::memory::MemoryStore::shared();
+        let store = Prefixed::new(truth, "repos/o/claims/");
+        let encode = |seq| {
+            frame::encode_entries([&LogEntry {
+                seq,
+                kind: EntryKind::Push as i32,
+                ..Default::default()
+            }])
+        };
+        let ClaimOutcome::Claimed(first) = claim_log_slot(&store, 0, encode).await? else {
+            anyhow::bail!("uncontended claim expected");
+        };
+        drop_own_slot(&store, &first).await;
+        let ClaimOutcome::Claimed(second) = claim_log_slot(&store, 0, encode).await? else {
+            anyhow::bail!("uncontended recreated claim expected");
+        };
+        assert_ne!(
+            first.bytes, second.bytes,
+            "content-based tokens must not alias attempts"
+        );
+        let manifest = Manifest {
+            format_version: walgit_proto::WAL_FORMAT_VERSION,
+            object_format: "sha1".into(),
+            head_seq: 1,
+            min_seq: 1,
+            log_segments: vec![LogSegmentRef {
+                key: second.key.clone(),
+                first_seq: 1,
+                last_seq: 1,
+                size: second.bytes.len() as u64,
+                sealed: true,
+            }],
+            ..Default::default()
+        };
+        store
+            .put_bytes(keys::MANIFEST, manifest.encode_to_vec(), PutMode::Create)
+            .await?;
+        assert!(
+            cas_landed(&store, &first).await?.is_none(),
+            "same key and sequence are insufficient"
+        );
+        assert!(cas_landed(&store, &second).await?.is_some());
+        Ok(())
     }
 }

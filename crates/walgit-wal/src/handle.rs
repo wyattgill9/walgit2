@@ -1,4 +1,4 @@
-//! RepoHandle: per-repository state, sync, publish, checkpoint.
+//! `RepoHandle`: per-repository state, sync, publish, checkpoint.
 
 use std::collections::HashMap;
 use std::sync::{
@@ -46,7 +46,7 @@ pub struct RepoHandle {
 
     // Prevents pack removal during reads. Uses tokio::sync::RwLock because
     // guards are held across .await points (freshness check, apply_delta).
-    pub(crate) rw: TokioRwLock<()>,
+    pub(crate) rw: Arc<TokioRwLock<()>>,
     // Single in-flight sync.
     pub(crate) sync_mutex: TokioMutex<()>,
     /// Serializes pack reconciliation (downloads/links/removals). Held
@@ -128,6 +128,10 @@ impl ObjectAccess {
 }
 
 impl RepoHandle {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Repository construction combines the shared services and loaded WAL state"
+    )]
     pub(crate) fn new(
         id: RepoId,
         local: LocalRepo,
@@ -145,7 +149,7 @@ impl RepoHandle {
             local,
             store,
             cfg,
-            rw: TokioRwLock::new(()),
+            rw: Arc::new(TokioRwLock::new(())),
             sync_mutex: TokioMutex::new(()),
             pack_mutex: TokioMutex::new(()),
             manifest: PLRwLock::new(Arc::new(manifest)),
@@ -266,10 +270,10 @@ impl RepoHandle {
             return Ok((guard, ObjectAccess::Local));
         }
         // Remote: reuse the reader for this manifest revision, else (re)open.
-        if let Some(r) = self.remote.lock().clone() {
-            if r.revision == manifest.revision {
-                return Ok((guard, ObjectAccess::Remote(r)));
-            }
+        if let Some(r) = self.remote.lock().clone()
+            && r.revision == manifest.revision
+        {
+            return Ok((guard, ObjectAccess::Remote(r)));
         }
         let remote = self.open_remote(&manifest).await?;
         Ok((guard, ObjectAccess::Remote(remote)))
@@ -322,7 +326,7 @@ impl RepoHandle {
             }
             Begin::AlreadyRunning(state) => {
                 // Another request is opening it: wait for that task, then reuse.
-                let _ = state.wait_done(std::time::Duration::from_secs(600)).await;
+                let _ = state.wait_done(std::time::Duration::from_mins(10)).await;
                 match state.outcome() {
                     Some(Ok(_)) => {}
                     Some(Err((_, m))) => {
@@ -364,6 +368,24 @@ impl RepoHandle {
         self.manifest.read().clone()
     }
 
+    /// Capture the exact manifest and its CAS token atomically.
+    pub fn manifest_pair(&self) -> (Arc<Manifest>, Option<Version>) {
+        let manifest = self.manifest.read();
+        (manifest.clone(), self.manifest_version.lock().clone())
+    }
+
+    /// Caller serializes ref application with `sync_mutex`. A late successful
+    /// publisher must not roll a cache back after another request synced ahead.
+    pub(crate) fn adopt_manifest(&self, manifest: Arc<Manifest>, version: Version) -> bool {
+        let mut current = self.manifest.write();
+        if current.revision > manifest.revision {
+            return false;
+        }
+        *self.manifest_version.lock() = Some(version);
+        *current = manifest;
+        true
+    }
+
     pub fn manifest_version(&self) -> Option<Version> {
         self.manifest_version.lock().clone()
     }
@@ -398,6 +420,13 @@ impl RepoHandle {
     /// Like [`sync`] but every pack is a real local copy (base rebuilds,
     /// bundle builds and anything else that streams whole packs). Refused with
     /// `TooLarge` when the set does not fit `cache.max_bytes`.
+    /// Pin installed object files across an owned blocking maintenance task.
+    /// Unlike a borrowed request guard, cancellation of its caller cannot release
+    /// this pin while a detached blocking worker still copies the input files.
+    pub async fn pin_local_objects(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.rw.clone().read_owned().await
+    }
+
     pub async fn sync_full(&self) -> Result<crate::sync::ReadGuard<'_>, WalError> {
         self.sync_level(SyncLevel::Full).await
     }
@@ -414,6 +443,14 @@ impl RepoHandle {
             self.spawn_pack_prefetch();
         }
         Ok(guard)
+    }
+
+    /// Revalidate immutable download membership without materializing pack data.
+    /// Bucket existence alone never authorizes a pack or index download.
+    pub async fn serves_pack_fresh(&self, checksum: &str) -> Result<bool, WalError> {
+        let _sync = self.sync_mutex.lock().await;
+        self.sync_locked_inner(&tracing::Span::current()).await?;
+        Ok(self.manifest().serves_pack(checksum))
     }
 
     /// Whether a refs-level sync should pull the serving copy in the background:
@@ -644,33 +681,30 @@ impl RepoHandle {
         // The whole materialization runs on the bulk runtime (own threads):
         // nothing in it can stall this runtime's request workers.
         let arc = self.self_arc.get().cloned();
-        let res = match arc {
-            Some(arc) => {
-                let m = manifest.clone();
-                let task_span = task.as_ref().map(|t| t.span());
-                crate::sync::on_bulk_runtime(async move {
-                    let work = async {
-                        crate::sync::reconcile_packs(&arc, &m, level).await?;
-                        arc.local.refresh_async().await?;
-                        Ok::<(), WalError>(())
-                    };
-                    match task_span {
-                        Some(sp) => work.instrument(sp).await,
-                        None => work.await,
-                    }
-                })
-                .await
-            }
-            None => {
-                let res = async {
-                    crate::sync::reconcile_packs(self, &manifest, level).await?;
-                    self.local.refresh_async().await?;
+        let res = if let Some(arc) = arc {
+            let m = manifest.clone();
+            let task_span = task.as_ref().map(super::tasks::TaskHandle::span);
+            crate::sync::on_bulk_runtime(async move {
+                let work = async {
+                    crate::sync::reconcile_packs(&arc, &m, level).await?;
+                    arc.local.refresh_async().await?;
                     Ok::<(), WalError>(())
                 };
-                match &task {
-                    Some(t) => res.instrument(t.span()).await,
-                    None => res.await,
+                match task_span {
+                    Some(sp) => work.instrument(sp).await,
+                    None => work.await,
                 }
+            })
+            .await
+        } else {
+            let res = async {
+                crate::sync::reconcile_packs(self, &manifest, level).await?;
+                self.local.refresh_async().await?;
+                Ok::<(), WalError>(())
+            };
+            match &task {
+                Some(t) => res.instrument(t.span()).await,
+                None => res.await,
             }
         };
         *self.active_reporter.lock() = None;
@@ -734,8 +768,10 @@ impl RepoHandle {
                 .collect();
         }
         let mount = self.mount_dir();
-        if mount.is_none() && self.cfg.cache.store_mount.is_some() {
-            tracing::warn!(repo = %self.id, mount = %self.cfg.cache.store_mount.as_ref().unwrap().display(), "store mount configured but the repository directory is not visible in it (gcsfuse not up yet?): base packs served remotely until it is");
+        if mount.is_none()
+            && let Some(store_mount) = &self.cfg.cache.store_mount
+        {
+            tracing::warn!(repo = %self.id, mount = %store_mount.display(), "store mount configured but the repository directory is not visible in it (gcsfuse not up yet?): base packs served remotely until it is");
         }
         manifest
             .packs
@@ -743,7 +779,9 @@ impl RepoHandle {
             .map(|p| {
                 // History packs (commits + trees of a base) are always local:
                 // that is the point of them.
-                let how = if p.tier != 2 || p.kind == walgit_proto::v1::PackKind::History as i32 {
+                let redundant_history = p.kind == walgit_proto::v1::PackKind::History as i32
+                    && p.pack_groups.is_empty() && !p.derived_from.is_empty();
+                let how = if p.tier != 2 || redundant_history {
                     PackPlan::Local
                 } else if let Some(m) = mount.as_ref() {
                     let target = crate::sync::mount_pack_path(m, &p.checksum);
@@ -775,19 +813,19 @@ impl RepoHandle {
     /// `remote-index` task while opening.
     pub async fn remote_reader(&self) -> Result<Arc<RemotePacks>, WalError> {
         let manifest = self.manifest();
-        if let Some(r) = self.remote.lock().clone() {
-            if r.revision == manifest.revision {
-                return Ok(r);
-            }
+        if let Some(r) = self.remote.lock().clone()
+            && r.revision == manifest.revision
+        {
+            return Ok(r);
         }
         self.open_remote(&manifest).await
     }
 
     /// Freshness check + refs apply, with `sync_mutex` and the write lock held
     /// by the caller. Packs are never touched here (see `sync_packs_phase`).
-    async fn sync_locked_inner(&self, span: &tracing::Span) -> Result<(), WalError> {
+    pub(crate) async fn sync_locked_inner(&self, span: &tracing::Span) -> Result<(), WalError> {
         let known = self.manifest_version.lock().clone();
-        let outcome = crate::sync::freshness_check(&self.store, &known).await?;
+        let outcome = crate::sync::freshness_check(&self.store, known.as_ref()).await?;
         match outcome {
             crate::sync::SyncOutcome::Unchanged => self.update_freshness(),
             crate::sync::SyncOutcome::Changed {
@@ -811,7 +849,7 @@ impl RepoHandle {
                 if initialised && manifest.revision == cur.revision {
                     // Same content under a version we did not record (a publish that learned the version
                     // by HEAD): adopt the version so the next check is a 304, apply nothing.
-                    *self.manifest_version.lock() = Some(meta_version);
+                    self.adopt_manifest(manifest.clone(), meta_version);
                     self.update_freshness();
                     return Ok(());
                 }
@@ -819,8 +857,7 @@ impl RepoHandle {
                 let before = self.state.lock().applied_seq;
                 crate::sync::apply_delta(self, &manifest, &meta_version).await?;
                 span.record("entries_applied", manifest.head_seq.saturating_sub(before));
-                *self.manifest.write() = Arc::new(manifest);
-                *self.manifest_version.lock() = Some(meta_version);
+                self.adopt_manifest(manifest, meta_version);
                 self.update_freshness();
             }
         }
@@ -854,16 +891,13 @@ impl RepoHandle {
 
     /// Any local pack that is a symlink into the store mount.
     fn has_linked_packs(&self) -> bool {
-        self.local
-            .packs()
-            .map(|ps| {
-                ps.iter()
-                    .any(|p| self.local.pack_path(&p.checksum).is_symlink())
-            })
-            .unwrap_or(false)
+        self.local.packs().is_ok_and(|ps| {
+            ps.iter()
+                .any(|p| self.local.pack_path(&p.checksum).is_symlink())
+        })
     }
 
-    /// Internal serving sync (no read guard). Used by publish/checkpoint/read_log.
+    /// Internal serving sync (no read guard). Used by `publish/checkpoint/read_log`.
     pub(crate) async fn sync_impl(&self) -> Result<(), WalError> {
         self.sync_impl_level(SyncLevel::Serve).await
     }
@@ -899,21 +933,19 @@ impl RepoHandle {
         .await;
 
         // Read manifest fresh
-        let (meta, manifest) = match crate::store_proto::get_message::<Manifest>(
-            &self.store,
-            walgit_proto::keys::MANIFEST,
-        )
-        .await?
-        {
-            Some((m, manifest)) => (m, manifest),
-            None => return Err(WalError::NotFound),
+        let Some((meta, manifest)) =
+            crate::store_proto::get_message::<Manifest>(&self.store, walgit_proto::keys::MANIFEST)
+                .await?
+        else {
+            return Err(WalError::NotFound);
         };
+
+        crate::validate_manifest(&manifest)?;
 
         // Reset state and re-materialize
         crate::sync::materialize_from_scratch(self, &manifest, &meta.version).await?;
 
-        *self.manifest.write() = Arc::new(manifest);
-        *self.manifest_version.lock() = Some(meta.version);
+        self.adopt_manifest(Arc::new(manifest), meta.version);
         self.last_freshness.lock().take();
 
         Ok(())
@@ -986,6 +1018,12 @@ impl RepoHandle {
         synced: bool,
         created_at: Option<prost_types::Timestamp>,
     ) -> Result<PublishResult, WalError> {
+        if pack.is_some() && txn.updates.is_empty() {
+            return Err(WalError::Invalid(
+                "a push pack requires a nonempty ref transaction".into(),
+            ));
+        }
+        let sender = self.get_or_init_publisher()?;
         self.publish_waiters.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::oneshot::channel();
         let request = PublishRequest {
@@ -997,7 +1035,6 @@ impl RepoHandle {
             response: tx,
         };
 
-        let sender = self.get_or_init_publisher().await;
         if sender.send(request).is_err() {
             self.publish_waiters.fetch_sub(1, Ordering::Relaxed);
             return Err(WalError::Corrupt("publisher channel closed".into()));
@@ -1028,36 +1065,130 @@ impl RepoHandle {
         crate::publish::publish_compact_impl(self, new_pack, supersedes, tier).await
     }
 
+    /// Publish a producer-proved classified pack and its exact coverage input.
+    /// Graph closure and conservation remain obligations of the producer.
+    pub async fn publish_compact_covering(
+        &self,
+        new_pack: walgit_git::PackInfo,
+        supersedes: Vec<gix_hash::ObjectId>,
+        tier: u32,
+        classification: &crate::PackClassification,
+        snapshots: &[crate::CoverageSnapshot],
+    ) -> Result<u64, WalError> {
+        crate::publish::publish_compact_classified(
+            self,
+            new_pack,
+            supersedes,
+            tier,
+            Some(classification),
+            snapshots,
+        )
+        .await
+    }
+
     /// D24: the repository's settings as last applied (manifest-inline).
     pub fn settings(&self) -> Option<walgit_proto::v1::RepoSettings> {
         self.manifest().settings.clone()
     }
 
     /// D24: effective configuration = host config ⊕ this repository's
-    /// settings, cached per settings revision. Settings that no longer parse
+    /// settings, cached per settings revision. Saved pre-removal bundle settings
+    /// are omitted from this derived view only; the durable document is unchanged.
+    /// Settings that no longer parse
     /// against this build fall back to the host config with a warning
     /// (never a failure on a read path).
     pub fn effective_config(&self) -> Arc<walgit_config::Config> {
-        let settings = self.settings();
-        let rev = settings.as_ref().map(|s| s.revision).unwrap_or(0);
+        let manifest = self.manifest();
+        let settings = &manifest.settings;
+        let rev = settings.as_ref().map_or(0, |s| s.revision);
         if rev == 0 {
             return self.cfg.clone();
         }
-        if let Some((r, c)) = self.effective.lock().as_ref() {
-            if *r == rev {
-                return c.clone();
-            }
+        if let Some((r, c)) = self.effective.lock().as_ref()
+            && *r == rev
+        {
+            return c.clone();
         }
-        let toml = settings.as_ref().map(|s| s.toml.as_str()).unwrap_or("");
-        let cfg = match self.cfg.with_settings(toml) {
-            Ok(c) => Arc::new(c),
-            Err(e) => {
-                tracing::warn!(repo = %self.id, revision = rev, error = %e, "repo settings do not apply to this build; using the host config");
-                self.cfg.clone()
-            }
-        };
+        let cfg = self.config_for_manifest(&manifest);
         *self.effective.lock() = Some((rev, cfg.clone()));
         cfg
+    }
+
+    /// Validate the effective policy for exactly the currently held generation.
+    pub fn validated_effective_config(&self) -> Result<Arc<walgit_config::Config>, WalError> {
+        self.validated_config_for_manifest(&self.manifest())
+    }
+
+    pub(crate) fn config_for_manifest(&self, manifest: &Manifest) -> Arc<walgit_config::Config> {
+        self.validated_config_for_manifest(manifest).unwrap_or_else(|e| {
+            tracing::warn!(repo = %self.id, error = %e, "repo settings do not apply to this build; using the host config");
+            self.cfg.clone()
+        })
+    }
+
+    pub(crate) fn validated_config_for_manifest(
+        &self,
+        manifest: &Manifest,
+    ) -> Result<Arc<walgit_config::Config>, WalError> {
+        let toml = manifest.settings.as_ref().map_or("", |s| s.toml.as_str());
+        let rev = manifest.settings.as_ref().map_or(0, |s| s.revision);
+        // Bucket-data compatibility, deliberately absent from Config::with_settings:
+        // host files and new settings writes must reject the removed section.
+        let mut migrated = None;
+        if toml.len() <= walgit_config::SETTINGS_MAX_BYTES
+            && let Ok(mut doc) = toml.parse::<toml::Table>()
+        {
+            let mut changed = false;
+            if matches!(doc.get("bundles"), Some(toml::Value::Table(_))) {
+                doc.remove("bundles");
+                changed = true;
+                tracing::warn!(repo = %self.id, revision = rev,
+                    "migrating saved repo settings: ignoring obsolete [bundles]; durable settings and history are unchanged");
+            }
+            if let Some(toml::Value::Table(old)) = doc.get("compaction").cloned() {
+                if doc.contains_key("packs") {
+                    return Err(WalError::Invalid("saved settings contain both [compaction] and [packs]; explicit administrator rewrite required".into()));
+                }
+                let mut packs = toml::Table::new();
+                let mut disabled = false;
+                for (key, value) in old {
+                    let target = match key.as_str() {
+                        "enabled" => "enabled",
+                        "factor" => "geometric_factor",
+                        "trigger_packs" => "fold_when_fresh_packs_reach",
+                        "lease_ttl" => "lease_ttl",
+                        "trigger_bytes" | "retention_superseded" => {
+                            disabled = true;
+                            continue;
+                        }
+                        "engine" if value.as_str() == Some("git") => continue,
+                        _ => {
+                            return Err(WalError::Invalid(format!(
+                                "saved compaction setting {key} cannot be migrated; administrator rewrite required"
+                            )));
+                        }
+                    };
+                    packs.insert(target.to_string(), value);
+                }
+                if disabled {
+                    packs.insert("enabled".into(), toml::Value::Boolean(false));
+                    tracing::warn!(repo = %self.id, revision = rev,
+                        "saved compaction byte/retention policy has no safe pack-lifecycle mapping; packs disabled until administrator rewrites settings");
+                }
+                doc.remove("compaction");
+                doc.insert("packs".into(), toml::Value::Table(packs));
+                changed = true;
+                tracing::warn!(repo = %self.id, revision = rev,
+                    "migrating supported saved [compaction] settings to [packs]; durable settings and history are unchanged");
+            }
+            if changed {
+                migrated = Some(doc.to_string());
+            }
+        }
+        self.cfg
+            .with_settings(migrated.as_deref().unwrap_or(toml))
+            .map(Arc::new)
+            .map_err(|e| WalError::Invalid(format!("saved settings revision {rev}: {e:#}")))
     }
 
     /// D24: validate and publish new settings (whole-document replace): a
@@ -1104,6 +1235,73 @@ impl RepoHandle {
         history_of: Option<String>,
     ) -> Result<u64, WalError> {
         crate::publish::add_pack_impl(self, pack, idx, tier, history_of).await
+    }
+
+    /// Publish a verified maintenance output additively. Its descriptor is
+    /// explicit: local directory scans may include rejected or concurrent work.
+    /// The caller retains the isolated input until the final replacement seal.
+    pub async fn publish_prepared_pack(
+        &self,
+        path: &std::path::Path,
+        descriptor: &walgit_proto::v1::PackRef,
+        classification: crate::PackClassification,
+    ) -> Result<u64, WalError> {
+        let checksum = gix_hash::ObjectId::from_hex(descriptor.checksum.as_bytes())
+            .map_err(|e| WalError::Invalid(format!("output checksum: {e}")))?;
+        // install_pack moves its input; preserve resumable scratch receipts by
+        // installing copies owned by a short-lived staging directory.
+        let source = path.to_path_buf();
+        let desc = descriptor.clone();
+        let staging = tokio::task::spawn_blocking(move || -> Result<_, std::io::Error> {
+            let dir = tempfile::tempdir()?;
+            for (present, extension) in [
+                (true, "pack"),
+                (true, "idx"),
+                (desc.has_rev, "rev"),
+                (desc.has_bitmap, "bitmap"),
+                (desc.has_commit_graph, "commit-graph"),
+            ] {
+                if present {
+                    std::fs::copy(
+                        source.with_extension(extension),
+                        dir.path()
+                            .join(format!("pack-{}.{}", desc.checksum, extension)),
+                    )?;
+                }
+            }
+            Ok(dir)
+        })
+        .await
+        .map_err(|e| WalError::Invalid(format!("output staging: {e}")))??;
+        let path = staging
+            .path()
+            .join(format!("pack-{}.pack", descriptor.checksum));
+        let mut extras = Vec::new();
+        for (present, extension) in [
+            (descriptor.has_rev, "rev"),
+            (descriptor.has_bitmap, "bitmap"),
+            (descriptor.has_commit_graph, "commit-graph"),
+        ] {
+            if present {
+                extras.push(path.with_extension(extension));
+            }
+        }
+        self.local
+            .install_pack(&path, &path.with_extension("idx"), &extras)
+            .await?;
+        let info = walgit_git::PackInfo {
+            checksum,
+            pack_size: descriptor.pack_size,
+            idx_size: descriptor.idx_size,
+            object_count: descriptor.object_count,
+            has_rev: descriptor.has_rev,
+            has_bitmap: descriptor.has_bitmap,
+            has_commit_graph: descriptor.has_commit_graph,
+            history_of: (!descriptor.derived_from.is_empty())
+                .then(|| descriptor.derived_from.clone()),
+        };
+        self.publish_compact_covering(info, Vec::new(), descriptor.tier, &classification, &[])
+            .await
     }
 
     /// Whether the last known manifest wants a checkpoint, and why.
@@ -1223,6 +1421,10 @@ impl RepoHandle {
     /// Read the checkpoint object's times when the manifest ref has none
     /// (one 240-byte GET per checkpoint per process; no-op otherwise).
     pub(crate) async fn learn_checkpoint_times(&self) -> Result<(), WalError> {
+        use walgit_store::ObjectStoreExt;
+
+        use prost::Message;
+
         let m = self.manifest();
         let Some(cp) = m.checkpoint.as_ref() else {
             return Ok(());
@@ -1232,8 +1434,7 @@ impl RepoHandle {
         {
             return Ok(());
         }
-        use prost::Message;
-        use walgit_store::ObjectStoreExt;
+
         if let Some((_, bytes)) = self.store.get_bytes(&cp.key).await? {
             let cpo = walgit_proto::v1::Checkpoint::decode(bytes.as_ref())
                 .map_err(|e| WalError::Corrupt(format!("checkpoint decode: {e}")))?;
@@ -1261,7 +1462,7 @@ impl RepoHandle {
         crate::log_reader::refs_at_seq(self, seq).await
     }
 
-    /// Read log entries [from_seq, to_seq].
+    /// Read log entries [`from_seq`, `to_seq`].
     pub async fn read_log(
         &self,
         from_seq: u64,
@@ -1288,14 +1489,14 @@ impl RepoHandle {
         *self.last_freshness.lock() = Some(Instant::now());
     }
 
-    async fn get_or_init_publisher(&self) -> mpsc::UnboundedSender<PublishRequest> {
+    fn get_or_init_publisher(&self) -> Result<mpsc::UnboundedSender<PublishRequest>, WalError> {
         let mut guard = self.publish_tx.lock();
         if let Some(tx) = &*guard {
             // A publisher task that died (panic mid-batch) leaves a sender to
             // a dropped receiver; respawn instead of failing every push on
             // this instance forever.
             if !tx.is_closed() {
-                return tx.clone();
+                return Ok(tx.clone());
             }
             tracing::warn!(repo = %self.id, "publisher task is gone; respawning");
         }
@@ -1303,10 +1504,12 @@ impl RepoHandle {
         let arc = self
             .self_arc
             .get()
-            .expect("self_arc must be set before publish")
+            .ok_or_else(|| {
+                WalError::Corrupt("publisher repository reference not initialized".into())
+            })?
             .clone();
         tokio::spawn(crate::publish::publisher_task(arc, rx));
         *guard = Some(tx.clone());
-        tx
+        Ok(tx)
     }
 }

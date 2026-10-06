@@ -1,6 +1,15 @@
+#![allow(
+    clippy::cast_sign_loss,
+    clippy::field_reassign_with_default,
+    clippy::unreadable_literal,
+    clippy::zombie_processes
+)]
+// Test fixtures use panics to fail the test, including shared helper functions.
+#![allow(clippy::unwrap_used)]
+
 //! Integration tests for walgit-wal.
 //!
-//! Uses MemoryStore + real LocalRepo tempdir + upstream git to create
+//! Uses `MemoryStore` + real `LocalRepo` tempdir + upstream git to create
 //! objects/packs.
 
 use std::collections::HashMap;
@@ -648,6 +657,32 @@ async fn test_compact_replays_on_other_registry() {
         );
     }
 
+    // Retirement is durable across restart and other manifest writers; static
+    // readers can finish previously issued downloads after compaction.
+    let retired = handle2.manifest().retired_packs.clone();
+    for old in &supersedes {
+        let checksum = old.to_string();
+        assert!(retired.iter().any(|p| p.checksum == checksum));
+        assert!(handle2.manifest().serves_pack(&checksum));
+        assert!(
+            store
+                .head(&format!(
+                    "{}{}",
+                    id.store_prefix(),
+                    walgit_proto::keys::pack_key(&checksum)
+                ))
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+    handle2
+        .publish_settings("", "test", "preserve retirement")
+        .await
+        .unwrap();
+    handle2.write_checkpoint().await.unwrap();
+    assert_eq!(handle2.manifest().retired_packs, retired);
+
     // Objects should be readable
     let oid = gix_hash::ObjectId::from_hex(prev.as_bytes()).unwrap();
     assert!(
@@ -832,7 +867,7 @@ async fn test_orphan_log_invisible_and_cleaned() {
         .store()
         .put(
             &orphan_key,
-            bytes::Bytes::from(orphan_bytes).into(),
+            orphan_bytes.into(),
             walgit_store::PutMode::Create.into(),
         )
         .await
@@ -950,7 +985,9 @@ async fn test_serve_level_links_base_from_store_mount() {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            body.push_str(&format!("{x:016x}"));
+            {
+                let _ = std::fmt::Write::write_fmt(&mut body, format_args!("{x:016x}"));
+            };
         }
         let c = work.commit(&format!("base_{i}"), &body);
         let pack = if prev.is_empty() {
@@ -1152,6 +1189,7 @@ async fn test_serve_level_links_base_from_store_mount() {
                 shallow: vec![],
                 want_refs: vec![],
                 packfile_uris_protocols: vec![],
+                packfile_indexes: false,
             },
             &mut out,
         )
@@ -1191,7 +1229,7 @@ fn checkpoint_due_triggers() {
     use walgit_wal::{CheckpointTrigger, checkpoint_due};
     let mut cfg = walgit_config::WalConfig::default();
     cfg.snapshot_every_entries = 10;
-    cfg.checkpoint_interval = Duration::from_secs(3600);
+    cfg.checkpoint_interval = Duration::from_hours(1);
     cfg.checkpoint_tail_bytes = walgit_config::ByteSize::kib(1);
     let seg = |first: u64, last: u64, size: u64| LogSegmentRef {
         key: String::new(),
@@ -1221,7 +1259,7 @@ fn checkpoint_due_triggers() {
     assert_eq!(checkpoint_due(&m, &cfg), Some(CheckpointTrigger::TailBytes));
 
     m.log_segments = vec![seg(1, 3, 100)];
-    let old = std::time::SystemTime::now() - Duration::from_secs(7200);
+    let old = std::time::SystemTime::now() - Duration::from_hours(2);
     m.updated_at = Some(walgit_proto::time::from_system(old));
     assert_eq!(
         checkpoint_due(&m, &cfg),
@@ -1271,6 +1309,8 @@ fn checkpoint_due_triggers() {
 /// from checkpoint + tail.
 #[tokio::test]
 async fn test_checkpoint_from_refs_level_instance() {
+    use prost::Message;
+
     let cache = tempfile::tempdir().unwrap();
     let store = MemoryStore::shared();
     let registry = Registry::new(store.clone(), Arc::new(make_config(cache.path(), 0)));
@@ -1349,7 +1389,7 @@ async fn test_checkpoint_from_refs_level_instance() {
     assert_eq!(handle2.checkpoint_due(), None);
 
     // The checkpoint object carries the pack inventory with side-file flags.
-    use prost::Message;
+
     let (_, bytes) = walgit_store::ObjectStoreExt::get_bytes(handle2.store(), &cp.key)
         .await
         .unwrap()
@@ -1393,7 +1433,9 @@ async fn test_serve_level_remote_serves_base_without_mount() {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            body.push_str(&format!("{x:016x}"));
+            {
+                let _ = std::fmt::Write::write_fmt(&mut body, format_args!("{x:016x}"));
+            };
         }
         let c = work.commit(&format!("base_{i}"), &body);
         let pack = if prev.is_empty() {
@@ -1514,6 +1556,7 @@ async fn test_serve_level_remote_serves_base_without_mount() {
                 shallow: vec![],
                 want_refs: vec![],
                 packfile_uris_protocols: vec![],
+                packfile_indexes: false,
             },
             &mut out,
             Some(&faulter),
@@ -1524,7 +1567,7 @@ async fn test_serve_level_remote_serves_base_without_mount() {
     assert_eq!(stats.objects, 3, "{stats:?}");
     let (faulted, rounds) = faulter.stats();
     assert!(
-        faulted >= 1 && faulted <= 3,
+        (1..=3).contains(&faulted),
         "faulted {faulted} (parent commit + root tree)"
     );
     assert!(rounds <= 3);
@@ -1600,6 +1643,8 @@ async fn test_annotate_pack_retrofits_commit_graph() {
 /// so `sync_refs()` on a cold instance answers while packs still download.
 #[tokio::test]
 async fn test_refs_sync_is_not_blocked_by_pack_materialization() {
+    use futures::StreamExt;
+
     let cache = tempfile::tempdir().unwrap();
     let store = MemoryStore::shared();
     let registry = Registry::new(store.clone(), Arc::new(make_config(cache.path(), 0)));
@@ -1634,7 +1679,7 @@ async fn test_refs_sync_is_not_blocked_by_pack_materialization() {
         inner.latency = Some(Duration::from_millis(150));
     }
     // Copy the data over.
-    use futures::StreamExt;
+
     let mut keys = store.list("", None);
     while let Some(m) = keys.next().await {
         let m = m.unwrap();
@@ -1707,7 +1752,9 @@ async fn test_history_pack_keeps_tree_walks_local() {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            body.push_str(&format!("{x:016x}"));
+            {
+                let _ = std::fmt::Write::write_fmt(&mut body, format_args!("{x:016x}"));
+            };
         }
         std::fs::create_dir_all(work.path().join(format!("d{i}/sub"))).unwrap();
         std::fs::write(work.path().join(format!("d{i}/sub/big.bin")), &body).unwrap();
@@ -1893,6 +1940,7 @@ async fn test_history_pack_keeps_tree_walks_local() {
         shallow: vec![],
         want_refs: vec![],
         packfile_uris_protocols: vec![],
+        packfile_indexes: false,
     };
     let mut out = Vec::new();
     let stats = handle2
@@ -1930,7 +1978,7 @@ async fn test_history_pack_keeps_tree_walks_local() {
 
 /// A long-lived read guard (a clone streaming for minutes) plus a pack
 /// removal that wants the write lock must not block new refs-level syncs:
-/// a queued writer on a tokio RwLock stalls every new reader (prod: info/refs
+/// a queued writer on a tokio `RwLock` stalls every new reader (prod: info/refs
 /// waited 60–680 s behind one 24-minute clone). Removal is try-only now.
 #[tokio::test]
 async fn test_refs_sync_never_waits_behind_a_long_read_guard() {
@@ -2176,8 +2224,8 @@ async fn test_repo_settings_publish_and_effective_config() {
     let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
     assert!(handle.settings().is_none());
     assert_eq!(
-        handle.effective_config().bundles.min_commits,
-        handle.effective_config().bundles.min_commits
+        handle.effective_config().packs.geometric_factor,
+        make_config(cache.path(), 0).packs.geometric_factor
     );
 
     // Rejected: forbidden section; unknown key.
@@ -2196,12 +2244,12 @@ async fn test_repo_settings_publish_and_effective_config() {
 
     // Accepted.
     let rev = handle
-        .publish_settings("[bundles]\nmin_commits = 3\n", "alice", "small repo")
+        .publish_settings("[packs]\ngeometric_factor = 3\n", "alice", "small repo")
         .await
         .unwrap();
     assert_eq!(rev, 1);
     assert_eq!(handle.manifest().head_seq, 1);
-    assert_eq!(handle.effective_config().bundles.min_commits, 3);
+    assert_eq!(handle.effective_config().packs.geometric_factor, 3);
     let log = handle.read_log(1, None).await.unwrap();
     assert_eq!(log[0].kind(), walgit_proto::v1::EntryKind::Settings);
     assert_eq!(log[0].settings.as_ref().unwrap().author, "alice");
@@ -2212,25 +2260,95 @@ async fn test_repo_settings_publish_and_effective_config() {
     let h2 = registry2.open(&id).await.unwrap();
     h2.sync_refs().await.unwrap();
     assert_eq!(h2.settings().unwrap().revision, 1);
-    assert_eq!(h2.effective_config().bundles.min_commits, 3);
+    assert_eq!(h2.effective_config().packs.geometric_factor, 3);
 
     // Second publish bumps the revision; clearing restores the host config.
     assert_eq!(
         handle
-            .publish_settings("[bundles]\nmin_commits = 9\n", "alice", "")
+            .publish_settings("[packs]\ngeometric_factor = 9\n", "alice", "")
             .await
             .unwrap(),
         2
     );
-    assert_eq!(handle.effective_config().bundles.min_commits, 9);
+    assert_eq!(handle.effective_config().packs.geometric_factor, 9);
     assert_eq!(
         handle.publish_settings("", "alice", "clear").await.unwrap(),
         3
     );
     assert_eq!(
-        handle.effective_config().bundles.min_commits,
-        make_config(cache.path(), 0).bundles.min_commits
+        handle.effective_config().packs.geometric_factor,
+        make_config(cache.path(), 0).packs.geometric_factor
     );
+}
+
+/// Old bucket settings keep their supported overrides and original audit record.
+#[tokio::test]
+async fn test_repo_settings_bundle_removal_replays_without_losing_overrides() {
+    use prost::Message;
+    use walgit_store::ObjectStoreExt;
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let registry = Registry::new(store.clone(), Arc::new(make_config(cache.path(), 0)));
+    let id = repo_id("test", "saved-settings");
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    let supported = "[packs]\ngeometric_factor = 3\n[upstream]\ngit = \"https://git.example.com/acme/source.git\"\nfollow = [\"refs/heads/release\"]\n";
+    handle
+        .publish_settings(supported, "alice", "preserve scope")
+        .await
+        .unwrap();
+    let saved = format!(
+        "# Historical configuration\n[bundles]\nenabled = false\n{}",
+        supported.replace("[packs]\ngeometric_factor", "[compaction]\nfactor")
+    );
+
+    // Encode the manifest and log as an older writer did. New writes cannot
+    // introduce this document, so seed persisted bytes rather than a shim API.
+    let mkey = format!("{}{}", id.store_prefix(), walgit_proto::keys::MANIFEST);
+    let (_, bytes) = store.get_bytes(&mkey).await.unwrap().unwrap();
+    let mut manifest = walgit_proto::v1::Manifest::decode(bytes.as_ref()).unwrap();
+    manifest.settings.as_mut().unwrap().toml = saved.clone();
+    let segment = &mut manifest.log_segments[0];
+    let lkey = format!("{}{}", id.store_prefix(), segment.key);
+    let (_, bytes) = store.get_bytes(&lkey).await.unwrap().unwrap();
+    let (mut entries, _) = walgit_proto::frame::decode_entries(&bytes).unwrap();
+    entries[0].settings.as_mut().unwrap().toml = saved.clone();
+    let log_bytes = walgit_proto::frame::encode_entries(entries.iter());
+    segment.size = log_bytes.len() as u64;
+    store
+        .put_bytes(&lkey, log_bytes, walgit_store::PutMode::Overwrite)
+        .await
+        .unwrap();
+    store
+        .put_bytes(
+            &mkey,
+            manifest.encode_to_vec(),
+            walgit_store::PutMode::Overwrite,
+        )
+        .await
+        .unwrap();
+
+    let cache2 = tempfile::tempdir().unwrap();
+    let reader = Registry::new(store.clone(), Arc::new(make_config(cache2.path(), 0)));
+    let replayed = reader.open(&id).await.unwrap();
+    replayed.sync_refs().await.unwrap();
+    let effective = replayed.effective_config();
+    assert_eq!(effective.packs.geometric_factor, 3);
+    assert_eq!(
+        effective.upstream.git.as_deref(),
+        Some("https://git.example.com/acme/source.git")
+    );
+    assert_eq!(effective.upstream.follow, ["refs/heads/release"]);
+    assert_eq!(replayed.settings().unwrap().toml, saved);
+    let log = replayed.read_log(1, None).await.unwrap();
+    assert_eq!(log[0].settings.as_ref().unwrap().toml, saved);
+    assert!(
+        replayed
+            .publish_settings(&saved, "bob", "new write")
+            .await
+            .is_err()
+    );
+    assert_eq!(replayed.settings().unwrap().revision, 1);
+    assert_eq!(replayed.manifest().head_seq, 1);
 }
 
 /// D22 provenance on the checkpoint: `first_state_at` = the earliest entry
@@ -2341,6 +2459,10 @@ async fn test_checkpoint_carries_first_state_and_as_of() {
 /// entry (every slot in between planned as "unavailable" in prod).
 #[tokio::test]
 async fn test_first_state_time_uses_the_checkpoint_when_early_entries_are_untimestamped() {
+    use walgit_store::ObjectStoreExt;
+
+    use prost::Message;
+
     let cache = tempfile::tempdir().unwrap();
     let store = MemoryStore::shared();
     let registry = Registry::new(store.clone(), Arc::new(make_config(cache.path(), 0)));
@@ -2378,8 +2500,7 @@ async fn test_first_state_time_uses_the_checkpoint_when_early_entries_are_untime
 
     // Rewrite the bucket the way 2026-08-19 wrote it: checkpoint ref without
     // first_state_at/as_of, created on 08-02; log entry 2 without created_at.
-    use prost::Message;
-    use walgit_store::ObjectStoreExt;
+
     let mkey = format!("{}{}", id.store_prefix(), walgit_proto::keys::MANIFEST);
     let (_, bytes) = store.get_bytes(&mkey).await.unwrap().unwrap();
     let mut m = walgit_proto::v1::Manifest::decode(bytes.as_ref()).unwrap();
@@ -2446,6 +2567,10 @@ async fn test_first_state_time_uses_the_checkpoint_when_early_entries_are_untime
 /// state" and the bundler cut it from today's main (prod 2026-08-21 04:2xZ).
 #[tokio::test]
 async fn test_checkpoint_times_come_from_the_object_when_the_ref_has_none() {
+    use walgit_store::ObjectStoreExt;
+
+    use prost::Message;
+
     let cache = tempfile::tempdir().unwrap();
     let store = MemoryStore::shared();
     let registry = Registry::new(store.clone(), Arc::new(make_config(cache.path(), 0)));
@@ -2482,8 +2607,7 @@ async fn test_checkpoint_times_come_from_the_object_when_the_ref_has_none() {
         .unwrap();
 
     // Strip the ref's times (08-19 import shape); stamp the object 08-19 21:33Z.
-    use prost::Message;
-    use walgit_store::ObjectStoreExt;
+
     let mkey = format!("{}{}", id.store_prefix(), walgit_proto::keys::MANIFEST);
     let (_, bytes) = store.get_bytes(&mkey).await.unwrap().unwrap();
     let mut m = walgit_proto::v1::Manifest::decode(bytes.as_ref()).unwrap();
@@ -2624,4 +2748,243 @@ async fn a_landed_cas_is_ok_even_when_the_local_apply_fails_and_the_next_sync_re
         c1
     );
     assert_eq!(handle.applied_seq(), 2);
+}
+
+#[tokio::test]
+async fn noop_receipts_never_claim_a_siblings_log_entry() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let registry = Registry::new(store, Arc::new(make_config(cache.path(), 20)));
+    let handle = registry
+        .create(&repo_id("o", "noop"), ObjectFormat::Sha1)
+        .await
+        .unwrap();
+    let work = WorkRepo::new();
+    let tip = work.commit("first", "content");
+    let pack = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    // Empty-ref pack publication is not a back door into the durable inventory.
+    let error = handle
+        .publish_push(Some(pack), make_txn(vec![]), HashMap::new())
+        .await;
+    assert!(matches!(error, Err(walgit_wal::WalError::Invalid(_))));
+    assert_eq!(handle.manifest().head_seq, 0);
+    assert!(handle.manifest().packs.is_empty());
+    let pack = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    handle
+        .publish_push(
+            Some(pack),
+            make_txn(vec![("refs/heads/main", "", &tip)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let unchanged = make_txn(vec![("refs/heads/main", &tip, &tip)]);
+    for _ in 0..2 {
+        let receipt = handle
+            .publish_push(None, unchanged.clone(), HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(receipt.seq, 0);
+        assert!(receipt.per_ref.iter().all(|(_, status)| status.is_ok()));
+        assert_eq!(handle.manifest().head_seq, 1);
+    }
+    let (noop, changed) = tokio::join!(
+        handle.publish_push(None, unchanged.clone(), HashMap::new()),
+        handle.publish_push(
+            None,
+            make_txn(vec![("refs/heads/other", "", &tip)]),
+            HashMap::new()
+        ),
+    );
+    assert_eq!(noop.unwrap().seq, 0);
+    assert_eq!(changed.unwrap().seq, 2);
+    let (noop, rejected) = tokio::join!(
+        handle.publish_push(None, unchanged, HashMap::new()),
+        handle.publish_push(
+            None,
+            make_txn(vec![("refs/heads/main", "", &tip)]),
+            HashMap::new()
+        ),
+    );
+    assert_eq!(noop.unwrap().seq, 0);
+    let rejected = rejected.unwrap();
+    assert_eq!(rejected.seq, 0);
+    assert!(rejected.per_ref.iter().all(|(_, status)| status.is_err()));
+    assert_eq!(handle.manifest().head_seq, 2);
+    assert_eq!(handle.read_log(1, None).await.unwrap().len(), 2);
+    let refused = handle
+        .publish_push(
+            None,
+            make_txn(vec![
+                ("refs/heads/partial", "", &tip),
+                ("refs/heads/main", "", &tip),
+            ]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused.seq, 0);
+    assert!(refused.per_ref.iter().all(|(_, status)| status.is_err()));
+    assert!(
+        handle
+            .local()
+            .ref_view()
+            .unwrap()
+            .get("refs/heads/partial")
+            .is_none()
+    );
+    let multi = handle
+        .publish_push(
+            None,
+            make_txn(vec![
+                ("refs/heads/left", "", &tip),
+                ("refs/heads/right", "", &tip),
+            ]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(multi.seq, 3);
+    assert_eq!(multi.per_ref.len(), 2);
+    assert!(multi.per_ref.iter().all(|(_, status)| status.is_ok()));
+}
+
+#[tokio::test]
+async fn lost_cas_reply_is_resolved_or_unknown_without_losing_the_commit() {
+    use walgit_store::fault::{FaultPlan, FaultStore};
+    let cache = tempfile::tempdir().unwrap();
+    let truth = MemoryStore::shared();
+    let link = FaultStore::new(truth, "lost-reply", 1);
+    let registry = Registry::new(link.clone(), Arc::new(make_config(cache.path(), 0)));
+    let handle = registry
+        .create(&repo_id("o", "unknown"), ObjectFormat::Sha1)
+        .await
+        .unwrap();
+    let work = WorkRepo::new();
+    let tip = work.commit("first", "content");
+    let pack = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    handle
+        .publish_push(
+            Some(pack),
+            make_txn(vec![("refs/heads/main", "", &tip)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    for (name, hide_evidence) in [("resolved", false), ("unknown", true)] {
+        link.set(FaultPlan {
+            p_err_after: 1.0,
+            only_keys: Some(vec!["manifest.pb".into()]),
+            deny_keys: if hide_evidence {
+                vec!["manifest.pb".into()]
+            } else {
+                vec![]
+            },
+            ..Default::default()
+        });
+        let reference = format!("refs/heads/{name}");
+        let result = handle
+            .publish_push_synced(None, make_txn(vec![(&reference, "", &tip)]), HashMap::new())
+            .await;
+        if hide_evidence {
+            assert!(matches!(
+                result,
+                Err(walgit_wal::WalError::CommitUnknown(_))
+            ));
+        } else {
+            assert!(
+                result
+                    .unwrap()
+                    .per_ref
+                    .iter()
+                    .all(|(_, status)| status.is_ok())
+            );
+        }
+        link.heal();
+        drop(handle.sync_refs().await.unwrap());
+        assert_eq!(
+            handle.local().ref_view().unwrap().get(&reference),
+            Some(tip.clone())
+        );
+    }
+    assert_eq!(handle.read_log(1, None).await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn readiness_carries_only_proven_inventory_and_rechecks_revision_only_restart() {
+    let writer_cache = tempfile::tempdir().unwrap();
+    let reader_cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let writer_registry =
+        Registry::new(store.clone(), Arc::new(make_config(writer_cache.path(), 0)));
+    let id = repo_id("o", "readiness");
+    let writer = writer_registry
+        .create(&id, ObjectFormat::Sha1)
+        .await
+        .unwrap();
+    assert!(
+        writer.packs_ready(),
+        "new empty inventory is proven at its birth revision"
+    );
+    let work = WorkRepo::new();
+    let tip = work.commit("first", "content");
+    let pack = ingest_pack_data(&writer, work.create_pack()).await.unwrap();
+    let checksum = pack.checksum;
+    writer
+        .publish_push(
+            Some(pack),
+            make_txn(vec![("refs/heads/main", "", &tip)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    assert!(writer.packs_ready());
+    let reader_registry =
+        Registry::new(store.clone(), Arc::new(make_config(reader_cache.path(), 0)));
+    let reader = reader_registry.open(&id).await.unwrap();
+    assert!(!reader.packs_ready());
+    drop(reader.sync().await.unwrap());
+    assert!(reader.packs_ready());
+    writer
+        .publish_settings("[packs]\nenabled = false\n", "test", "unchanged inventory")
+        .await
+        .unwrap();
+    assert!(
+        writer.packs_ready(),
+        "settings must not invent installation work"
+    );
+    drop(reader.sync_refs().await.unwrap());
+    assert!(
+        reader.packs_ready(),
+        "refs apply carries only an identical proven inventory"
+    );
+    drop(reader);
+    drop(reader_registry);
+    let seq = writer.manifest().head_seq;
+    let rev = writer.local().write_rev_index(&checksum).await.unwrap();
+    writer
+        .annotate_pack(&checksum.to_string(), Some(rev), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        writer.manifest().head_seq,
+        seq,
+        "annotation changes revision without log sequence"
+    );
+    let reopened_registry = Registry::new(store, Arc::new(make_config(reader_cache.path(), 0)));
+    let reopened = reopened_registry.open(&id).await.unwrap();
+    assert!(
+        !reopened.packs_ready(),
+        "saved counters must not hide a new side file"
+    );
+    let local_rev = reopened.local().pack_path(&checksum).with_extension("rev");
+    assert!(!local_rev.exists());
+    drop(reopened.sync().await.unwrap());
+    assert!(reopened.packs_ready());
+    assert!(local_rev.is_file());
+    drop(reopened.sync().await.unwrap());
+    assert!(
+        reopened.packs_ready(),
+        "reconciliation must settle at the held revision"
+    );
 }

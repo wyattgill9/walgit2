@@ -1,3 +1,5 @@
+// Test fixtures use panics to fail the test, including shared helper functions.
+#![allow(clippy::unwrap_used)]
 #![allow(dead_code)]
 //! Test harness: spin up walgit-server on a random port backed by the in-memory
 //! store + a tempdir cache, and drive real upstream `git` against it.
@@ -19,7 +21,6 @@ pub struct Server {
     _shutdown: tokio::sync::oneshot::Sender<()>,
     pub store: Arc<MemoryStore>,
     registry: Arc<walgit_wal::Registry>,
-    bundles: Arc<walgit_bundle::Bundler>,
     /// The instance's state (maintenance loop tests drive `run_pass` directly).
     pub state: Arc<walgit_server::AppState>,
     /// Cache dir; removed when the server is dropped (hermetic, no /tmp pile-up).
@@ -76,14 +77,12 @@ impl Server {
         cfg.cache.max_bytes = ByteSize::gib(2);
         cfg.server.listen = "127.0.0.1:0".parse().unwrap();
         cfg.server.max_concurrent_per_repo = 8;
-        cfg.server.request_timeout = std::time::Duration::from_secs(600);
+        cfg.server.request_timeout = std::time::Duration::from_mins(10);
         cfg.server.max_push_bytes = ByteSize::gib(2);
         cfg.wal.fsck_objects = true;
         cfg.wal.check_connectivity = true;
         cfg.wal.freshness_ttl = std::time::Duration::ZERO;
         cfg.git.allow_filter = true;
-        cfg.bundles.advertise = true;
-        cfg.bundles.min_commits = 0; // tests cut tiny incrementals on purpose; the gate has its own test
 
         // Allow the e2e suite to run under either upload-pack engine.
         // Default: git (the subprocess engine). Set =gix to use the
@@ -96,12 +95,11 @@ impl Server {
             "auto" => cfg.git.upload_pack_engine = walgit_config::UploadPackEngine::Auto,
             _ => cfg.git.upload_pack_engine = walgit_config::UploadPackEngine::Git,
         }
-        if let Ok(ms) = std::env::var("WALGIT_TEST_MEMORY_LATENCY_MS") {
-            if let Ok(ms) = ms.parse::<u64>() {
-                if let Some(s) = Arc::get_mut(&mut store) {
-                    s.latency = Some(std::time::Duration::from_millis(ms));
-                }
-            }
+        if let Ok(ms) = std::env::var("WALGIT_TEST_MEMORY_LATENCY_MS")
+            && let Ok(ms) = ms.parse::<u64>()
+            && let Some(s) = Arc::get_mut(&mut store)
+        {
+            s.latency = Some(std::time::Duration::from_millis(ms));
         }
 
         tweak(&mut cfg);
@@ -115,7 +113,6 @@ impl Server {
         let state = AppState::new(Arc::new(cfg), dyn_store).await?;
 
         let registry = state.registry.clone();
-        let bundles = state.bundles.clone();
         // Events bridge sweep timer (no-op unless the bridge is enabled).
         walgit_server::bridge::spawn_sweeper(state.clone());
 
@@ -138,21 +135,19 @@ impl Server {
             _shutdown: tx,
             store,
             registry,
-            bundles,
             state,
             _cache: cache,
         })
     }
 
-    /// Two instances sharing one MemoryStore, different cache dirs.
+    /// Two instances sharing one `MemoryStore`, different cache dirs.
     pub async fn start_pair() -> Result<(Self, Self)> {
         let mut store = MemoryStore::shared();
-        if let Ok(ms) = std::env::var("WALGIT_TEST_MEMORY_LATENCY_MS") {
-            if let Ok(ms) = ms.parse::<u64>() {
-                if let Some(s) = Arc::get_mut(&mut store) {
-                    s.latency = Some(std::time::Duration::from_millis(ms));
-                }
-            }
+        if let Ok(ms) = std::env::var("WALGIT_TEST_MEMORY_LATENCY_MS")
+            && let Ok(ms) = ms.parse::<u64>()
+            && let Some(s) = Arc::get_mut(&mut store)
+        {
+            s.latency = Some(std::time::Duration::from_millis(ms));
         }
         let a = Self::start_with(store.clone(), tempfile::tempdir()?).await?;
         let b = Self::start_with(store.clone(), tempfile::tempdir()?).await?;
@@ -204,21 +199,16 @@ impl Server {
     pub async fn registry_has_packs(&self, owner: &str, repo: &str) -> bool {
         let id = walgit_git::RepoId::new(owner, repo).unwrap();
         match self.registry.open(&id).await {
-            Ok(h) => h.packs_ready() && !h.local().packs().map(|p| p.is_empty()).unwrap_or(true),
+            Ok(h) => h.packs_ready() && !h.local().packs().map_or(true, |p| p.is_empty()),
             Err(_) => false,
         }
     }
 
-    pub async fn build_bundle(&self, owner: &str, repo: &str, strategy: &str) -> Result<()> {
-        let id = walgit_git::RepoId::new(owner, repo)?;
-        self.bundles.build(&id, strategy).await?;
-        Ok(())
-    }
-
     pub async fn ls_remote(&self, owner: &str, repo: &str) -> Result<String> {
-        let out = Command::new("git")
+        let out = tokio::process::Command::new("git")
             .args(["ls-remote", &self.repo_url(owner, repo)])
-            .output()?;
+            .output()
+            .await?;
         assert!(
             out.status.success(),
             "ls-remote failed: {}",

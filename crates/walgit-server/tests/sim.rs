@@ -1,4 +1,7 @@
-//! Simulation tests: safety mode → liveness mode (after TigerBeetle's VOPR,
+// Test fixtures use panics to fail the test, including shared helper functions.
+#![allow(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
+//! Simulation tests: safety mode → liveness mode (after `TigerBeetle`'s VOPR,
 //! "Simulation Testing For Liveness", 2023).
 //!
 //! A *cluster* is N walgit instances (one `Registry` + cache dir each) that
@@ -111,7 +114,9 @@ impl WorkRepo {
     fn pack(&self, head: &str, base: Option<&str>) -> Vec<u8> {
         let mut revs = format!("{head}\n");
         if let Some(b) = base {
-            revs.push_str(&format!("^{b}\n"));
+            {
+                let _ = std::fmt::Write::write_fmt(&mut revs, format_args!("^{b}\n"));
+            };
         }
         let mut child = Command::new("git")
             .args(["pack-objects", "--stdout", "--revs", "-q"])
@@ -151,8 +156,8 @@ fn sim_config(cache_dir: &Path) -> walgit_config::Config {
     cfg.wal.snapshot_every_entries = 0;
     cfg.wal.checkpoint_interval = Duration::ZERO;
     cfg.wal.checkpoint_tail_bytes = walgit_config::ByteSize::b(0);
-    cfg.compaction.lease_ttl = Duration::from_secs(2);
-    cfg.compaction.trigger_packs = 4;
+    cfg.packs.lease_ttl = Duration::from_secs(2);
+    cfg.packs.fold_when_fresh_packs_reach = 4;
     // The simulator exercises WAL publication, not derived-index CPU work.
     // History-pack/commit-graph builders can dominate tiny zero-latency store
     // runs and obscure the liveness bound without injecting another fault.
@@ -167,7 +172,7 @@ struct Instance {
     link: Arc<FaultStore>,
     registry: Arc<Registry>,
     cfg: Arc<walgit_config::Config>,
-    _cache: tempfile::TempDir,
+    cache: tempfile::TempDir,
 }
 
 impl Instance {
@@ -198,7 +203,7 @@ impl Instance {
             link,
             registry,
             cfg,
-            _cache: cache,
+            cache,
         }
     }
     async fn open(&self, id: &RepoId) -> Result<Arc<RepoHandle>> {
@@ -218,7 +223,7 @@ struct Cluster {
 impl Cluster {
     async fn new(seed: u64, n: usize) -> Result<Self> {
         let truth: DynStore = MemoryStore::shared();
-        let id = RepoId::new("sim", &format!("r{seed}"))?;
+        let id = RepoId::new("sim", format!("r{seed}"))?;
         let mut c = Cluster {
             seed,
             truth,
@@ -258,7 +263,7 @@ impl Cluster {
         let s = self.next_link_seed.fetch_add(1, Ordering::Relaxed);
         // Take the cache dir out of the old instance without dropping it.
         let placeholder = tempfile::tempdir().unwrap();
-        let cache = std::mem::replace(&mut self.instances[i]._cache, placeholder);
+        let cache = std::mem::replace(&mut self.instances[i].cache, placeholder);
         let fresh = Instance::new_at(&self.truth, &name, s, cache, tweak);
         let old = std::mem::replace(&mut self.instances[i], fresh);
         drop(old);
@@ -282,11 +287,12 @@ impl Cluster {
     fn dump_traces(&self) -> String {
         let mut s = String::new();
         for i in &self.instances {
-            s.push_str(&format!(
-                "--- link {} ({})\n",
-                i.name,
-                i.link.stats().summary()
-            ));
+            {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut s,
+                    format_args!("--- link {} ({})\n", i.name, i.link.stats().summary()),
+                );
+            };
             for l in i
                 .link
                 .take_trace()
@@ -302,48 +308,6 @@ impl Cluster {
             }
         }
         s
-    }
-}
-
-/// BundleSource adapter used by the bundle-lease liveness scenario.
-struct SimBundleSource(Arc<Registry>);
-
-#[async_trait::async_trait]
-impl walgit_bundle::BundleSource for SimBundleSource {
-    async fn open_repo(
-        &self,
-        id: &RepoId,
-    ) -> Result<walgit_bundle::BundleRepoHandle, walgit_bundle::BundleError> {
-        let h = self
-            .0
-            .open(id)
-            .await
-            .map_err(|e| walgit_bundle::BundleError::Other(e.to_string()))?;
-        Ok(walgit_bundle::BundleRepoHandle {
-            local: h.local().clone(),
-            store: h.store().clone(),
-            head_seq: h.manifest().head_seq,
-            engine: walgit_bundle::BundleEngine::Git,
-            cfg: Some(h.effective_config()),
-        })
-    }
-
-    async fn prepare_objects(&self, id: &RepoId) -> Result<(), walgit_bundle::BundleError> {
-        let h = self
-            .0
-            .open(id)
-            .await
-            .map_err(|e| walgit_bundle::BundleError::Other(e.to_string()))?;
-        drop(
-            h.sync_full()
-                .await
-                .map_err(|e| walgit_bundle::BundleError::Other(e.to_string()))?,
-        );
-        Ok(())
-    }
-
-    async fn list_repos(&self) -> Result<Vec<RepoId>, walgit_bundle::BundleError> {
-        Ok(Vec::new())
     }
 }
 
@@ -522,13 +486,10 @@ async fn check_truth(c: &Cluster, pushers: &[Pusher]) -> Result<()> {
     // The checkpoint (if any) folds the log prefix: refs from its RefSnapshot,
     // entries after it from the tail. Both must exist in the bucket.
     let prefix = c.repo_prefix();
-    let cp_seq = manifest.checkpoint.as_ref().map(|cp| cp.seq).unwrap_or(0);
+    let cp_seq = manifest.checkpoint.as_ref().map_or(0, |cp| cp.seq);
     let mut folded: HashMap<String, String> = HashMap::new();
-    if cp_seq > 0 {
-        let key = format!(
-            "{prefix}{}",
-            walgit_proto::keys::checkpoint_refs_key(cp_seq)
-        );
+    if let Some(cp) = &manifest.checkpoint {
+        let key = format!("{prefix}{}", cp.refs_key);
         let (_, b) = c
             .truth
             .get_bytes(&key)
@@ -559,14 +520,14 @@ async fn check_truth(c: &Cluster, pushers: &[Pusher]) -> Result<()> {
         );
     }
     ensure!(
-        log.first().map(|e| e.seq > cp_seq).unwrap_or(true),
+        log.first().is_none_or(|e| e.seq > cp_seq),
         "log tail starts at {} <= checkpoint {cp_seq}",
         log[0].seq
     );
     ensure!(
-        log.last().map(|e| e.seq).unwrap_or(cp_seq) == manifest.head_seq,
+        log.last().map_or(cp_seq, |e| e.seq) == manifest.head_seq,
         "log tail {} != manifest.head_seq {}",
-        log.last().map(|e| e.seq).unwrap_or(cp_seq),
+        log.last().map_or(cp_seq, |e| e.seq),
         manifest.head_seq
     );
     // Every ACK after the checkpoint is in the log at its seq with its txn.
@@ -615,14 +576,11 @@ async fn check_truth(c: &Cluster, pushers: &[Pusher]) -> Result<()> {
             // f must be last.new or a commit pushed after it (the ack'd or an
             // errored-but-committed push along the same chain).
             let later = log.iter().filter(|e| e.seq > last.seq).any(|e| {
-                e.txn
-                    .as_ref()
-                    .map(|t| {
-                        t.updates
-                            .iter()
-                            .any(|u| u.name == p.refname && u.new_oid == f)
-                    })
-                    .unwrap_or(false)
+                e.txn.as_ref().is_some_and(|t| {
+                    t.updates
+                        .iter()
+                        .any(|u| u.name == p.refname && u.new_oid == f)
+                })
             }) || last.seq <= cp_seq;
             ensure!(
                 f == last.new || later,
@@ -652,10 +610,7 @@ async fn check_truth(c: &Cluster, pushers: &[Pusher]) -> Result<()> {
         );
     }
     if let Some(cp) = &manifest.checkpoint {
-        for key in [
-            walgit_proto::keys::checkpoint_key(cp.seq),
-            walgit_proto::keys::checkpoint_refs_key(cp.seq),
-        ] {
+        for key in [cp.key.clone(), cp.refs_key.clone()] {
             ensure!(
                 c.truth.exists(&format!("{prefix}{key}")).await?,
                 "checkpoint object missing: {key}"
@@ -776,7 +731,6 @@ async fn check_core_liveness(
             bound,
             walgit_server::ops::compact_repo(
                 &h,
-                &c.instances[core[0]].cfg,
                 walgit_server::ops::CompactRequest {
                     force: true,
                     rebuild_base: false,
@@ -787,8 +741,10 @@ async fn check_core_liveness(
         .await
         .map_err(|_| anyhow!("liveness: compaction hung > {bound:?}"))?;
         match out {
-            Ok(walgit_server::ops::CompactOutcome::Published { .. })
-            | Ok(walgit_server::ops::CompactOutcome::NotTriggered { .. }) => break,
+            Ok(
+                walgit_server::ops::CompactOutcome::Published { .. }
+                | walgit_server::ops::CompactOutcome::NotTriggered { .. },
+            ) => break,
             Ok(walgit_server::ops::CompactOutcome::LeaseHeld) => {
                 ensure!(
                     t.elapsed() < bound,
@@ -834,7 +790,7 @@ fn seeds() -> Vec<u64> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(2);
-    (1..=n).map(|i| 0xC0FFEE + i * 7919).collect()
+    (1..=n).map(|i| 0x00C0_FFEE + i * 7_919).collect()
 }
 fn pushes_per_pusher() -> u64 {
     std::env::var("WALGIT_SIM_PUSHES")
@@ -848,15 +804,20 @@ impl Lcg {
     fn next(&mut self) -> u64 {
         self.0 = self
             .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         self.0 >> 33
     }
     fn below(&mut self, n: u64) -> u64 {
         self.next() % n.max(1)
     }
+    fn below_usize(&mut self, n: usize) -> usize {
+        let bound = u64::try_from(n).expect("usize always fits in u64");
+        usize::try_from(self.below(bound)).expect("random value is less than the usize bound")
+    }
     fn chance(&mut self, p: f64) -> bool {
-        (self.next() as f64 / (1u64 << 31) as f64) < p
+        let sample = u32::try_from(self.next()).expect("LCG output is limited to 31 bits");
+        (f64::from(sample) / f64::from(1u32 << 31)) < p
     }
 }
 
@@ -876,27 +837,25 @@ async fn run_safety_then_liveness(seed: u64) -> Result<()> {
     let per = pushes_per_pusher();
     let op_timeout = Duration::from_secs(10);
     for round in 0..per {
-        for p in pushers.iter_mut() {
-            let i = rng.below(n_instances as u64) as usize;
+        for p in &mut pushers {
+            let i = rng.below_usize(n_instances);
             let _ = p.push_once(&c.instances[i], &c.id, op_timeout).await?;
         }
         // Random crash: replace an instance (its in-flight state is gone).
         if rng.chance(0.2) {
-            let i = rng.below(n_instances as u64) as usize;
+            let i = rng.below_usize(n_instances);
             c.restart(i);
             c.instances[i].link.set(FaultPlan::chaos(0.04));
         }
         // Occasionally somebody checkpoints or compacts under chaos.
         if round % 4 == 3 {
-            let i = rng.below(n_instances as u64) as usize;
+            let i = rng.below_usize(n_instances);
             if let Ok(h) = c.instances[i].open(&c.id).await {
                 let _ = tokio::time::timeout(op_timeout, h.write_checkpoint()).await;
-                let cfg = c.instances[i].cfg.clone();
                 let _ = tokio::time::timeout(
                     op_timeout,
                     walgit_server::ops::compact_repo(
                         &h,
-                        &cfg,
                         walgit_server::ops::CompactRequest {
                             force: rng.chance(0.5),
                             rebuild_base: false,
@@ -922,7 +881,7 @@ async fn run_safety_then_liveness(seed: u64) -> Result<()> {
     // Liveness mode: pick a core of 2, heal it, freeze the rest in nasty states.
     let mut idx: Vec<usize> = (0..n_instances).collect();
     for k in (1..idx.len()).rev() {
-        let j = rng.below(k as u64 + 1) as usize;
+        let j = rng.below_usize(k + 1);
         idx.swap(k, j);
     }
     let core = &idx[..2];
@@ -951,7 +910,7 @@ async fn run_safety_then_liveness(seed: u64) -> Result<()> {
     for (k, &i) in idx[2..].iter().enumerate() {
         c.instances[i]
             .link
-            .set(frozen[(k + rng.below(4) as usize) % frozen.len()].clone());
+            .set(frozen[(k + rng.below_usize(4)) % frozen.len()].clone());
     }
     // Non-core pushers keep hammering the frozen links in the background (they
     // may never interfere with the core).
@@ -968,7 +927,7 @@ async fn run_safety_then_liveness(seed: u64) -> Result<()> {
                     link,
                     registry: reg,
                     cfg: Arc::new(sim_config(Path::new("/nonexistent"))),
-                    _cache: tempfile::tempdir().unwrap(),
+                    cache: tempfile::tempdir().unwrap(),
                 };
                 for _ in 0..20 {
                     let _ = p.push_once(&inst, &id, Duration::from_millis(500)).await;
@@ -1005,7 +964,7 @@ async fn sim_safety_then_liveness() {
         let r = run_safety_then_liveness(seed).await;
         eprintln!(
             "[seed {seed}] {:?} in {:.1}s",
-            r.as_ref().map(|_| "ok"),
+            r.as_ref().map(|()| "ok"),
             t.elapsed().as_secs_f64()
         );
         if let Err(e) = r {
@@ -1036,7 +995,7 @@ async fn liveness_compaction_after_lease_holder_dies() -> Result<()> {
         &walgit_proto::keys::lease_key("compact"),
         "dead-instance",
         "compact",
-        c.instances[1].cfg.compaction.lease_ttl,
+        c.instances[1].cfg.packs.lease_ttl,
     )
     .await?
     .expect("lease free");
@@ -1048,7 +1007,6 @@ async fn liveness_compaction_after_lease_holder_dies() -> Result<()> {
     loop {
         let out = walgit_server::ops::compact_repo(
             &h0,
-            &c.instances[0].cfg,
             walgit_server::ops::CompactRequest {
                 force: true,
                 rebuild_base: false,
@@ -1062,11 +1020,13 @@ async fn liveness_compaction_after_lease_holder_dies() -> Result<()> {
                 ensure!(
                     t.elapsed() < Duration::from_secs(15),
                     "lease of a dead holder never expired (ttl {:?})",
-                    c.instances[0].cfg.compaction.lease_ttl
+                    c.instances[0].cfg.packs.lease_ttl
                 );
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            other => bail!("unexpected {other:?}"),
+            other @ walgit_server::ops::CompactOutcome::NotTriggered { .. } => {
+                bail!("unexpected {other:?}")
+            }
         }
     }
     eprintln!(
@@ -1151,13 +1111,13 @@ async fn liveness_stale_instance_cannot_starve_the_core() -> Result<()> {
             link: stale_link,
             registry: stale_reg,
             cfg: Arc::new(sim_config(Path::new("/nonexistent"))),
-            _cache: tempfile::tempdir().unwrap(),
+            cache: tempfile::tempdir().unwrap(),
         };
         let mut n = 0u64;
         loop {
             let _ = stale_p.push_once(&inst, &id, Duration::from_secs(2)).await;
             n += 1;
-            if n % 10 == 0 {
+            if n.is_multiple_of(10) {
                 tracing::info!(
                     "stale pusher: {n} attempts, last: {:?}",
                     stale_p.errors.last()
@@ -1313,7 +1273,6 @@ async fn liveness_orphaned_log_segment_does_not_block_writers() -> Result<()> {
     let h = c.instances[0].open(&c.id).await?;
     let out = walgit_server::ops::compact_repo(
         &h,
-        &c.instances[0].cfg,
         walgit_server::ops::CompactRequest {
             force: true,
             rebuild_base: false,
@@ -1338,6 +1297,7 @@ async fn liveness_orphaned_log_segment_does_not_block_writers() -> Result<()> {
 /// Once its link heals, it must finish syncing — a half-downloaded pack on
 /// disk may not poison every later attempt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::many_single_char_names)]
 async fn liveness_cold_start_through_truncated_pack_reads() -> Result<()> {
     let mut c = Cluster::new(15, 1).await?;
     let mut p = Pusher::new(0);
@@ -1392,7 +1352,6 @@ async fn liveness_cold_start_through_truncated_pack_reads() -> Result<()> {
     // Compaction on the healed instance works on what it downloaded.
     let out = walgit_server::ops::compact_repo(
         &h,
-        &c.instances[cold].cfg,
         walgit_server::ops::CompactRequest {
             force: true,
             rebuild_base: false,
@@ -1436,7 +1395,7 @@ async fn liveness_black_holed_instance_is_invisible_to_the_core() -> Result<()> 
             link,
             registry: reg,
             cfg: Arc::new(sim_config(Path::new("/nonexistent"))),
-            _cache: tempfile::tempdir().unwrap(),
+            cache: tempfile::tempdir().unwrap(),
         };
         for _ in 0..5 {
             let _ = p1.push_once(&inst, &id, Duration::from_secs(30)).await;
@@ -1467,7 +1426,6 @@ async fn liveness_black_holed_instance_is_invisible_to_the_core() -> Result<()> 
         Duration::from_secs(20),
         walgit_server::ops::compact_repo(
             &h,
-            &c.instances[0].cfg,
             walgit_server::ops::CompactRequest {
                 force: true,
                 rebuild_base: false,
@@ -1519,7 +1477,7 @@ async fn liveness_frozen_task_owner_does_not_wedge_readiness() -> Result<()> {
     Ok(())
 }
 
-/// A request ReadGuard is the pin that promises packs remain on disk. Even a
+/// A request `ReadGuard` is the pin that promises packs remain on disk. Even a
 /// leaked guard must make eviction skip the repo; after it drops, eviction may
 /// reclaim the cache.
 #[tokio::test]
@@ -1565,12 +1523,10 @@ async fn liveness_checkpoint_racing_compaction() -> Result<()> {
     let h0 = c.instances[0].open(&c.id).await?;
     let h1 = c.instances[1].open(&c.id).await?;
     drop(h1.sync_full().await?);
-    let cfg = c.instances[1].cfg.clone();
     let (cp, compact) = tokio::join!(
         h0.write_checkpoint(),
         walgit_server::ops::compact_repo(
             &h1,
-            &cfg,
             walgit_server::ops::CompactRequest {
                 force: true,
                 rebuild_base: false
@@ -1590,55 +1546,8 @@ async fn liveness_checkpoint_racing_compaction() -> Result<()> {
     Ok(())
 }
 
-/// The due-bundle lease is durable, so a dead holder leaves it behind. Once
-/// its expiry passes, a healthy maintainer must steal it and build the bundle.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn liveness_bundle_build_after_lease_holder_dies() -> Result<()> {
-    let mut c = Cluster::new(21, 1).await?;
-    let mut p = Pusher::new(0);
-    ensure!(
-        p.push_once(&c.instances[0], &c.id, Duration::from_secs(10))
-            .await?
-    );
-    let maint = c.add_instance("bundle-core", &|cfg| {
-        cfg.bundles.strategy.truncate(1); // weekly/full only
-        // The sim pushes to refs/heads/p<idx>, never main; with the D22 default
-        // `bundles.main_only = true` a weekly of this repo has no refs to cut
-        // (`NoRefs`) — the test was silently failing since that default landed
-        // (2026-08-21 ~22:00Z). Bundle every head here; the liveness under test
-        // is the lease, not the ref selection.
-        cfg.bundles.main_only = false;
-    });
-    let h = c.instances[maint].open(&c.id).await?;
-    let dead =
-        walgit_bundle::ops::try_acquire_lease(h.store(), "weekly", Duration::from_millis(100))
-            .await?
-            .expect("setup: weekly lease free");
-    std::mem::forget(dead);
-
-    let source = Arc::new(SimBundleSource(c.instances[maint].registry.clone()));
-    let bundler = walgit_bundle::Bundler::new_with_source(source, c.instances[maint].cfg.clone());
-    ensure!(
-        bundler
-            .run_due(&c.id, std::time::SystemTime::now())
-            .await?
-            .is_empty(),
-        "built while dead holder's lease was live"
-    );
-    tokio::time::sleep(Duration::from_millis(120)).await;
-    let built = tokio::time::timeout(
-        Duration::from_secs(20),
-        bundler.run_due(&c.id, std::time::SystemTime::now()),
-    )
-    .await
-    .map_err(|_| anyhow!("bundle build did not recover after lease expiry"))??;
-    ensure!(built.iter().any(|b| b.strategy == "weekly"));
-    check_truth(&c, std::slice::from_ref(&p)).await?;
-    Ok(())
-}
-
 /// Exact healthy-link request counts defend the critical-path budgets in
-/// docs/ROUNDTRIPS.md. MemoryStore has no retries, so deltas are deterministic:
+/// docs/ROUNDTRIPS.md. `MemoryStore` has no retries, so deltas are deterministic:
 /// push = one freshness GET + pack/idx/log PUTs + manifest CAS; warm refs = one
 /// conditional GET; cold refs = the open's manifest GET + one log tail GET.
 #[tokio::test]
@@ -1676,7 +1585,7 @@ async fn healthy_request_round_trip_budgets() -> Result<()> {
     // Checkpoint: the freshness GET every operation pays, then refs PUT ∥ checkpoint PUT, then
     // the manifest CAS — 4 requests, 3 rounds; the provenance times come from what the writer
     // already applied, never a log GET (2026-08-22: it was 6 requests in 6 rounds with a
-    // bundle-list GET and a log GET inside).
+    // unnecessary store reads inside).
     let before = c.instances[0].link.stats().ops.load(Ordering::Relaxed);
     let cp = h.write_checkpoint().await?;
     let cp_ops = c.instances[0].link.stats().ops.load(Ordering::Relaxed) - before;
@@ -1692,228 +1601,6 @@ async fn healthy_request_round_trip_budgets() -> Result<()> {
         "healthy request counts: push={push_ops}, warm_refs={warm_ops}, cold_refs={cold_ops}, checkpoint={cp_ops}"
     );
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Bundle list: two maintainers (one legacy-shaped) + retention under faults
-// ---------------------------------------------------------------------------
-
-fn sim_bundle_entry(
-    strategy: &str,
-    kind: &str,
-    slot: u64,
-    base_id: &str,
-) -> walgit_proto::v1::BundleEntry {
-    walgit_proto::v1::BundleEntry {
-        id: format!("{strategy}-{slot}"),
-        key: format!("bundles/{strategy}/{slot}.bundle"),
-        strategy: strategy.into(),
-        kind: kind.into(),
-        creation_token: slot,
-        slot,
-        base_id: base_id.into(),
-        ..Default::default()
-    }
-}
-
-/// Oracle over the truth store: every bundle the *current* list references exists (a client
-/// that just read the list never 404s on an entry), and — once converged — the list obeys the
-/// D21 rule (`keep` fulls + the 2 newest incrementals per strategy, no orphan).
-async fn check_bundle_list_truth(c: &Cluster, converged: bool) -> Result<()> {
-    let store = walgit_store::Prefixed::new(c.truth.clone(), c.repo_prefix());
-    let Some(list) = walgit_bundle::ops::read_list(&store).await? else {
-        return Ok(());
-    };
-    for b in &list.bundles {
-        ensure!(
-            c.truth
-                .head(&format!("{}{}", c.repo_prefix(), b.key))
-                .await?
-                .is_some(),
-            "listed bundle {} is missing from the bucket (a client would 404)",
-            b.key
-        );
-        if !b.base_id.is_empty() {
-            ensure!(
-                list.bundles.iter().any(|x| x.id == b.base_id),
-                "orphan {}: base {} not listed",
-                b.id,
-                b.base_id
-            );
-        }
-    }
-    if converged {
-        let mut probe = list.clone();
-        let pruned = walgit_bundle::slots::retain(
-            &sim_config(Path::new("/nonexistent")).bundles,
-            &mut probe,
-        );
-        ensure!(
-            pruned.is_empty(),
-            "list not at retention: would still prune {pruned:?}"
-        );
-        for strat in ["daily", "hourly"] {
-            ensure!(
-                list.bundles.iter().filter(|b| b.strategy == strat).count()
-                    <= walgit_bundle::slots::INCREMENTALS_KEPT,
-                "{strat}: more than {} listed",
-                walgit_bundle::slots::INCREMENTALS_KEPT
-            );
-        }
-    }
-    Ok(())
-}
-
-/// A legacy-shaped maintainer (the rule before 2026-08-22: publish = append, prune nothing) and a
-/// current one race on `bundles/list.pb` through faulty links (lost responses, spurious 412s,
-/// errors before the op) while an oracle watches the truth. The list must converge to the D21
-/// rule within a bounded number of healthy passes, no listed bundle may ever be missing, and a
-/// steady-state retention pass costs one request (ROUNDTRIPS: 0 extra when nothing is pruned).
-async fn run_bundle_retention_race(seed: u64) -> Result<()> {
-    let mut c = Cluster::new(seed, 1).await?;
-    let store = walgit_store::Prefixed::new(c.truth.clone(), c.repo_prefix());
-    // Seed: one weekly, two dailies on it, 8 hourlies on each daily (objects = dummy bytes).
-    let mut list = walgit_proto::v1::BundleList {
-        mode: "all".into(),
-        heuristic: "creationToken".into(),
-        ..Default::default()
-    };
-    let w0 = 1_787_000_400u64;
-    list.bundles
-        .push(sim_bundle_entry("weekly", "full", w0, ""));
-    let mut slot_max = w0;
-    for d in 1..=2u64 {
-        let ds = w0 + d * 86_400;
-        list.bundles.push(sim_bundle_entry(
-            "daily",
-            "incremental",
-            ds,
-            &format!("weekly-{w0}"),
-        ));
-        for h in 1..=8u64 {
-            list.bundles.push(sim_bundle_entry(
-                "hourly",
-                "incremental",
-                ds + h * 3600,
-                &format!("daily-{ds}"),
-            ));
-            slot_max = slot_max.max(ds + h * 3600);
-        }
-    }
-    for b in &list.bundles {
-        store
-            .put_bytes(&b.key, b"bundle".as_slice(), walgit_store::PutMode::Create)
-            .await?;
-    }
-    store
-        .put_bytes(
-            walgit_proto::keys::BUNDLE_LIST,
-            list.encode_to_vec(),
-            walgit_store::PutMode::Create,
-        )
-        .await?;
-    check_bundle_list_truth(&c, false).await?;
-
-    // The current maintainer (faulty link) and the legacy one (its own faulty link).
-    let cur = c.add_instance("maint-current", &|cfg| cfg.bundles.enabled = true);
-    let legacy = c.add_instance("maint-legacy", &|cfg| cfg.bundles.enabled = true);
-    let chaos = FaultPlan::chaos(0.15).with_only(&["bundles/"]);
-    c.instances[cur].link.set(chaos.clone());
-    c.instances[legacy].link.set(chaos);
-    let bundler = walgit_bundle::Bundler::new_with_source(
-        Arc::new(SimBundleSource(c.instances[cur].registry.clone())),
-        c.instances[cur].cfg.clone(),
-    );
-    let legacy_h = c.instances[legacy].open(&c.id).await?;
-    let legacy_store = legacy_h.store().clone();
-    let newest_daily = format!("daily-{}", w0 + 2 * 86_400);
-
-    // Safety mode: interleave retention passes with legacy appends (each new hourly's object is
-    // written first, then the list entry — the legacy code's order too), checking the oracle.
-    let mut appended = 0u64;
-    for round in 0..12u64 {
-        let _ = bundler.apply_retention(&c.id).await; // faults may fail it: that is the point
-        if round % 2 == 0 {
-            slot_max += 3600;
-            let e = sim_bundle_entry("hourly", "incremental", slot_max, &newest_daily);
-            if legacy_store
-                .put_bytes(&e.key, b"bundle".as_slice(), walgit_store::PutMode::Create)
-                .await
-                .is_ok()
-            {
-                let e2 = e.clone();
-                let r = walgit_bundle::ops::cas_update_list(&legacy_store, 8, move |cur| {
-                    let mut l = cur.cloned().unwrap_or_default();
-                    l.bundles.retain(|b| b.id != e2.id);
-                    l.bundles.push(e2.clone());
-                    Ok(Some(l))
-                })
-                .await;
-                if r.is_ok() {
-                    appended += 1;
-                }
-            }
-        }
-        check_bundle_list_truth(&c, false)
-            .await
-            .with_context(|| format!("round {round}, seed {seed}\n{}", c.dump_traces()))?;
-    }
-
-    // Liveness mode: heal the current maintainer; the list converges within a bound.
-    c.instances[cur].link.heal();
-    let mut converged = false;
-    for _ in 0..6 {
-        bundler.apply_retention(&c.id).await?;
-        if check_bundle_list_truth(&c, true).await.is_ok() {
-            converged = true;
-            break;
-        }
-    }
-    ensure!(
-        converged,
-        "list did not converge to retention (seed {seed}, legacy appended {appended}):\n{}",
-        c.dump_traces()
-    );
-    // Steady state: a retention pass with nothing to prune is one request (the list GET).
-    let before = c.instances[cur].link.stats().ops.load(Ordering::Relaxed);
-    ensure!(bundler.apply_retention(&c.id).await? == 0);
-    let ops = c.instances[cur].link.stats().ops.load(Ordering::Relaxed) - before;
-    ensure!(
-        ops <= 1,
-        "steady-state retention pass used {ops} requests, budget 1"
-    );
-    // And a legacy append after convergence is folded by the next pass, never leaving a gap.
-    slot_max += 3600;
-    let e = sim_bundle_entry("hourly", "incremental", slot_max, &newest_daily);
-    c.instances[legacy].link.heal();
-    legacy_store
-        .put_bytes(&e.key, b"bundle".as_slice(), walgit_store::PutMode::Create)
-        .await?;
-    let e2 = e.clone();
-    walgit_bundle::ops::cas_update_list(&legacy_store, 8, move |cur| {
-        let mut l = cur.cloned().unwrap_or_default();
-        l.bundles.push(e2.clone());
-        Ok(Some(l))
-    })
-    .await?;
-    check_bundle_list_truth(&c, false).await?;
-    bundler.apply_retention(&c.id).await?;
-    check_bundle_list_truth(&c, true).await?;
-    let final_list = walgit_bundle::ops::read_list(&store).await?.unwrap();
-    ensure!(
-        final_list.bundles.iter().any(|b| b.id == e.id),
-        "the newest legacy hourly is listed"
-    );
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sim_bundle_retention_under_two_maintainers() {
-    for seed in seeds() {
-        run_bundle_retention_race(seed)
-            .await
-            .unwrap_or_else(|e| panic!("seed {seed}: {e:#}"));
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1969,10 +1656,7 @@ async fn run_checkpoint_crash(seed: u64, crash_at: &str) -> Result<()> {
     let m = c.truth_manifest().await?;
     ensure!(m.checkpoint.as_ref().map(|x| x.seq) == Some(before.head_seq));
     // The committed checkpoint's objects exist and a cold start folds from it.
-    for key in [
-        walgit_proto::keys::checkpoint_key(cp.seq),
-        walgit_proto::keys::checkpoint_refs_key(cp.seq),
-    ] {
+    for key in [cp.key.clone(), cp.refs_key.clone()] {
         ensure!(
             c.truth
                 .head(&format!("{}{}", c.repo_prefix(), key))
@@ -2013,6 +1697,11 @@ fn pack_objects(repo: &Path, checksum: &gix_hash::ObjectId) -> std::collections:
         .args(["verify-pack", "-v", idx.to_str().unwrap()])
         .output()
         .unwrap();
+    assert!(
+        out.status.success(),
+        "verify-pack failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| {
@@ -2027,6 +1716,7 @@ fn pack_objects(repo: &Path, checksum: &gix_hash::ObjectId) -> std::collections:
 
 /// Build a large-repository shape on a disk-mode host: a tier-2 base (full repack + bitmap) with its D18
 /// history pack, then several fresh pushes. Returns (base, history) checksums.
+#[allow(clippy::many_single_char_names)]
 async fn seed_base_and_history(
     c: &Cluster,
     i: usize,
@@ -2043,7 +1733,6 @@ async fn seed_base_and_history(
     drop(h.sync_full().await?);
     let out = walgit_server::ops::compact_repo(
         &h,
-        &c.instances[i].cfg,
         walgit_server::ops::CompactRequest {
             force: true,
             rebuild_base: true,
@@ -2108,19 +1797,38 @@ async fn geometric_fold_never_touches_the_base_or_the_history_pack() -> Result<(
         .map(|x| x.checksum.clone())
         .collect();
     ensure!(fresh.len() >= 2, "{before:?}");
+    let mut expected_inventory = std::collections::HashSet::new();
+    for pack in &before.packs {
+        expected_inventory.extend(pack_objects(
+            h.local().path(),
+            &gix_hash::ObjectId::from_hex(pack.checksum.as_bytes())?,
+        ));
+    }
     let base_objects = pack_objects(h.local().path(), &base);
     ensure!(!base_objects.is_empty());
 
-    let out = walgit_server::ops::compact_repo(
-        &h,
-        &c.instances[i].cfg,
-        walgit_server::ops::CompactRequest {
-            force: true,
-            rebuild_base: false,
-        },
-        &walgit_server::ops::noop_log,
-    )
-    .await?;
+    // Classification and mixed-pack separation are independent bounded units.
+    // Keep running them until the compatible fresh family is actually folded.
+    let mut folded = None;
+    for _ in 0..16 {
+        let outcome = walgit_server::ops::compact_repo(
+            &h,
+            walgit_server::ops::CompactRequest {
+                force: true,
+                rebuild_base: false,
+            },
+            &walgit_server::ops::noop_log,
+        )
+        .await?;
+        if matches!(
+            outcome,
+            walgit_server::ops::CompactOutcome::Published { tier: 1, .. }
+        ) {
+            folded = Some(outcome);
+            break;
+        }
+    }
+    let out = folded.ok_or_else(|| anyhow!("no compatible family folded within 16 units"))?;
     let dbg = format!("{out:?}");
     let walgit_server::ops::CompactOutcome::Published {
         rebuild_base,
@@ -2156,16 +1864,20 @@ async fn geometric_fold_never_touches_the_base_or_the_history_pack() -> Result<(
             .any(|x| x.checksum == hist.to_hex().to_string()
                 && x.kind == walgit_proto::v1::PackKind::History as i32)
     );
-    for f in &fresh {
-        ensure!(
-            !live.contains(&f.as_str()),
-            "fresh pack {f} still live after the fold"
-        );
+    ensure!(
+        superseded >= 2,
+        "fold needs at least two compatible inputs: {dbg}"
+    );
+    let mut actual_inventory = std::collections::HashSet::new();
+    for pack in &after.packs {
+        actual_inventory.extend(pack_objects(
+            h.local().path(),
+            &gix_hash::ObjectId::from_hex(pack.checksum.as_bytes())?,
+        ));
     }
     ensure!(
-        superseded == fresh.len(),
-        "superseded {superseded}, fresh {}",
-        fresh.len()
+        actual_inventory == expected_inventory,
+        "fold changed committed object inventory"
     );
     // The folded pack carries none of the base's objects.
     for new in &packs {
@@ -2194,7 +1906,7 @@ async fn full_rebuild_leaves_exactly_one_base_even_with_a_retained_pack() -> Res
         cfg.git.history_pack = true;
     });
     let mut p = Pusher::new(0);
-    let (base1, _hist1) = seed_base_and_history(&c, i, &mut p, 2).await?;
+    let (_base1, _hist1) = seed_base_and_history(&c, i, &mut p, 2).await?;
     let h = c.instances[i].open(&c.id).await?;
     drop(h.sync_full().await?);
     // Simulate git retaining the old base (a `.keep` git would honour — as a kept pack it is not
@@ -2212,7 +1924,6 @@ async fn full_rebuild_leaves_exactly_one_base_even_with_a_retained_pack() -> Res
     let log_lines: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let out = walgit_server::ops::compact_repo(
         &h,
-        &c.instances[i].cfg,
         walgit_server::ops::CompactRequest {
             force: true,
             rebuild_base: true,
@@ -2255,7 +1966,10 @@ async fn full_rebuild_leaves_exactly_one_base_even_with_a_retained_pack() -> Res
             // The rebuild may reproduce an identical pack (same objects, same order): then it is the
             // new base, never a stale extra.
             ensure!(
-                fulls[0].checksum == *old,
+                after
+                    .packs
+                    .iter()
+                    .any(|pack| pack.checksum == *old && pack.tier == 2),
                 "old pack {old} still live next to the new base: {after:?}"
             );
         }
@@ -2265,13 +1979,12 @@ async fn full_rebuild_leaves_exactly_one_base_even_with_a_retained_pack() -> Res
         "rebuild superseded {superseded} of {} live packs",
         before.len()
     );
-    ensure!(base1 != gix_hash::ObjectId::from_hex(fulls[0].checksum.as_bytes())? || true);
     check_truth(&c, std::slice::from_ref(&p)).await?;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Resumable base rebuild (BUNDLE_URI_DESIGN §5a)
+// Resumable isolated pack cuts
 // ---------------------------------------------------------------------------
 
 /// Run one rebuild attempt; returns (outcome, log lines).
@@ -2282,11 +1995,10 @@ async fn rebuild_attempt(
     let lines: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let h = match c.instances[i].open(&c.id).await {
         Ok(h) => h,
-        Err(e) => return (Err(e.into()), Vec::new()),
+        Err(e) => return (Err(e), Vec::new()),
     };
     let out = walgit_server::ops::compact_repo(
         &h,
-        &c.instances[i].cfg,
         walgit_server::ops::CompactRequest {
             force: true,
             rebuild_base: true,
@@ -2297,19 +2009,15 @@ async fn rebuild_attempt(
     (out, lines.into_inner().unwrap())
 }
 
-/// A deploy (D31) kills the rebuild after any phase: the next unit resumes from the marker —
-/// across every phase boundary there is exactly **one** `git repack` in total — the serving copy
-/// is never rewritten (its pack files before publish are exactly the pre-rebuild ones), and the
-/// result is one base + one history pack. A push between the attempts makes the head move, and
-/// the next unit starts over (a second repack) instead of publishing a pack that lacks objects.
+/// Interrupted isolated cuts preserve the serving inventory and all committed
+/// objects. A changed ref snapshot rejects scratch from the previous cut.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::many_single_char_names)]
 async fn base_rebuild_resumes_after_a_kill_between_any_two_phases() -> Result<()> {
-    use walgit_server::rebuild::{Phase, TEST_ABORT_AFTER};
+    use walgit_server::pack_lifecycle::{Phase, TEST_ABORT_AFTER};
     let mut c = Cluster::new(33, 1).await?;
     let i = c.add_instance("ssd", &|cfg| {
         cfg.cache.mode = walgit_config::CacheMode::Disk;
-        cfg.git.history_pack = true;
-        cfg.git.commit_graph = true;
     });
     let mut p = Pusher::new(0);
     for _ in 0..4 {
@@ -2320,144 +2028,106 @@ async fn base_rebuild_resumes_after_a_kill_between_any_two_phases() -> Result<()
     }
     let h = c.instances[i].open(&c.id).await?;
     drop(h.sync_full().await?);
+    let before = h.manifest();
     let before_files: std::collections::BTreeSet<String> =
         std::fs::read_dir(h.local().path().join("objects/pack"))?
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .collect();
+    let mut expected = std::collections::HashSet::new();
+    for pack in &before.packs {
+        expected.extend(pack_objects(
+            h.local().path(),
+            &gix_hash::ObjectId::from_hex(pack.checksum.as_bytes())?,
+        ));
+    }
     let repo_key = c.id.to_string();
-    let mut repacks = 0usize;
-    // Kill after each phase in turn; every attempt but the last fails by the hook.
-    for phase in [
-        Phase::Copied,
-        Phase::Repacked,
-        Phase::HistoryPack,
-        Phase::CommitGraph,
-    ] {
+    for phase in [Phase::Prepared, Phase::Step] {
         *TEST_ABORT_AFTER.lock() = Some((repo_key.clone(), phase));
         let (out, log) = rebuild_attempt(&c, i).await;
-        repacks += log.iter().filter(|l| l.starts_with("repack done")).count();
         ensure!(
             out.is_err(),
-            "attempt killed after {phase:?} should fail: {out:?}\n{}",
+            "attempt killed after {phase:?}: {out:?}\n{}",
             log.join("\n")
         );
-        // The serving copy is untouched while the rebuild is in flight.
         let now_files: std::collections::BTreeSet<String> =
             std::fs::read_dir(h.local().path().join("objects/pack"))?
                 .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
                 .collect();
         ensure!(
             now_files == before_files,
-            "serving copy changed during the rebuild after {phase:?}: {now_files:?} vs {before_files:?}"
+            "serving files changed before publication"
         );
-        // "Restart": a fresh instance on the same cache dir/link name — the scratch dir on "disk" survives.
-        c.restart_keep_disk(i, &|cfg| {
-            cfg.cache.mode = walgit_config::CacheMode::Disk;
-            cfg.git.history_pack = true;
-            cfg.git.commit_graph = true;
-        });
+        ensure!(
+            h.manifest().packs == before.packs,
+            "inputs changed before final seal"
+        );
+        c.restart_keep_disk(i, &|cfg| cfg.cache.mode = walgit_config::CacheMode::Disk);
     }
     *TEST_ABORT_AFTER.lock() = None;
     let (out, log) = rebuild_attempt(&c, i).await;
-    repacks += log.iter().filter(|l| l.starts_with("repack done")).count();
-    let out = out.with_context(|| log.join("\n"))?;
-    ensure!(
-        matches!(
-            out,
-            walgit_server::ops::CompactOutcome::Published {
-                rebuild_base: true,
-                ..
-            }
-        ),
-        "{out:?}"
-    );
-    ensure!(
-        repacks == 1,
-        "exactly one git repack across all attempts, saw {repacks}:\n{}",
-        log.join("\n")
-    );
-    ensure!(
-        log.iter().any(|l| l.starts_with("resuming base rebuild")),
-        "{}",
-        log.join("\n")
-    );
-    let h = c.instances[i].open(&c.id).await?;
-    drop(h.sync_full().await?);
-    let m = h.manifest();
-    ensure!(
-        m.packs
-            .iter()
-            .filter(|x| x.tier == 2 && x.kind != walgit_proto::v1::PackKind::History as i32)
-            .count()
-            == 1,
-        "{m:?}"
-    );
-    ensure!(
-        m.packs
-            .iter()
-            .filter(|x| x.kind == walgit_proto::v1::PackKind::History as i32)
-            .count()
-            == 1,
-        "{m:?}"
-    );
-    ensure!(m.packs.len() == 2, "{m:?}");
-    let scratch = c.instances[i].cfg.cache.dir.join("_rebuild");
-    ensure!(
-        !scratch.join("sim").exists() || std::fs::read_dir(scratch.join("sim"))?.next().is_none(),
-        "scratch dir left behind"
-    );
-    check_truth(&c, std::slice::from_ref(&p)).await?;
-
-    // A push between a kill and the resume: the head moved, the next attempt starts over.
-    *TEST_ABORT_AFTER.lock() = Some((repo_key.clone(), Phase::Repacked));
-    let (out, log1) = rebuild_attempt(&c, i).await;
-    ensure!(out.is_err());
-    ensure!(log1.iter().filter(|l| l.starts_with("repack done")).count() == 1);
-    ensure!(
-        p.push_once(&c.instances[i], &c.id, Duration::from_secs(10))
-            .await?
-    );
-    *TEST_ABORT_AFTER.lock() = None;
-    let (out, log2) = rebuild_attempt(&c, i).await;
-    let out = out.with_context(|| log2.join("\n"))?;
     ensure!(matches!(
-        out,
+        out.with_context(|| log.join("\n"))?,
         walgit_server::ops::CompactOutcome::Published {
             rebuild_base: true,
             ..
         }
     ));
     ensure!(
-        log2.iter()
-            .any(|l| l.starts_with("discarding interrupted base rebuild")),
+        log.iter()
+            .any(|line| line.contains("resumed validated pack lifecycle progress")),
         "{}",
-        log2.join("\n")
-    );
-    ensure!(
-        log2.iter().filter(|l| l.starts_with("repack done")).count() == 1,
-        "a fresh repack after the head moved"
+        log.join("\n")
     );
     let h = c.instances[i].open(&c.id).await?;
     drop(h.sync_full().await?);
-    let m = h.manifest();
+    let mut actual = std::collections::HashSet::new();
+    for pack in &h.manifest().packs {
+        actual.extend(pack_objects(
+            h.local().path(),
+            &gix_hash::ObjectId::from_hex(pack.checksum.as_bytes())?,
+        ));
+    }
     ensure!(
-        m.packs.len() == 2,
-        "one base + one history pack again: {m:?}"
+        actual == expected,
+        "cut changed the committed object inventory"
     );
-    // The pushed commit is in the new base (not lost to a stale scratch).
-    let base = m
-        .packs
-        .iter()
-        .find(|x| x.tier == 2 && x.kind != walgit_proto::v1::PackKind::History as i32)
-        .unwrap();
-    let objs = pack_objects(
-        h.local().path(),
-        &gix_hash::ObjectId::from_hex(base.checksum.as_bytes())?,
-    );
+    check_truth(&c, std::slice::from_ref(&p)).await?;
+
+    *TEST_ABORT_AFTER.lock() = Some((repo_key.clone(), Phase::Step));
+    let (out, _) = rebuild_attempt(&c, i).await;
+    ensure!(out.is_err());
     ensure!(
-        objs.contains(&p.tip),
-        "the in-between push's tip {} is in the new base",
-        p.tip
+        p.push_once(&c.instances[i], &c.id, Duration::from_secs(10))
+            .await?
+    );
+    *TEST_ABORT_AFTER.lock() = None;
+    let (out, log) = rebuild_attempt(&c, i).await;
+    ensure!(matches!(
+        out.with_context(|| log.join("\n"))?,
+        walgit_server::ops::CompactOutcome::Published {
+            rebuild_base: true,
+            ..
+        }
+    ));
+    ensure!(
+        log.iter()
+            .any(|line| line.starts_with("scratch cannot resume")),
+        "{}",
+        log.join("\n")
+    );
+    let h = c.instances[i].open(&c.id).await?;
+    drop(h.sync_full().await?);
+    let mut actual = std::collections::HashSet::new();
+    for pack in &h.manifest().packs {
+        actual.extend(pack_objects(
+            h.local().path(),
+            &gix_hash::ObjectId::from_hex(pack.checksum.as_bytes())?,
+        ));
+    }
+    ensure!(actual.contains(&p.tip), "the in-between push was lost");
+    ensure!(
+        expected.is_subset(&actual),
+        "previously committed objects were lost"
     );
     check_truth(&c, std::slice::from_ref(&p)).await?;
     Ok(())
@@ -2471,8 +2141,8 @@ async fn base_rebuild_resumes_after_a_kill_between_any_two_phases() -> Result<()
 /// download and caches have something to evict).
 fn push_blobby(p: &mut Pusher, kb: usize, rng: &mut Lcg) -> String {
     let mut buf = vec![0u8; kb * 1024];
-    for b in buf.iter_mut() {
-        *b = rng.next() as u8;
+    for b in &mut buf {
+        *b = u8::try_from(rng.next() & 0xff).expect("masked random byte fits in u8");
     }
     std::fs::write(p.work.path().join(format!("blob-{}.bin", p.n + 1)), &buf).unwrap();
     p.work.commit(p.n + 1, &format!("p{}", p.idx))
@@ -2485,6 +2155,7 @@ fn push_blobby(p: &mut Pusher, kb: usize, rng: &mut Lcg) -> String {
 /// `materialize` running for the repo; an aborted owner releases the lock at once (the next
 /// caller starts its own task — nothing blocks forever); a late joiner's `attach()` replays
 /// the story so far and sees the outcome; downloads are not multiplied by the callers.
+#[allow(clippy::many_single_char_names)]
 async fn run_task_ownership(seed: u64) -> Result<()> {
     let mut rng = Lcg(seed);
     let mut c = Cluster::new(seed, 1).await?;
@@ -2530,7 +2201,8 @@ async fn run_task_ownership(seed: u64) -> Result<()> {
                 Duration::from_millis(1),
                 Duration::from_millis(2 + rng.below(15)),
             )),
-            p_err_before: 0.05 + (rng.below(10) as f64) / 100.0,
+            p_err_before: 0.05
+                + f64::from(u32::try_from(rng.below(10)).expect("sample is below 10")) / 100.0,
             p_truncate: 0.05,
             ..Default::default()
         }
@@ -2541,15 +2213,15 @@ async fn run_task_ownership(seed: u64) -> Result<()> {
     let repo = c.id.to_string();
 
     // K concurrent object-level syncs; one random caller is aborted after a random delay.
-    let k = 4 + rng.below(4) as usize;
+    let k = 4 + rng.below_usize(4);
     let mut joins = Vec::new();
     for _ in 0..k {
         let h = h.clone();
         joins.push(tokio::spawn(async move {
-            h.sync().await.map(|g| drop(g)).map_err(|e| e.to_string())
+            h.sync().await.map(drop).map_err(|e| e.to_string())
         }));
     }
-    let victim = rng.below(k as u64) as usize;
+    let victim = rng.below_usize(k);
     let abort_after = Duration::from_millis(rng.below(40));
     // Watch the task registry while they run: at most one materialize task at a time.
     let watcher = {
@@ -2629,7 +2301,8 @@ async fn run_task_ownership(seed: u64) -> Result<()> {
         "late joiner did not see the outcome: {outcome:?}"
     );
     // Downloads: every attempt downloads each pack at most once (+ idx); no N-fold traffic.
-    let ops = c.instances[j].link.stats().ops.load(Ordering::Relaxed) as usize;
+    let ops = usize::try_from(c.instances[j].link.stats().ops.load(Ordering::Relaxed))
+        .context("store operation count does not fit usize")?;
     let attempts = materializes.len();
     let budget = attempts * (live_packs * 4 + 6) + k * 3 + 20;
     ensure!(
@@ -2651,10 +2324,10 @@ async fn sim_task_ownership_under_concurrency_and_owner_crash() {
 
 /// Budget-mode cache pressure: four repositories of which the cache holds about two, a
 /// randomized interleaving of refs-level and object-level reads, one repository pinned by a
-/// live ReadGuard throughout, plus one repository whose pack set exceeds `cache.max_bytes`.
+/// live `ReadGuard` throughout, plus one repository whose pack set exceeds `cache.max_bytes`.
 /// Asserted after every step: the pinned repo is never evicted; the too-large repo is refused
 /// with `TooLarge` (never materialized, never the cause of evicting the others); the cache
-/// stays ≤ max_bytes + one pack set; a refs-level read on a cold repo during eviction stays fast.
+/// stays ≤ `max_bytes` + one pack set; a refs-level read on a cold repo during eviction stays fast.
 async fn run_cache_pressure(seed: u64) -> Result<()> {
     let mut rng = Lcg(seed ^ 0x5EED);
     let truth: DynStore = MemoryStore::shared();
@@ -2662,7 +2335,7 @@ async fn run_cache_pressure(seed: u64) -> Result<()> {
     let mut ids = Vec::new();
     let mut pushers = Vec::new();
     for r in 0..4u32 {
-        let id = RepoId::new("sim", &format!("cache{seed}-{r}"))?;
+        let id = RepoId::new("sim", format!("cache{seed}-{r}"))?;
         writer.registry.create(&id, ObjectFormat::Sha1).await?;
         let mut p = Pusher::new(r as usize);
         let new = push_blobby(&mut p, 96, &mut rng);
@@ -2694,7 +2367,7 @@ async fn run_cache_pressure(seed: u64) -> Result<()> {
         pushers.push(p);
     }
     // The big one: ~5 × a small repo.
-    let big = RepoId::new("sim", &format!("cache{seed}-big"))?;
+    let big = RepoId::new("sim", format!("cache{seed}-big"))?;
     writer.registry.create(&big, ObjectFormat::Sha1).await?;
     {
         let mut p = Pusher::new(9);
@@ -2752,7 +2425,7 @@ async fn run_cache_pressure(seed: u64) -> Result<()> {
     let mut refs_latencies = Vec::new();
     let mut total_evicted = 0usize;
     for step in 0..30u64 {
-        let r = 1 + rng.below(3) as usize; // repos 1..3
+        let r = 1 + rng.below_usize(3); // repos 1..3
         let id = &ids[r];
         let h = front.registry.open(id).await?;
         match rng.below(3) {
@@ -2854,3 +2527,43 @@ async fn sim_cache_pressure_keeps_pinned_repos_and_refuses_too_large() {
 
 #[allow(dead_code)]
 fn _unused(_: WalError) {}
+
+/// A prepared older checkpoint cannot replace a newer checkpoint after another
+/// push advances head beyond both. Sequence equality with current head is not enough.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checkpoint_retry_never_regresses_a_newer_checkpoint() -> Result<()> {
+    let c = Cluster::new(63, 2).await?;
+    let mut p = Pusher::new(0);
+    ensure!(
+        p.push_once(&c.instances[0], &c.id, Duration::from_secs(10))
+            .await?
+    );
+    let old = c.instances[0].open(&c.id).await?;
+    let old_seq = old.manifest().head_seq;
+    let gate = c.instances[0].link.gate_next("put", "checkpoint.pb");
+    let pending = tokio::spawn(async move { old.write_checkpoint().await });
+    tokio::time::timeout(Duration::from_secs(10), gate.entered()).await?;
+
+    ensure!(
+        p.push_once(&c.instances[1], &c.id, Duration::from_secs(10))
+            .await?
+    );
+    let newer = c.instances[1].open(&c.id).await?;
+    let checkpoint = newer.write_checkpoint().await?;
+    ensure!(checkpoint.seq > old_seq);
+    ensure!(
+        p.push_once(&c.instances[1], &c.id, Duration::from_secs(10))
+            .await?
+    );
+    ensure!(c.truth_manifest().await?.head_seq > checkpoint.seq);
+
+    gate.release();
+    let observed = tokio::time::timeout(Duration::from_secs(10), pending).await???;
+    ensure!(
+        observed == checkpoint,
+        "old writer did not adopt the newer checkpoint"
+    );
+    ensure!(c.truth_manifest().await?.checkpoint == Some(checkpoint));
+    check_truth(&c, std::slice::from_ref(&p)).await?;
+    Ok(())
+}

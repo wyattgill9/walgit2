@@ -1,10 +1,38 @@
-//! Git smart HTTP server (protocol v0/v2), LFS, bundle serving, admin, health, metrics.
+//! Git smart HTTP server (protocol v0/v2), LFS, admin, health, metrics.
 //! See AGENTS.md Phase 3.
+#![allow(
+    clippy::case_sensitive_file_extension_comparisons,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::doc_lazy_continuation,
+    clippy::expect_used,
+    clippy::if_same_then_else,
+    clippy::implicit_hasher,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names,
+    clippy::match_wildcard_for_single_variants,
+    clippy::needless_continue,
+    clippy::needless_pass_by_value,
+    clippy::ref_option,
+    clippy::string_slice,
+    clippy::struct_field_names,
+    clippy::too_many_arguments,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::type_complexity,
+    clippy::unnested_or_patterns,
+    clippy::unnecessary_wraps,
+    clippy::unused_async,
+    clippy::unused_self,
+    clippy::unwrap_used,
+    clippy::unreadable_literal,
+    clippy::used_underscore_binding
+)]
 
 pub mod admin;
 pub mod auth;
 pub mod bridge;
-pub mod bundles;
 pub mod cache;
 pub mod error;
 pub mod events;
@@ -18,10 +46,11 @@ pub mod maintain;
 pub mod metrics;
 pub mod middleware;
 pub mod ops;
+pub mod pack_lifecycle;
+pub mod packfile_uri;
 pub mod pktline;
 pub mod policy;
 pub mod prewarm;
-pub mod rebuild;
 pub mod repo;
 pub mod settings;
 pub mod setup;
@@ -55,7 +84,6 @@ pub struct AppState {
     pub cfg: Arc<walgit_config::Config>,
     pub store: DynStore,
     pub registry: Arc<walgit_wal::Registry>,
-    pub bundles: Arc<walgit_bundle::Bundler>,
     pub auth: Arc<auth::Authenticator>,
     pub semaphores: middleware::RepoSemaphores,
     /// HTTP requests in flight (counted until the response body is done); on the watchdog line.
@@ -77,16 +105,13 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Build a full AppState from a config + store (memory or opened backend).
+    /// Build a full `AppState` from a config + store (memory or opened backend).
     pub async fn new(
         cfg: Arc<walgit_config::Config>,
         store: DynStore,
     ) -> anyhow::Result<Arc<Self>> {
         let registry = walgit_wal::Registry::new(store.clone(), cfg.clone());
         let bridge = bridge::Bridge::new(&cfg, registry.clone());
-        let bundle_source: Arc<dyn walgit_bundle::BundleSource> =
-            Arc::new(RegistryBundleSource(registry.clone()));
-        let bundles = walgit_bundle::Bundler::new_with_source(bundle_source, cfg.clone());
         let metrics_handle = metrics::install()?;
         let tls = tls::load(&cfg)?;
         if let Some(t) = &tls {
@@ -96,7 +121,6 @@ impl AppState {
             cfg: cfg.clone(),
             store,
             registry,
-            bundles,
             auth: auth::Authenticator::new(&cfg),
             semaphores: middleware::RepoSemaphores::new(cfg.server.max_concurrent_per_repo),
             inflight: Arc::new(middleware::Inflight::default()),
@@ -114,7 +138,7 @@ impl AppState {
 /// Build a full axum router.
 pub fn router(state: Arc<AppState>) -> Router {
     // Dynamic web responses (JSON API, SPA index/overview) are compressed on
-    // the fly; git smart-HTTP, bundles and LFS bytes never are (packs are
+    // the fly; git smart-HTTP and LFS bytes never are (packs are
     // already compressed, and `Content-Length`/`Range` must stay exact).
     // Embedded `/_ui/assets` arrive precompressed from the build and carry
     // their own `Content-Encoding`, which this layer leaves untouched; SSE is
@@ -143,7 +167,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             state.clone(),
             web::require_auth,
         ));
-    let inner = Router::new()
+
+    Router::new()
         .merge(
             web::api::router(state.clone())
                 .with_state(())
@@ -176,7 +201,7 @@ pub fn router(state: Arc<AppState>) -> Router {
                  body: Body| async move {
                     bridge::http_notify(&st, &headers, body)
                         .await
-                        .unwrap_or_else(|e| e.into_response())
+                        .unwrap_or_else(axum::response::IntoResponse::into_response)
                 },
             ),
         )
@@ -222,17 +247,15 @@ pub fn router(state: Arc<AppState>) -> Router {
             state.inflight.clone(),
             middleware::request_id,
         ))
-        .with_state(state);
-    inner
+        .with_state(state)
 }
 
 async fn host_from_authority(mut req: Request<Body>) -> Request<Body> {
-    if !req.headers().contains_key(axum::http::header::HOST) {
-        if let Some(auth) = req.uri().authority().map(|a| a.to_string()) {
-            if let Ok(v) = axum::http::HeaderValue::from_str(&auth) {
-                req.headers_mut().insert(axum::http::header::HOST, v);
-            }
-        }
+    if !req.headers().contains_key(axum::http::header::HOST)
+        && let Some(auth) = req.uri().authority().map(std::string::ToString::to_string)
+        && let Ok(v) = axum::http::HeaderValue::from_str(&auth)
+    {
+        req.headers_mut().insert(axum::http::header::HOST, v);
     }
     req
 }
@@ -241,7 +264,10 @@ fn panic_response(err: Box<dyn std::any::Any + Send + 'static>) -> Response {
     let msg = err
         .downcast_ref::<String>()
         .cloned()
-        .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+        .or_else(|| {
+            err.downcast_ref::<&str>()
+                .map(std::string::ToString::to_string)
+        })
         .unwrap_or_else(|| "unknown panic".to_string());
     tracing::error!(panic = %msg, "request handler panicked");
     (
@@ -285,7 +311,7 @@ fn spawn_runtime_watchdog(
                     })
                     .map(|pages| pages * 4096 / (1024 * 1024));
                 tracing::warn!(
-                    gap_ms = gap.as_millis() as u64,
+                    gap_ms = u64::try_from(gap.as_millis()).unwrap_or(u64::MAX),
                     inflight,
                     tasks_running,
                     lock_wait_max_ms = walgit_wal::lockwait::max_wait_ms(),
@@ -323,7 +349,7 @@ pub(crate) fn request_peer(req: &Request<Body>) -> Option<SocketAddr> {
 }
 
 /// Route a parsed repo request (`/{owner}/{repo}[.git]/<sub>` or the same sub
-/// under `/{owner}/{repo}/api[-browser]`) to git smart-HTTP, LFS, bundles,
+/// under `/{owner}/{repo}/api[-browser]`) to git smart-HTTP, LFS,
 /// repo admin and policy handlers.
 pub(crate) async fn dispatch_route(
     st: &Arc<AppState>,
@@ -338,6 +364,9 @@ pub(crate) async fn dispatch_route(
     let sub = route.subpath.as_str();
     let result: Result<Response, ApiError> = async {
         match (&method, sub) {
+            (&Method::GET | &Method::HEAD, s) if s.starts_with("packfiles/") => {
+                packfile_uri::get(st, route, &method, &headers, peer).await
+            }
             (&Method::GET, "info/refs") => {
                 let _permit = acquire(st, route).await;
                 smart::info_refs(st, route, &headers, &query).await
@@ -365,17 +394,6 @@ pub(crate) async fn dispatch_route(
             (&Method::POST, "info/lfs/verify") => {
                 let bytes = collect_body(body.take().unwrap()).await?;
                 lfs::verify(st, route, &headers, bytes).await
-            }
-            (&Method::GET, "bundles/list") => {
-                bundles::list(st, route, &headers, &query, true).await
-            }
-            (&Method::GET, "bundles/catchup") => {
-                bundles::list(st, route, &headers, &query, false).await
-            }
-            (&Method::GET | &Method::HEAD, s)
-                if s.starts_with("bundles/") && s != "bundles/list" && s != "bundles/catchup" =>
-            {
-                bundles::object(st, route, &method, &headers, peer).await
             }
             (&Method::PUT, "") => admin::create(st, route, &headers, &query).await,
             (&Method::DELETE, "") => admin::delete(st, route, &headers).await,
@@ -507,7 +525,7 @@ impl axum::serve::Listener for NodelayListener {
     }
 }
 
-/// Enable TCP_NODELAY on an accepted stream. Applied via `Listener::tap_io` so
+/// Enable `TCP_NODELAY` on an accepted stream. Applied via `Listener::tap_io` so
 /// the connection stays a plain `TcpStream` and axum's blanket `Connected` impl
 /// for `TapIo` supplies the peer `SocketAddr` to `ConnectInfo` (used by the
 /// accel-redirect loopback check). Git's receive-pack status is many small
@@ -525,6 +543,9 @@ pub async fn serve(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let addr = state.cfg.server.listen;
+    // Resolve the machine type before the first request, so `/readyz`, `/healthz`
+    // and the UI footer only read a cell that is already filled (principle VI).
+    instance::init_machine_type(&state.cfg).await;
     let state_for_shutdown = state.clone();
     prewarm::spawn(state.clone());
     bridge::spawn_sweeper(state.clone());
@@ -572,27 +593,24 @@ pub async fn serve(
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     };
     let serving = async move {
-        match tls {
-            Some(t) => {
-                axum::serve(
-                    tls::TlsListener {
-                        tcp: listener,
-                        acceptor: t.acceptor.clone(),
-                    },
-                    app,
-                )
-                .with_graceful_shutdown(graceful)
-                .await
-            }
-            None => {
-                use axum::serve::ListenerExt;
-                axum::serve(
-                    NodelayListener(listener).tap_io(set_nodelay),
-                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-                )
-                .with_graceful_shutdown(graceful)
-                .await
-            }
+        if let Some(t) = tls {
+            axum::serve(
+                tls::TlsListener {
+                    tcp: listener,
+                    acceptor: t.acceptor.clone(),
+                },
+                app,
+            )
+            .with_graceful_shutdown(graceful)
+            .await
+        } else {
+            use axum::serve::ListenerExt;
+            axum::serve(
+                NodelayListener(listener).tap_io(set_nodelay),
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(graceful)
+            .await
         }
     };
     // In-flight requests get `server.drain_timeout` from phase 2 on (a stuck
@@ -601,7 +619,7 @@ pub async fn serve(
     let bound = state_for_shutdown.cfg.server.drain_timeout;
     tokio::select! {
         r = serving => r?,
-        _ = async { phase2.notified().await; tokio::time::sleep(bound).await } => {
+        () = async { phase2.notified().await; tokio::time::sleep(bound).await } => {
             tracing::warn!(?bound, "shutdown: in-flight requests still open past server.drain_timeout; exiting");
         }
     }
@@ -631,122 +649,6 @@ pub fn listen_url(cfg: &walgit_config::Config) -> String {
 /// is dropped on abort; a blocking git child is left to die with the container).
 const UNIT_STOP_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Server-side adapter implementing `walgit_bundle::BundleSource` over a
-/// `walgit_wal::Registry`. Defined here (server owns the type) so the orphan
-/// rule is satisfied; lets us use `Bundler::new_with_source` without waiting for
-/// a Registry impl in the bundle crate.
-struct RegistryBundleSource(Arc<walgit_wal::Registry>);
-
-#[async_trait::async_trait]
-impl walgit_bundle::BundleSource for RegistryBundleSource {
-    async fn open_repo(
-        &self,
-        id: &walgit_git::RepoId,
-    ) -> Result<walgit_bundle::BundleRepoHandle, walgit_bundle::BundleError> {
-        let h = self.0.open(id).await.map_err(|e| match e {
-            walgit_wal::WalError::NotFound => {
-                walgit_bundle::BundleError::RepoNotFound(id.to_string())
-            }
-            other => walgit_bundle::BundleError::Other(other.to_string()),
-        })?;
-        Ok(walgit_bundle::BundleRepoHandle {
-            local: h.local().clone(),
-            store: h.store().clone(),
-            head_seq: h.manifest().head_seq,
-            engine: walgit_bundle::BundleEngine::Git,
-            cfg: Some(h.effective_config()),
-        })
-    }
-
-    async fn prepare_objects(
-        &self,
-        id: &walgit_git::RepoId,
-    ) -> Result<(), walgit_bundle::BundleError> {
-        // `git bundle create` streams from the local copy: bring the packs
-        // here first (Serve level). Registry::open alone is refs-level — the
-        // maintainer built from it and git said "bad object refs/heads/main".
-        // Too-large repos fail with the "larger than this instance" message
-        // that run_all_due treats as "skipped, the VM job builds those".
-        // Never from open_repo: list/advert callers hold a read guard and a
-        // sync here would deadlock on the repo's write lock.
-        let h = self
-            .0
-            .open(id)
-            .await
-            .map_err(|e| walgit_bundle::BundleError::Other(e.to_string()))?;
-        drop(
-            h.sync()
-                .await
-                .map_err(|e| walgit_bundle::BundleError::Other(e.to_string()))?,
-        );
-        Ok(())
-    }
-
-    /// gix (+ remote faulter) when the base is remote-served or linked from
-    /// the store mount (stock git would read every boundary tree through the
-    /// mount or fail), git on a complete local copy.
-    async fn engine(&self, id: &walgit_git::RepoId) -> walgit_bundle::BundleEngine {
-        let Ok(h) = self.0.open(id).await else {
-            return walgit_bundle::BundleEngine::Git;
-        };
-        if !h.remote_served().is_empty() {
-            match h.remote_reader().await {
-                Ok(reader) => {
-                    return walgit_bundle::BundleEngine::Gix {
-                        faulter: Some(Arc::new(walgit_wal::remote::Faulter::new(
-                            reader,
-                            h.local().clone(),
-                        ))),
-                    };
-                }
-                Err(e) => {
-                    tracing::warn!(repo = %id, error = %e, "remote reader unavailable for bundle build; using git")
-                }
-            }
-        }
-        let linked = h
-            .local()
-            .packs()
-            .map(|ps| {
-                ps.iter()
-                    .any(|p| h.local().pack_path(&p.checksum).is_symlink())
-            })
-            .unwrap_or(false);
-        if linked {
-            return walgit_bundle::BundleEngine::Gix { faulter: None };
-        }
-        walgit_bundle::BundleEngine::Git
-    }
-
-    async fn refs_as_of(
-        &self,
-        id: &walgit_git::RepoId,
-        at: std::time::SystemTime,
-    ) -> Result<Option<(walgit_git::RefSnapshotData, u64)>, walgit_bundle::BundleError> {
-        let h = self
-            .0
-            .open(id)
-            .await
-            .map_err(|e| walgit_bundle::BundleError::Other(e.to_string()))?;
-        let (snap, seq) = h
-            .refs_as_of(at)
-            .await
-            .map_err(|e| walgit_bundle::BundleError::Other(e.to_string()))?;
-        if seq == 0 {
-            return Ok(None); // nothing at that time (or predates replayable history)
-        }
-        Ok(Some((snap.into(), seq)))
-    }
-
-    async fn list_repos(&self) -> Result<Vec<walgit_git::RepoId>, walgit_bundle::BundleError> {
-        Ok(self
-            .0
-            .list()
-            .await
-            .map_err(|e| walgit_bundle::BundleError::Other(e.to_string()))?)
-    }
-}
-
 #[cfg(test)]
 mod listen_tests {
     #[tokio::test]
@@ -755,7 +657,7 @@ mod listen_tests {
             .await
             .unwrap();
         let port = m.local_addr().unwrap().port();
-        if !m.addrs().iter().any(|a| a.is_ipv6()) {
+        if !m.addrs().iter().any(std::net::SocketAddr::is_ipv6) {
             return; // no IPv6 on this host
         }
         tokio::net::TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, port))

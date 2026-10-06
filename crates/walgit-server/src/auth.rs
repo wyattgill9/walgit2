@@ -3,7 +3,7 @@
 //!
 //! * **`token`** — static tokens from the config, presented as `Authorization:
 //!   Bearer <token>` or as the password of HTTP Basic (any user name).
-//! * **`oidc`** — any OpenID Connect issuer. Three credentials are accepted:
+//! * **`oidc`** — any `OpenID` Connect issuer. Three credentials are accepted:
 //!   1. an **ID token** from the issuer in `Authorization: Bearer` (RS256/ES256,
 //!      signature against the issuer's JWKS, `iss`, `exp`, `aud` ∈ `audiences` ∪
 //!      {`oauth_client_id`}, `email_verified`), for CLIs that can mint one;
@@ -216,7 +216,7 @@ impl JwksSource for HttpOidcSource {
             .get(reqwest::header::CACHE_CONTROL)
             .and_then(|v| v.to_str().ok())
             .and_then(parse_max_age)
-            .unwrap_or(Duration::from_secs(300));
+            .unwrap_or(Duration::from_mins(5));
         let document: JwksDocument = response
             .error_for_status()
             .map_err(|e| format!("JWKS response failed: {e}"))?
@@ -894,24 +894,24 @@ fn edge_owns_authorization(headers: &HeaderMap) -> bool {
         })
 }
 
-/// The client's `Authorization` header value (edge-forwarded copy first).
+/// The client's `Authorization` header value: the header itself when walgit is hit
+/// directly, the edge-forwarded copy when an edge announced `client-authorization`.
 fn client_authorization(headers: &HeaderMap) -> Option<String> {
-    if let Some(v) = headers
+    // Nothing announced the capability, so `Authorization` is the client's own and a
+    // forwarded copy nobody vouched for is not read at all (D39 (2), §1.3).
+    if !edge_owns_authorization(headers) {
+        return headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+    }
+    // Behind the edge, a missing copy means the client sent no credential; the
+    // Authorization that is there is the hop's own.
+    headers
         .get(FORWARDED_AUTHORIZATION_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|v| !v.is_empty())
-    {
-        return Some(v.to_string());
-    }
-    // Behind the edge, a missing copy means the client sent no credential; the
-    // Authorization that is there is the hop's own.
-    if edge_owns_authorization(headers) {
-        return None;
-    }
-    headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
         .map(str::to_string)
 }
 
@@ -921,7 +921,7 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
 
 /// Value of cookie `name` from the `Cookie` header(s).
 pub fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
-    for h in headers.get_all(axum::http::header::COOKIE).iter() {
+    for h in &headers.get_all(axum::http::header::COOKIE) {
         let Ok(s) = h.to_str() else { continue };
         for part in s.split(';') {
             let part = part.trim();
@@ -1002,7 +1002,8 @@ mod tests {
 
     /// Behind the edge (`client-authorization` capability) `Authorization` is the hop's own
     /// credential: with no `X-Walgit-Authorization` there is no client bearer (so the session
-    /// cookie gets its turn). Without the capability, `Authorization` is the client's.
+    /// cookie gets its turn). Without the capability, `Authorization` is the client's and the
+    /// forwarded header is not read at all.
     #[test]
     fn edge_owned_authorization_is_not_the_client() {
         let mut h = HeaderMap::new();
@@ -1018,6 +1019,24 @@ mod tests {
             "Bearer client".parse().unwrap(),
         );
         assert_eq!(bearer_token(&h).as_deref(), Some("client"));
+
+        let mut direct = HeaderMap::new();
+        direct.insert(AUTHORIZATION, "Bearer a".parse().unwrap());
+        direct.insert(FORWARDED_AUTHORIZATION_HEADER, "Bearer b".parse().unwrap());
+        assert_eq!(
+            bearer_token(&direct).as_deref(),
+            Some("a"),
+            "hit directly, a forwarded copy no edge announced is ignored"
+        );
+        direct.insert(
+            crate::static_object::CAPABILITIES_HEADER,
+            "client-authorization".parse().unwrap(),
+        );
+        assert_eq!(
+            bearer_token(&direct).as_deref(),
+            Some("b"),
+            "the announced capability makes the forwarded copy the client's"
+        );
     }
 
     #[test]
@@ -1049,7 +1068,7 @@ mod tests {
     }
 
     // gitleaks:allow — fixed test fixture; never loaded outside this module's OIDC verifier tests.
-    const PRIVATE_KEY: &[u8] = br#"-----BEGIN PRIVATE KEY-----
+    const PRIVATE_KEY: &[u8] = br"-----BEGIN PRIVATE KEY-----
 MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDJETqse41HRBsc
 7cfcq3ak4oZWFCoZlcic525A3FfO4qW9BMtRO/iXiyCCHn8JhiL9y8j5JdVP2Q9Z
 IpfElcFd3/guS9w+5RqQGgCR+H56IVUyHZWtTJbKPcwWXQdNUX0rBFcsBzCRESJL
@@ -1077,13 +1096,14 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
 2pOhmquJQVDPDLuZHdrIiKiDM20dy9sMfHygWcZjQ4WSxf/J7T9canLZIXFhHAZT
 3wc9h4G8BBCtWN2TN/LsGZdB
 -----END PRIVATE KEY-----
-"#;
+";
     const MODULUS: &str = "yRE6rHuNR0QbHO3H3Kt2pOKGVhQqGZXInOduQNxXzuKlvQTLUTv4l4sggh5_CYYi_cvI-SXVT9kPWSKXxJXBXd_4LkvcPuUakBoAkfh-eiFVMh2VrUyWyj3MFl0HTVF9KwRXLAcwkREiS3npThHRyIxuy0ZMeZfxVL5arMhw1SRELB8HoGfG_AtH89BIE9jDBHZ9dLelK9a184zAf8LwoPLxvJb3Il5nncqPcSfKDDodMFBIMc4lQzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi-yUod-j8MtvIj812dkS4QMiRVN_by2h3ZY8LYVGrqZXZTcgn2ujn8uKjXLZVD5TdQ";
     const EXPONENT: &str = "AQAB";
 
     fn config() -> walgit_config::Config {
         let mut cfg = walgit_config::Config::default();
         cfg.server.auth.mode = AuthMode::Oidc;
+        cfg.server.auth.issuer = ISSUER.into();
         cfg.server.auth.allowed_domains = vec!["Example.com".into()];
         cfg.server.auth.audiences = vec![AUD.into()];
         cfg.server.auth.anonymous_read = false;
@@ -1131,7 +1151,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                     n: MODULUS.into(),
                     e: EXPONENT.into(),
                 }],
-                max_age: Duration::from_secs(3600),
+                max_age: Duration::from_hours(1),
             })),
         })
     }
@@ -1322,7 +1342,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
     async fn issued_access_tokens_are_bearers_and_basic_passwords_and_never_cookies() {
         let mut cfg = config();
         cfg.server.auth.session_secret = Some(SECRET.into());
-        cfg.server.auth.access_token_ttl = Duration::from_secs(3600);
+        cfg.server.auth.access_token_ttl = Duration::from_hours(1);
         let auth = Authenticator::with_key_source(&cfg, source());
         let tok = auth.access_token("dev@example.com").unwrap();
         assert!(tok.starts_with(ACCESS_TOKEN_PREFIX));
@@ -1431,7 +1451,7 @@ mod session_tests {
         assert!(unix_now().unwrap().abs_diff(iat) <= 2);
         assert_eq!(
             walgit_config::Config::default().server.auth.session_ttl,
-            Duration::from_secs(30 * 86400)
+            Duration::from_hours(720)
         );
     }
 

@@ -72,7 +72,7 @@ fn blocking_section<T>(f: impl FnOnce() -> T) -> T {
 }
 
 /// Write one section line, wrapped in a band-1 frame when the client asked
-/// for `sideband-all` (flush/delim stay raw, as in git's packet_writer).
+/// for `sideband-all` (flush/delim stay raw, as in git's `packet_writer`).
 fn line(buf: &mut Vec<u8>, data: &[u8], sideband_all: bool) {
     if sideband_all {
         let mut framed = Vec::with_capacity(data.len() + 1);
@@ -190,58 +190,6 @@ impl LocalRepo {
         Ok(stats)
     }
 
-    /// A git bundle (`# v2 git bundle` header with `refs` and `-<prereq>`
-    /// lines, then the pack) written with this engine: the pack is exactly
-    /// "objects reachable from `refs` minus `prerequisites`", enumerated by
-    /// tree diff, so incremental bundles of a repository whose base is
-    /// linked/remote-served never walk the base's trees (stock `git bundle
-    /// create` marks every tree of the boundary commits uninteresting = reads
-    /// them all). `refs` are `(name, oid)`; prerequisites are commit ids the
-    /// consumer must already have. Returns the pack's object count and bytes.
-    pub async fn write_bundle_gix<W: AsyncWrite + Unpin + Send>(
-        &self,
-        mut out: W,
-        refs: &[(String, gix_hash::ObjectId)],
-        prerequisites: &[gix_hash::ObjectId],
-        faulter: Option<&dyn ObjectFaulter>,
-    ) -> Result<UploadPackStats, GitError> {
-        let mut header = String::from("# v2 git bundle\n");
-        for p in prerequisites {
-            header.push_str(&format!("-{} \n", p.to_hex()));
-        }
-        for (name, oid) in refs {
-            header.push_str(&format!("{} {name}\n", oid.to_hex()));
-        }
-        header.push('\n');
-        out.write_all(header.as_bytes())
-            .await
-            .map_err(GitError::Io)?;
-        let req = UploadPackRequest {
-            wants: refs.iter().map(|(_, o)| *o).collect(),
-            haves: prerequisites.to_vec(),
-            done: true,
-            thin_pack: false,
-            no_progress: true,
-            include_tag: false,
-            ofs_delta: true,
-            sideband_all: false,
-            wait_for_done: false,
-            filter: None,
-            deepen: None,
-            deepen_since: None,
-            deepen_not: vec![],
-            shallow: vec![],
-            want_refs: vec![],
-            packfile_uris_protocols: vec![],
-        };
-        // Prerequisites are known by definition (the bundle's consumer has them).
-        let common: Vec<gix_hash::ObjectId> = prerequisites.to_vec();
-        let mut sink = PackOut::Raw(out);
-        let stats = self.produce_pack(&req, &common, faulter, &mut sink).await?;
-        sink.finish().await?;
-        Ok(stats)
-    }
-
     /// Enumerate (retrying after faults) and stream the pack into `sink`.
     async fn produce_pack<W: AsyncWrite + Unpin + Send>(
         &self,
@@ -271,7 +219,13 @@ impl LocalRepo {
                 let found = f.fault(&missing).await?;
                 if found < missing.len() {
                     return Err(GitError::MissingObject {
-                        oid: missing[0].to_hex().to_string(),
+                        oid: missing
+                            .first()
+                            .ok_or_else(|| {
+                                GitError::InvalidInput("empty missing-object set".into())
+                            })?
+                            .to_hex()
+                            .to_string(),
                     });
                 }
                 self.refresh_async().await?;
@@ -279,11 +233,7 @@ impl LocalRepo {
         }
 
         // ---- enumerate (sync, retried after faulting missing objects) ----
-        let filter = req
-            .filter
-            .as_deref()
-            .map(parse_filter)
-            .unwrap_or(PackFilter::None);
+        let filter = req.filter.as_deref().map_or(PackFilter::None, parse_filter);
         let has_filter = req.filter.is_some();
         let mut rounds = 0usize;
         let (set, commits, diffed) = loop {
@@ -291,7 +241,7 @@ impl LocalRepo {
             // seconds on big ranges: never on an async worker (D19).
             let attempt = blocking_section(|| {
                 let repo = self.gix();
-                enumerate(&repo, &req, &common_haves, &filter, faulter)
+                enumerate(&repo, req, common_haves, &filter, faulter)
             })?;
             match attempt {
                 Enumerated::Done {
@@ -303,7 +253,13 @@ impl LocalRepo {
                     rounds += 1;
                     let Some(f) = faulter else {
                         return Err(GitError::MissingObject {
-                            oid: missing[0].to_hex().to_string(),
+                            oid: missing
+                                .first()
+                                .ok_or_else(|| {
+                                    GitError::InvalidInput("empty missing-object set".into())
+                                })?
+                                .to_hex()
+                                .to_string(),
                         });
                     };
                     if rounds > MAX_FAULT_ROUNDS {
@@ -320,7 +276,13 @@ impl LocalRepo {
                     let found = f.fault(&missing).await?;
                     if found == 0 {
                         return Err(GitError::MissingObject {
-                            oid: missing[0].to_hex().to_string(),
+                            oid: missing
+                                .first()
+                                .ok_or_else(|| {
+                                    GitError::InvalidInput("empty missing-object set".into())
+                                })?
+                                .to_hex()
+                                .to_string(),
                         });
                     }
                     self.refresh_async().await?;
@@ -354,7 +316,13 @@ impl LocalRepo {
             if !missing.is_empty() {
                 let Some(f) = faulter else {
                     return Err(GitError::MissingObject {
-                        oid: missing[0].to_hex().to_string(),
+                        oid: missing
+                            .first()
+                            .ok_or_else(|| {
+                                GitError::InvalidInput("empty missing-object set".into())
+                            })?
+                            .to_hex()
+                            .to_string(),
                     });
                 };
                 sink.progress(&format!(
@@ -365,7 +333,13 @@ impl LocalRepo {
                 let found = f.fault(&missing).await?;
                 if found < missing.len() {
                     return Err(GitError::MissingObject {
-                        oid: missing[0].to_hex().to_string(),
+                        oid: missing
+                            .first()
+                            .ok_or_else(|| {
+                                GitError::InvalidInput("empty missing-object set".into())
+                            })?
+                            .to_hex()
+                            .to_string(),
                     });
                 }
                 self.refresh_async().await?;
@@ -419,8 +393,8 @@ impl LocalRepo {
             .await
             .map_err(|e| GitError::Protocol(format!("pack generator panicked: {e}")))??;
         tracing::debug!(
-            enumerate_ms = t_enum.as_millis() as u64,
-            total_ms = t_start.elapsed().as_millis() as u64,
+            enumerate_ms = u64::try_from(t_enum.as_millis()).unwrap_or(u64::MAX),
+            total_ms = u64::try_from(t_start.elapsed().as_millis()).unwrap_or(u64::MAX),
             objects = num_objects,
             bytes,
             rounds,
@@ -429,7 +403,7 @@ impl LocalRepo {
         sink.progress(&format!("Total {num_objects} objects, {bytes} bytes\n"))
             .await;
         Ok(UploadPackStats {
-            objects: num_objects as u64,
+            objects: u64::from(num_objects),
             bytes,
         })
     }
@@ -443,7 +417,6 @@ enum PackOut<W: AsyncWrite + Unpin + Send> {
         sb_all: bool,
         progress: bool,
     },
-    Raw(W),
 }
 
 impl<W: AsyncWrite + Unpin + Send> PackOut<W> {
@@ -455,13 +428,11 @@ impl<W: AsyncWrite + Unpin + Send> PackOut<W> {
                 let _ = sb.write_progress(text.as_bytes()).await;
             }
             PackOut::Sideband { .. } => {}
-            PackOut::Raw(_) => {
-                tracing::debug!(target: "walgit_git::upload_gix", "{}", text.trim_end())
-            }
         }
     }
     async fn begin_pack(&mut self) -> Result<(), GitError> {
-        if let PackOut::Sideband { sb, sb_all, .. } = self {
+        let PackOut::Sideband { sb, sb_all, .. } = self;
+        {
             let mut pf = Vec::with_capacity(16);
             line(&mut pf, b"packfile\n", *sb_all);
             sb.inner_mut().write_all(&pf).await.map_err(GitError::Io)?;
@@ -471,13 +442,11 @@ impl<W: AsyncWrite + Unpin + Send> PackOut<W> {
     async fn data(&mut self, chunk: &[u8]) -> Result<(), GitError> {
         match self {
             PackOut::Sideband { sb, .. } => sb.write_data(chunk).await,
-            PackOut::Raw(w) => w.write_all(chunk).await.map_err(GitError::Io),
         }
     }
     async fn finish(&mut self) -> Result<(), GitError> {
         match self {
             PackOut::Sideband { sb, .. } => sb.flush().await,
-            PackOut::Raw(w) => w.flush().await.map_err(GitError::Io),
         }
     }
 }
@@ -494,7 +463,7 @@ struct ChanWriter {
 impl ChanWriter {
     fn flush_all(&mut self) -> Result<(), GitError> {
         if !self.buf.is_empty() {
-            let chunk = std::mem::replace(&mut self.buf, Vec::new());
+            let chunk = std::mem::take(&mut self.buf);
             self.tx.blocking_send(chunk).map_err(|_| {
                 GitError::Io(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
@@ -568,7 +537,9 @@ fn generate_pack_streaming(
     let thread_limit = if small {
         Some(1)
     } else {
-        std::thread::available_parallelism().map(|n| n.get()).ok()
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .ok()
     };
     let chunk_size = if small { 64 } else { 256 };
     let interrupt = std::sync::atomic::AtomicBool::new(false);
@@ -587,12 +558,13 @@ fn generate_pack_streaming(
     if counts.is_empty() {
         let header = gix_pack::data::header::encode(PackVersion::V2, 0);
         let mut buf = header.to_vec();
-        let trailer = crate::compute_pack_trailer(&buf, object_hash);
+        let trailer = crate::compute_pack_trailer(&buf, object_hash)?;
         buf.extend_from_slice(trailer.as_slice());
         out.write_all(&buf).map_err(GitError::Io)?;
         return Ok(0);
     }
-    let num_entries = counts.len() as u32;
+    let num_entries = u32::try_from(counts.len())
+        .map_err(|_| GitError::InvalidInput("pack exceeds u32 object count".into()))?;
     let progress: Box<dyn gix_features::progress::DynNestedProgress + 'static> =
         Box::new(gix_features::progress::Discard);
     let entries = entry::iter_from_counts(
@@ -609,14 +581,14 @@ fn generate_pack_streaming(
         },
     );
     let entries_in_order = gix_features::parallel::InOrderIter::from(entries);
-    let mut pack_iter = FromEntriesIter::new(
+    let pack_iter = FromEntriesIter::new(
         entries_in_order,
         out,
         num_entries,
         PackVersion::V2,
         object_hash,
     );
-    while let Some(result) = pack_iter.next() {
+    for result in pack_iter {
         result.map_err(ge)?;
     }
     Ok(num_entries)
@@ -793,19 +765,16 @@ fn enumerate(
             let mut parent_trees: Vec<Old> = Vec::with_capacity(parent_ids.len());
             let mut deferred = false;
             for p in &parent_ids {
-                match repo.objects.try_find(p, &mut buf).map_err(GitError::Gix)? {
-                    Some(obj) => {
-                        match gix_object::CommitRefIter::from_bytes(obj.data, kind).tree_id() {
-                            Ok(t) => parent_trees.push(Old::Tree(t)),
-                            Err(e) => return Err(ge(e)),
-                        }
+                if let Some(obj) = repo.objects.try_find(p, &mut buf).map_err(GitError::Gix)? {
+                    match gix_object::CommitRefIter::from_bytes(obj.data, kind).tree_id() {
+                        Ok(t) => parent_trees.push(Old::Tree(t)),
+                        Err(e) => return Err(ge(e)),
                     }
-                    None => {
-                        // Parent commit not local (base): fault it, diff this
-                        // commit on the retry.
-                        missing.push(*p);
-                        deferred = true;
-                    }
+                } else {
+                    // Parent commit not local (base): fault it, diff this
+                    // commit on the retry.
+                    missing.push(*p);
+                    deferred = true;
                 }
             }
             if deferred {
@@ -835,24 +804,22 @@ fn enumerate(
     }
 
     // include-tag: annotated tags whose target is in the set.
-    if req.include_tag {
-        if let Ok(snap) = crate::read_refs(repo.path()) {
-            for r in &snap.refs {
-                let Ok(tag_oid) = gix_hash::ObjectId::from_hex(r.oid.as_bytes()) else {
-                    continue;
-                };
-                if set.contains(&tag_oid) {
-                    continue;
-                }
-                if let Ok(Some(obj)) = repo.objects.try_find(&tag_oid, &mut buf) {
-                    if obj.kind == ObjKind::Tag {
-                        if let Ok(tag) = gix_object::TagRef::from_bytes(obj.data, kind) {
-                            if set.contains(&tag.target()) {
-                                set.insert(tag_oid);
-                            }
-                        }
-                    }
-                }
+    if req.include_tag
+        && let Ok(snap) = crate::read_refs(repo.path())
+    {
+        for r in &snap.refs {
+            let Ok(tag_oid) = gix_hash::ObjectId::from_hex(r.oid.as_bytes()) else {
+                continue;
+            };
+            if set.contains(&tag_oid) {
+                continue;
+            }
+            if let Ok(Some(obj)) = repo.objects.try_find(&tag_oid, &mut buf)
+                && obj.kind == ObjKind::Tag
+                && let Ok(tag) = gix_object::TagRef::from_bytes(obj.data, kind)
+                && set.contains(&tag.target())
+            {
+                set.insert(tag_oid);
             }
         }
     }
@@ -923,15 +890,14 @@ fn diff_tree_new_objects(
     for o in olds {
         match o {
             Old::Absent => old_maps.push(HashMap::new()),
-            Old::Tree(oid) => match tree_entries(repo, oid, buf)? {
-                Some(entries) => {
-                    old_maps.push(entries.into_iter().map(|(m, n, o)| (n, (m, o))).collect())
-                }
-                None => {
+            Old::Tree(oid) => {
+                if let Some(entries) = tree_entries(repo, oid, buf)? {
+                    old_maps.push(entries.into_iter().map(|(m, n, o)| (n, (m, o))).collect());
+                } else {
                     missing.push(*oid);
                     deferred = true;
                 }
-            },
+            }
         }
     }
     if deferred {
@@ -953,11 +919,11 @@ fn diff_tree_new_objects(
             continue;
         }
         if mode.is_tree() {
-            if let PackFilter::Tree(max) = filter {
-                if depth + 1 > *max {
-                    set.insert(oid);
-                    continue;
-                }
+            if let PackFilter::Tree(max) = filter
+                && depth + 1 > *max
+            {
+                set.insert(oid);
+                continue;
             }
             if set.insert(oid) {
                 let sub_olds: Vec<Old> = old_maps
@@ -973,10 +939,10 @@ fn diff_tree_new_objects(
             match filter {
                 PackFilter::BlobNone => continue,
                 PackFilter::BlobLimit(limit) => {
-                    if let Ok(Some(h)) = repo.objects.try_header(&oid) {
-                        if h.size > *limit {
-                            continue;
-                        }
+                    if let Ok(Some(h)) = repo.objects.try_header(&oid)
+                        && h.size > *limit
+                    {
+                        continue;
                     }
                 }
                 _ => {}
@@ -1022,8 +988,12 @@ mod frozen_source_tests {
         // Two packs with distinct content, newest first in gix's load order.
         let mut blobs = Vec::new();
         for (i, words) in ["one pack", "two pack"].iter().enumerate() {
+            use std::io::Write;
+
             let content = format!("{words} {}\n", "x".repeat(300 + i * 50));
             let oid = {
+                use std::io::Write;
+
                 let mut c = std::process::Command::new("git")
                     .arg("-C")
                     .arg(dir)
@@ -1032,7 +1002,7 @@ mod frozen_source_tests {
                     .stdout(std::process::Stdio::piped())
                     .spawn()
                     .unwrap();
-                use std::io::Write;
+
                 c.stdin
                     .take()
                     .unwrap()
@@ -1052,7 +1022,7 @@ mod frozen_source_tests {
                 .stdout(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
-            use std::io::Write;
+
             c.stdin
                 .take()
                 .unwrap()
@@ -1111,8 +1081,12 @@ mod frozen_source_tests {
         // slot (same path). Keep adding packs until that happens.
         let mut shifted = false;
         for i in 0..24 {
+            use std::io::Write;
+
             let content = format!("later pack {i} {}\n", "y".repeat(200 + i));
             let oid = {
+                use std::io::Write;
+
                 let mut c = std::process::Command::new("git")
                     .arg("-C")
                     .arg(dir)
@@ -1121,7 +1095,7 @@ mod frozen_source_tests {
                     .stdout(std::process::Stdio::piped())
                     .spawn()
                     .unwrap();
-                use std::io::Write;
+
                 c.stdin
                     .take()
                     .unwrap()
@@ -1140,7 +1114,7 @@ mod frozen_source_tests {
                 .stdout(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
-            use std::io::Write;
+
             c.stdin
                 .take()
                 .unwrap()

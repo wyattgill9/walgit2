@@ -1,10 +1,30 @@
-//! `walgit` (full CLI: serve | compact | bundle | repo | wal | synth | import | mirror | config)
+//! `walgit` (full CLI: serve | compact | repo | wal | synth | import | mirror | config)
 //! and `walgit-server` (`walgit serve` under the name a standalone deployment expects, D39),
 //! both thin bins over this library.
 //!
 //! The only flag is the global `--config PATH` (D8); no subcommand = `serve`. Every command loads
 //! `walgit.toml`, applies `WALGIT__` env overrides, and initialises tracing
 //! from `[telemetry]` before dispatching.
+#![allow(
+    clippy::case_sensitive_file_extension_comparisons,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::doc_lazy_continuation,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names,
+    clippy::needless_continue,
+    clippy::needless_pass_by_value,
+    clippy::redundant_locals,
+    clippy::string_slice,
+    clippy::unnecessary_sort_by,
+    clippy::unused_async,
+    clippy::unwrap_used,
+    clippy::unreadable_literal
+)]
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -14,7 +34,6 @@ mod config_cmd;
 mod settings_cmd;
 mod synth;
 
-mod bundle_cmd;
 mod compact;
 mod import;
 mod import_direct;
@@ -68,7 +87,7 @@ struct ServerCli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the HTTP server (smart HTTP v0/v2, LFS, bundles, optional compaction/bundle loops).
+    /// Run the HTTP server (smart HTTP v0/v2, LFS, optional maintenance loops).
     Serve,
     /// Trigger compaction (geometric repack) for one repo or all.
     Compact {
@@ -81,15 +100,9 @@ enum Command {
         once: bool,
         /// Rebuild the tier-2 base: full `git repack -adb` + bitmap + commit-graph
         /// layer, published as a COMPACT entry, then a checkpoint at that seq.
-        /// Needs the whole pack set on local disk (the weekly VM job), never
-        /// a serverless host. Follow with `walgit bundle compose`.
+        /// Needs the whole pack set on local disk, never a serverless host.
         #[arg(long)]
         base: bool,
-    },
-    /// Build and publish bundles.
-    Bundle {
-        #[command(subcommand)]
-        action: BundleAction,
     },
     /// Repository management.
     Repo {
@@ -140,12 +153,6 @@ enum Command {
         /// Directory with the pack set to publish (--direct). Default: the source's objects/pack.
         #[arg(long)]
         packs: Option<PathBuf>,
-        /// (--direct) Also publish a bundle-uri full bundle = header ∘ pack (zero extra upload on GCS).
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-        bundle: bool,
-        /// (--direct) Bundle strategy name (default: first full strategy in config, else "import").
-        #[arg(long)]
-        bundle_strategy: Option<String>,
         /// (--direct) Supersede an existing non-empty repository.
         #[arg(long)]
         replace: bool,
@@ -200,7 +207,7 @@ enum Command {
         /// How often to fold the buffer's small packs (`git repack --geometric=2 --write-midx`).
         #[arg(long, default_value = "1h", value_parser = humantime::parse_duration)]
         repack_every: std::time::Duration,
-        /// Where the destination's bearer token comes from: `token` ($WALGIT_TOKEN), `gcloud` (a Google
+        /// Where the destination's bearer token comes from: `token` ($`WALGIT_TOKEN`), `gcloud` (a Google
         /// ID token for you) or `gce` (this VM's service account via the metadata server).
         #[arg(long, value_enum, default_value_t = mirror::Identity::Token)]
         identity: mirror::Identity,
@@ -209,47 +216,6 @@ enum Command {
     Config {
         #[command(subcommand)]
         action: ConfigAction,
-    },
-}
-
-#[derive(Subcommand)]
-enum BundleAction {
-    /// Build due bundles now.
-    Run {
-        /// Restrict to one repo.
-        #[arg(long)]
-        repo: Option<String>,
-        /// Restrict to one strategy name.
-        #[arg(long)]
-        strategy: Option<String>,
-    },
-    /// Print the slot table of a repository: built / missing / unavailable / wrong-host
-    /// per strategy and slot, which host maintains it and whether that host is alive.
-    Plan {
-        /// `owner/name`.
-        repo: String,
-    },
-    /// Publish a full bundle = header ∘ tier-2 base pack via server-side compose
-    /// (no disk, no bytes through this machine). The header carries the refs at
-    /// the base's WAL seq (the checkpoint there), so the bundle is exact. Run
-    /// right after `walgit compact --base` (the weekly VM job).
-    Compose {
-        /// `owner/name`.
-        repo: String,
-        /// Strategy name (default: the first `kind = "full"` strategy).
-        #[arg(long)]
-        strategy: Option<String>,
-    },
-    /// Remove bundles from the list (CAS) and delete their objects: for entries
-    /// whose content is wrong (2026-08-21: slots cut from "now" under old tokens).
-    /// The plan then shows the slots as missing/unavailable again and the
-    /// maintainer rebuilds what is buildable (D22).
-    Rm {
-        /// `owner/name`.
-        repo: String,
-        /// Bundle ids (`<strategy>-<token>`), as shown by `bundle plan`.
-        #[arg(required = true)]
-        ids: Vec<String>,
     },
 }
 
@@ -275,8 +241,7 @@ enum RepoAction {
         #[command(subcommand)]
         action: PolicyAction,
     },
-    /// Per-repo settings in the WAL (D24): TOML overrides of [bundles],
-    /// [maintenance], [compaction] on top of the host config.
+    /// Per-repo settings in the WAL (D24): TOML overrides of [maintenance], [compaction] on top of the host config.
     Settings {
         #[command(subcommand)]
         action: SettingsAction,
@@ -504,7 +469,6 @@ async fn dispatch(command: Command, cfg: Config) -> Result<()> {
             once,
             base,
         } => compact::run(repo, all, once, base, &cfg).await,
-        Command::Bundle { action } => bundle_cmd::run(action, &cfg).await,
         Command::Repo { action } => repo::run(action, &cfg).await,
         Command::Wal { action } => wal_cmd::run(action, &cfg).await,
         Command::Mirror {
@@ -537,8 +501,6 @@ async fn dispatch(command: Command, cfg: Config) -> Result<()> {
             reuse_packs,
             direct,
             packs,
-            bundle,
-            bundle_strategy,
             replace,
             force,
             parallelism,
@@ -553,8 +515,6 @@ async fn dispatch(command: Command, cfg: Config) -> Result<()> {
                         from,
                         repo,
                         packs,
-                        bundle,
-                        bundle_strategy,
                         replace,
                         parallelism,
                         commit_graph,

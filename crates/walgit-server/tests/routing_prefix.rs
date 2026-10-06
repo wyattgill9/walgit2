@@ -1,3 +1,10 @@
+#![allow(
+    clippy::case_sensitive_file_extension_comparisons,
+    clippy::unnecessary_wraps
+)]
+// Test fixtures use panics to fail the test, including shared helper functions.
+#![allow(clippy::panic, clippy::string_slice)]
+
 //! D26/D27 + no-compat banner: **repo prefix first, lane segment second**.
 //! Source-level (grep), not HTTP.
 //!
@@ -108,7 +115,7 @@ fn forbidden_client_hits(src: &str, rel: &str) -> Vec<String> {
     let mut hits = Vec::new();
     for (i, line) in src.lines().enumerate() {
         let t = line.trim();
-        if t.starts_with("//") || t.starts_with("*") || t.starts_with("/*") {
+        if t.starts_with("//") || t.starts_with('*') || t.starts_with("/*") {
             continue;
         }
         // Documentation of the alias in comments is fine; code that builds a URL is not.
@@ -159,8 +166,6 @@ fn clients_emit_prefix_form() -> TestResult {
 }
 
 fn walk_ts(dir: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let base = root().join(dir);
     fn rec(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
         let Ok(rd) = fs::read_dir(dir) else { return };
         for e in rd.flatten() {
@@ -181,6 +186,10 @@ fn walk_ts(dir: &str) -> Vec<(String, String)> {
             }
         }
     }
+
+    let mut out = Vec::new();
+    let base = root().join(dir);
+
     rec(&base, &root(), &mut out);
     out
 }
@@ -201,7 +210,7 @@ fn repo_prefix_location_regex_semantics() {
         "/acme/monorepo.git/info/refs",
         "/acme/monorepo/api/refs",
         "/acme/monorepo/api-browser/refs",
-        "/acme/monorepo/bundles/weekly/x",
+        "/acme/monorepo/info/lfs/objects/abc",
         "/acme/monorepo/info/lfs/objects/aa",
         "/acme/monorepo/settings",
         "/acme/monorepo/tree/main",

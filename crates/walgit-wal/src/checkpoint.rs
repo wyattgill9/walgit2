@@ -1,11 +1,12 @@
 //! Checkpoint writing and store GC.
+#![allow(clippy::needless_continue)]
 
 use std::sync::Arc;
 
 use prost::Message;
 use walgit_proto::keys;
 use walgit_proto::time;
-use walgit_proto::v1::{Checkpoint, CheckpointRef, Manifest, RefSnapshot};
+use walgit_proto::v1::{Checkpoint, CheckpointRef, Manifest};
 use walgit_store::{ObjectStore, PutBody, PutMode, PutOptions, StoreError};
 
 use crate::error::WalError;
@@ -43,7 +44,7 @@ pub fn checkpoint_due(
     if head == 0 {
         return None;
     }
-    let cp_seq = manifest.checkpoint.as_ref().map(|c| c.seq).unwrap_or(0);
+    let cp_seq = manifest.checkpoint.as_ref().map_or(0, |c| c.seq);
     if cp_seq >= head {
         return None;
     }
@@ -73,43 +74,38 @@ pub fn checkpoint_due(
             Some(c) => c.created_at.as_ref().map(time::to_system),
             None => manifest.updated_at.as_ref().map(time::to_system),
         };
-        if let Some(t) = since {
-            if std::time::SystemTime::now()
+        if let Some(t) = since
+            && std::time::SystemTime::now()
                 .duration_since(t)
                 .unwrap_or_default()
                 >= cfg.checkpoint_interval
-            {
-                return Some(CheckpointTrigger::Age);
-            }
+        {
+            return Some(CheckpointTrigger::Age);
         }
     }
     None
 }
 
 /// Write a checkpoint at the current head: refs snapshot + pack set, then
-/// CAS manifest (checkpoint=, min_seq=, log_segments trimmed). Idempotent.
+/// CAS manifest (checkpoint=, `min_seq`=, `log_segments` trimmed). Idempotent.
 /// Needs only a **refs-level** sync (manifest + ref state): it works on an
 /// instance that could never hold the repo's packs.
 pub(crate) async fn write_checkpoint_impl(handle: &RepoHandle) -> Result<CheckpointRef, WalError> {
     let trigger = checkpoint_due(&handle.manifest(), &handle.cfg.wal)
-        .map(|t| t.to_string())
-        .unwrap_or_else(|| "manual".into());
+        .map_or_else(|| "manual".into(), |t| t.to_string());
     let span = tracing::info_span!("wal.checkpoint", repo = %handle.id, trigger = %trigger, seq = tracing::field::Empty, refs = tracing::field::Empty, folded = tracing::field::Empty, outcome = tracing::field::Empty);
     let t0 = std::time::Instant::now();
     let r = write_checkpoint_inner(handle)
         .instrument(span.clone())
         .await;
-    match &r {
-        Ok(cp) => {
-            span.record("seq", cp.seq);
-            span.record("outcome", "ok");
-            metrics::histogram!("walgit_checkpoint_seconds").record(t0.elapsed().as_secs_f64());
-            metrics::counter!("walgit_checkpoints_total", "outcome" => "ok").increment(1);
-        }
-        Err(_) => {
-            span.record("outcome", "error");
-            metrics::counter!("walgit_checkpoints_total", "outcome" => "error").increment(1);
-        }
+    if let Ok(cp) = &r {
+        span.record("seq", cp.seq);
+        span.record("outcome", "ok");
+        metrics::histogram!("walgit_checkpoint_seconds").record(t0.elapsed().as_secs_f64());
+        metrics::counter!("walgit_checkpoints_total", "outcome" => "ok").increment(1);
+    } else {
+        span.record("outcome", "error");
+        metrics::counter!("walgit_checkpoints_total", "outcome" => "error").increment(1);
     }
     r
 }
@@ -119,21 +115,21 @@ async fn write_checkpoint_inner(handle: &RepoHandle) -> Result<CheckpointRef, Wa
     let max_retries = handle.cfg.wal.cas_max_retries;
 
     // Sync to get current state (refs only; packs are taken from the manifest).
-    handle.sync_impl_level(crate::sync::SyncLevel::Refs).await?;
-    let manifest = handle.manifest.read().clone();
+    let view = handle.publication_view().await?;
+    let manifest = &view.manifest;
 
     // If checkpoint already at head, return it (idempotent)
-    if let Some(ref cp) = manifest.checkpoint {
-        if cp.seq == manifest.head_seq {
-            tracing::Span::current().record("folded", 0u64);
-            return Ok(cp.clone());
-        }
+    if let Some(ref cp) = manifest.checkpoint
+        && cp.seq == manifest.head_seq
+    {
+        tracing::Span::current().record("folded", 0u64);
+        return Ok(cp.clone());
     }
 
     let seq = manifest.head_seq;
     tracing::Span::current().record(
         "folded",
-        seq - manifest.checkpoint.as_ref().map(|c| c.seq).unwrap_or(0),
+        seq - manifest.checkpoint.as_ref().map_or(0, |c| c.seq),
     );
     if seq == 0 {
         return Err(WalError::Corrupt(
@@ -142,10 +138,10 @@ async fn write_checkpoint_inner(handle: &RepoHandle) -> Result<CheckpointRef, Wa
     }
 
     // Build refs snapshot from local repo
-    let refs_data = handle.local.refs()?;
-    let snap: RefSnapshot = refs_data.into();
-    let refs_key = keys::checkpoint_refs_key(seq);
-    let snap_bytes = snap.encode_to_vec();
+    let snap = &view.refs;
+    let snap_bytes =
+        walgit_proto::snapshot::encode(snap).map_err(|e| WalError::Corrupt(e.to_string()))?;
+    let refs_key = walgit_proto::snapshot::key(&snap_bytes);
 
     // Provenance for the slot planner (D22): the earliest state ever (carried forward) and the
     // time of the newest folded entry — from what this writer already applied (`first_entry_time`
@@ -155,20 +151,20 @@ async fn write_checkpoint_inner(handle: &RepoHandle) -> Result<CheckpointRef, Wa
     let prev = manifest.checkpoint.as_ref();
     let created_at = time::now();
     let first_state_at = prev
-        .and_then(|c| c.first_state_at.clone())
+        .and_then(|c| c.first_state_at)
         .or_else(|| handle.first_entry_time.lock().map(time::from_system))
         .or_else(|| handle.first_seq_published_at.lock().map(time::from_system))
-        .or_else(|| prev.and_then(|c| c.created_at.clone()));
+        .or_else(|| prev.and_then(|c| c.created_at));
     let as_of = handle
         .last_entry_time
         .lock()
         .map(time::from_system)
-        .or_else(|| prev.and_then(|c| c.as_of.clone()))
+        .or_else(|| prev.and_then(|c| c.as_of))
         .or(Some(created_at));
 
     // The checkpoint: the pack set with its side-file inventory (idx/rev/bitmap/commit-graph
     // flags travel in PackRef) + the ref snapshot. `bundle_key` is left empty: nothing reads it
-    // (`import --direct` still fills it), and looking the list up cost a round trip.
+    // and no bundle object is consulted.
     let checkpoint = Checkpoint {
         seq,
         object_format: manifest.object_format.clone(),
@@ -180,24 +176,20 @@ async fn write_checkpoint_inner(handle: &RepoHandle) -> Result<CheckpointRef, Wa
         },
         bundle_key: String::new(),
         created_at: Some(created_at),
-        writer: writer.to_string(),
+        writer: writer.clone(),
     };
-    let cp_key = keys::checkpoint_key(seq);
+    let cp_key = keys::checkpoint_attempt_key(seq, &uuid::Uuid::new_v4().to_string());
     let cp_bytes = checkpoint.encode_to_vec();
 
-    // Round 1: both immutable objects in parallel. Keyed by seq and deterministic for a given
-    // state, so a writer that dies here leaves garbage, never a hazard (sim
+    // Round 1: both immutable objects in parallel. Content-addressed refs and attempt-unique metadata, so a writer that dies here leaves garbage, never a hazard (sim
     // `sim_checkpoint_writer_crash_is_invisible_and_repaired`).
     let immutable = PutOptions {
+        mode: PutMode::Create,
         immutable: true,
         ..Default::default()
     };
     let (r_refs, r_cp) = tokio::join!(
-        handle.store.put(
-            &refs_key,
-            PutBody::Bytes(bytes::Bytes::from(snap_bytes)),
-            immutable.clone()
-        ),
+        crate::snapshots::put_snapshot(&handle.store, &refs_key, snap_bytes),
         handle.store.put(
             &cp_key,
             PutBody::Bytes(bytes::Bytes::from(cp_bytes)),
@@ -213,19 +205,19 @@ async fn write_checkpoint_inner(handle: &RepoHandle) -> Result<CheckpointRef, Wa
         created_at: Some(created_at),
         first_state_at,
         as_of,
+        refs_key,
     };
 
     // Round 2: CAS manifest: set checkpoint, min_seq = seq+1, trim log_segments
     let mut attempts = 0u32;
     loop {
-        let current_manifest = handle.manifest.read().clone();
-        let known_version = handle.manifest_version.lock().clone();
+        let (current_manifest, known_version) = handle.manifest_pair();
 
         // If checkpoint already at or past head, done
-        if let Some(ref cp) = current_manifest.checkpoint {
-            if cp.seq >= current_manifest.head_seq {
-                return Ok(cp.clone());
-            }
+        if let Some(ref cp) = current_manifest.checkpoint
+            && cp.seq >= seq
+        {
+            return Ok(cp.clone());
         }
 
         let mut updated: Manifest = (*current_manifest).clone();
@@ -234,7 +226,7 @@ async fn write_checkpoint_inner(handle: &RepoHandle) -> Result<CheckpointRef, Wa
         // Trim log_segments: keep only those with last_seq > seq
         updated.log_segments.retain(|s| s.last_seq > seq);
         updated.updated_at = Some(time::now());
-        updated.writer = writer.to_string();
+        updated.writer = writer.clone();
         updated.revision += 1;
 
         let buf = updated.encode_to_vec();
@@ -253,8 +245,10 @@ async fn write_checkpoint_inner(handle: &RepoHandle) -> Result<CheckpointRef, Wa
             .await
         {
             Ok(meta) => {
-                *handle.manifest.write() = Arc::new(updated.clone());
-                *handle.manifest_version.lock() = Some(meta.version.clone());
+                let _sync = handle.sync_mutex.lock().await;
+                if !handle.adopt_manifest(Arc::new(updated.clone()), meta.version.clone()) {
+                    return Ok(cp_ref);
+                }
                 {
                     let mut state = handle.state.lock();
                     state.manifest_version = Some(meta.version.as_str().to_string());

@@ -1,4 +1,4 @@
-//! sync() implementation: freshness check, catch-up, materialization.
+//! `sync()` implementation: freshness check, catch-up, materialization.
 
 use std::sync::Arc;
 
@@ -7,17 +7,17 @@ use crate::store_proto::{get_message, get_message_if_changed};
 use tracing::Instrument;
 use walgit_git::LocalRepo;
 use walgit_proto::keys;
-use walgit_proto::v1::{EntryKind, LogEntry, Manifest, PackRef, RefSnapshot};
+use walgit_proto::v1::{EntryKind, LogEntry, Manifest, PackRef};
 use walgit_store::{GetOptions, GetResult, ObjectStore, Prefixed, Version};
 
 /// A read guard held for the lifetime of a request. While any guard is alive
-/// no pack is removed locally (the inner RwLock read guard prevents it).
+/// no pack is removed locally (the inner `RwLock` read guard prevents it).
 pub struct ReadGuard<'a> {
     pub(crate) _guard: tokio::sync::RwLockReadGuard<'a, ()>,
     pub(crate) handle: &'a super::handle::RepoHandle,
 }
 
-impl<'a> ReadGuard<'a> {
+impl ReadGuard<'_> {
     pub fn manifest(&self) -> Arc<Manifest> {
         self.handle.manifest.read().clone()
     }
@@ -82,31 +82,35 @@ pub(crate) enum SyncOutcome {
     Unchanged,
     Changed {
         meta_version: Version,
-        manifest: Manifest,
+        manifest: std::sync::Arc<Manifest>,
     },
 }
 
 /// Perform a conditional GET on manifest.pb and return the outcome.
 pub(crate) async fn freshness_check(
     store: &Prefixed,
-    known: &Option<Version>,
+    known: Option<&Version>,
 ) -> Result<SyncOutcome, WalError> {
-    match known {
+    let outcome = match known {
         Some(v) => match get_message_if_changed::<Manifest>(store, keys::MANIFEST, v).await? {
             None => Ok(SyncOutcome::Unchanged),
             Some((meta, manifest)) => Ok(SyncOutcome::Changed {
                 meta_version: meta.version,
-                manifest,
+                manifest: std::sync::Arc::new(manifest),
             }),
         },
         None => match get_message::<Manifest>(store, keys::MANIFEST).await? {
             None => Err(WalError::NotFound),
             Some((meta, manifest)) => Ok(SyncOutcome::Changed {
                 meta_version: meta.version,
-                manifest,
+                manifest: std::sync::Arc::new(manifest),
             }),
         },
+    }?;
+    if let SyncOutcome::Changed { manifest, .. } = &outcome {
+        crate::validate_manifest(manifest)?;
     }
+    Ok(outcome)
 }
 
 /// Download a pack+idx from the store and install it into the local repo.
@@ -204,7 +208,7 @@ pub(crate) async fn download_and_install_pack(
         .install_pack(&pack_path, &idx_path, &extra)
         .instrument(span.clone())
         .await?;
-    if pack.kind == walgit_proto::v1::PackKind::History as i32 {
+    if pack.kind == walgit_proto::v1::PackKind::History as i32 && pack.pack_groups.is_empty() {
         local.mark_history_pack(&oid, &pack.derived_from).await?;
         tracing::info!(checksum = %checksum, base = %pack.derived_from, bytes = pack.pack_size, "history pack installed (commits + trees local)");
     }
@@ -228,6 +232,7 @@ pub(crate) async fn link_and_install_pack(
     pack: &PackRef,
     tmp_dir: &std::path::Path,
     target: &std::path::Path,
+    reporter: &crate::progress::Reporter,
 ) -> Result<(), WalError> {
     let checksum = &pack.checksum;
     let oid = gix_hash::ObjectId::from_hex(checksum.as_bytes())
@@ -240,7 +245,6 @@ pub(crate) async fn link_and_install_pack(
     let idx_path = tmp_dir.join(format!("pack-{checksum}.idx"));
     // The remote reader may already hold this index (web API on the same
     // instance): same bytes, hard-link instead of a second 2 GB download.
-    let remote_idx = crate::remote::idx_dir(local.path()).join(format!("{checksum}.idx"));
     let mut extra = Vec::new();
     let mut side_futs = Vec::new();
     // Idx + rev + bitmap + commit-graph in one round (each already striped).
@@ -257,9 +261,14 @@ pub(crate) async fn link_and_install_pack(
                 .instrument(span.clone()),
         );
     }
-    let idx_r = if remote_idx.is_file()
-        && (std::fs::hard_link(&remote_idx, &idx_path).is_ok()
-            || std::fs::copy(&remote_idx, &idx_path).is_ok())
+    let idx_r = if crate::index_cache::reuse(
+        local.path(),
+        pack,
+        local.object_format().kind(),
+        idx_path.clone(),
+        reporter,
+    )
+    .await?
     {
         tracing::info!(checksum = %checksum, "pack index reused from the remote reader");
         let side_rs = futures::future::join_all(side_futs).await;
@@ -320,11 +329,39 @@ fn side_files(pack: &PackRef) -> [(bool, &'static str, String); 3] {
 /// NIC's worth), with bounded memory (PAR * CHUNK).
 /// `progress(delta_bytes, total_bytes)` is called as chunks land (callers
 /// throttle). `known_size` skips the happy-path HEAD (ROUNDTRIPS: HEAD ≈ GET;
-/// PackRef already carries pack/idx sizes).
+/// `PackRef` already carries pack/idx sizes).
 pub(crate) type ProgressFn<'a> = &'a (dyn Fn(u64, u64) + Send + Sync);
 
 fn nonzero(n: u64) -> Option<u64> {
     (n > 0).then_some(n)
+}
+
+async fn write_complete_body(
+    key: &str,
+    dest: &std::path::Path,
+    mut body: walgit_store::ByteStream,
+    size: u64,
+    report: &(impl Fn(u64) + Sync),
+) -> Result<(), WalError> {
+    use futures::StreamExt;
+    let mut received = 0u64;
+    let mut file = tokio::fs::File::create(dest).await?;
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk?;
+        received = received.saturating_add(chunk.len() as u64);
+        if received > size {
+            return Err(WalError::Corrupt(format!("oversized body for {key}")));
+        }
+        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
+        report(chunk.len() as u64);
+    }
+    if received != size {
+        return Err(WalError::Corrupt(format!(
+            "short body for {key}: expected {size}, got {received}"
+        )));
+    }
+    tokio::io::AsyncWriteExt::flush(&mut file).await?;
+    Ok(())
 }
 
 pub(crate) async fn download_object(
@@ -361,16 +398,14 @@ pub(crate) async fn download_object(
     if size <= CHUNK {
         let res = store.get(key, GetOptions::default()).await?;
         return match res {
-            GetResult::Object { body, .. } => {
-                let mut file = tokio::fs::File::create(dest).await?;
-                let mut body = body;
-                while let Some(chunk) = body.next().await {
-                    let chunk = chunk?;
-                    tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
-                    report(chunk.len() as u64);
+            GetResult::Object { meta, body } => {
+                if meta.size != size {
+                    return Err(WalError::Corrupt(format!(
+                        "size changed for {key}: expected {size}, got {}",
+                        meta.size
+                    )));
                 }
-                tokio::io::AsyncWriteExt::flush(&mut file).await?;
-                Ok(())
+                write_complete_body(key, dest, body, size, &report).await
             }
             GetResult::NotModified { .. } => {
                 Err(WalError::Corrupt(format!("unexpected 304 for {key}")))
@@ -380,7 +415,9 @@ pub(crate) async fn download_object(
     let file = std::fs::File::create(dest)?;
     file.set_len(size)?;
     let file = std::sync::Arc::new(file);
-    let starts: Vec<u64> = (0..size).step_by(CHUNK as usize).collect();
+    let starts: Vec<u64> = (0..size)
+        .step_by(usize::try_from(CHUNK).map_err(|e| WalError::Corrupt(e.to_string()))?)
+        .collect();
     let report = &report;
     futures::stream::iter(starts)
         .map(|start| {
@@ -402,7 +439,11 @@ pub(crate) async fn download_object(
                         return Err(WalError::Corrupt(format!("unexpected 304 for {key}")));
                     }
                 };
-                let bytes = walgit_store::util::collect(body, (end - start) as usize).await?;
+                let bytes = walgit_store::util::collect(
+                    body,
+                    usize::try_from(end - start).map_err(|e| WalError::Corrupt(e.to_string()))?,
+                )
+                .await?;
                 if bytes.len() as u64 != end - start {
                     return Err(WalError::Corrupt(format!(
                         "short range read for {key}: {}..{} got {}",
@@ -432,24 +473,27 @@ pub(crate) async fn apply_delta(
     new_manifest: &Manifest,
     new_version: &Version,
 ) -> Result<(), WalError> {
-    let store = &handle.store;
     let local = &handle.local;
     let current_state = handle.state.lock().clone();
 
     // If we have a checkpoint and haven't loaded it yet, load its refs. Its
     // packs are a subset of `Manifest.packs` and are reconciled below.
-    let checkpoint_seq = new_manifest.checkpoint.as_ref().map(|c| c.seq).unwrap_or(0);
+    let checkpoint_seq = new_manifest.checkpoint.as_ref().map_or(0, |c| c.seq);
     let need_checkpoint_load = checkpoint_seq > 0 && current_state.applied_seq < checkpoint_seq;
 
     // The checkpoint's times feed `first_state_time` / `refs_as_of`; old refs
     // carry none, the object always does.
     handle.learn_checkpoint_times().await?;
     if need_checkpoint_load {
-        let refs_key = keys::checkpoint_refs_key(checkpoint_seq);
-        if let Some((_, snap)) = get_message::<RefSnapshot>(store, &refs_key).await? {
-            local.load_ref_snapshot(&snap)?;
-            handle.state.lock().applied_seq = checkpoint_seq;
-        }
+        let cp = new_manifest
+            .checkpoint
+            .as_ref()
+            .ok_or_else(|| WalError::Corrupt("missing checkpoint descriptor".into()))?;
+        let snap =
+            crate::snapshots::checkpoint_snapshot(&handle.store, cp, &new_manifest.object_format)
+                .await?;
+        local.load_ref_snapshot(&snap)?;
+        handle.state.lock().applied_seq = checkpoint_seq;
     }
 
     // Replay log entries (refs, and superseded-pack bookkeeping) from
@@ -463,8 +507,15 @@ pub(crate) async fn apply_delta(
     {
         let mut state = handle.state.lock();
         state.manifest_version = Some(new_version.as_str().to_string());
+        let held = handle.manifest();
+        let ready = state.packs_ready()
+            && state.revision == held.revision
+            && held.packs == new_manifest.packs;
         state.applied_seq = head_seq;
         state.revision = new_manifest.revision;
+        if ready {
+            state.packs_revision = new_manifest.revision;
+        }
     }
     crate::state::save_state(local.path(), &handle.state.lock().clone())?;
     local.refresh_async().await?;
@@ -493,6 +544,8 @@ pub(crate) async fn reconcile_packs_inner(
 ) -> Result<(), WalError> {
     let store = &handle.store;
     let local = &handle.local;
+    let segmented = manifest.packs.iter().any(|p| !p.pack_groups.is_empty());
+    local.set_segmented_midx_mode(segmented);
     // Test hook: simulate an unknown blocking call inside the install path
     // (what prod had: 2.6–43 s runtime stalls during materialization). With
     // the bulk runtime this only delays bulk work.
@@ -563,16 +616,22 @@ pub(crate) async fn reconcile_packs_inner(
     }
     {
         let mut st = handle.state.lock();
-        st.remote_served = remote_served.clone();
+        st.remote_served.clone_from(&remote_served);
     }
-    let remote_set: std::collections::HashSet<&str> =
-        remote_served.iter().map(|s| s.as_str()).collect();
+    let remote_set: std::collections::HashSet<&str> = remote_served
+        .iter()
+        .map(std::string::String::as_str)
+        .collect();
 
     // History packs (D18) are an accelerator, not a requirement: a fetch can
     // be served from the linked/remote base right away. They are installed by
     // a background task (`RepoHandle::spawn_history_pack_install`) so the
     // first request on an instance never waits for a 7.5 GB download.
-    let is_history = |p: &PackRef| p.kind == walgit_proto::v1::PackKind::History as i32;
+    let is_history = |p: &PackRef| {
+        p.kind == walgit_proto::v1::PackKind::History as i32
+            && p.pack_groups.is_empty()
+            && !p.derived_from.is_empty()
+    };
     let deferred_history: Vec<PackRef> = manifest
         .packs
         .iter()
@@ -613,7 +672,7 @@ pub(crate) async fn reconcile_packs_inner(
                     tracing::info!(repo = %handle.id, pack = %p.checksum, ext, "side-file installed for an installed pack");
                 }
                 Err(e) => {
-                    tracing::warn!(repo = %handle.id, pack = %p.checksum, ext, error = %e, "side-file download failed")
+                    tracing::warn!(repo = %handle.id, pack = %p.checksum, ext, error = %e, "side-file download failed");
                 }
             }
         }
@@ -684,7 +743,10 @@ pub(crate) async fn reconcile_packs_inner(
         let link_to = link_target(&p);
         tasks.push(tokio::spawn(
             async move {
-                let _permit = sem.acquire().await.unwrap();
+                let _permit = sem
+                    .acquire()
+                    .await
+                    .map_err(|e| WalError::Corrupt(e.to_string()))?;
                 // Per-object progress arrives as absolute (done,total); turn it
                 // into deltas for the shared counter.
                 let cb = |delta: u64, _t: u64| {
@@ -698,7 +760,8 @@ pub(crate) async fn reconcile_packs_inner(
                 };
                 match link_to {
                     Some(target) => {
-                        link_and_install_pack(&store, &local, &p, &tmp_dir, &target).await
+                        link_and_install_pack(&store, &local, &p, &tmp_dir, &target, &reporter)
+                            .await
                     }
                     None => {
                         download_and_install_pack(&store, &local, &p, &tmp_dir, Some(&cb)).await
@@ -739,24 +802,59 @@ pub(crate) async fn reconcile_packs_inner(
         })
         .collect::<Result<_, _>>()?;
     if !to_remove.is_empty() {
-        match handle.rw.try_write() {
-            Ok(_w) => {
-                for (_, oid) in &to_remove {
-                    if local.pack_path(oid).exists() {
-                        local.remove_pack(oid)?;
-                        removed += 1;
-                    }
+        if let Ok(_w) = handle.rw.try_write() {
+            for (_, oid) in &to_remove {
+                if local.pack_path(oid).exists() {
+                    local.remove_pack(oid)?;
+                    removed += 1;
                 }
             }
-            Err(_) => {
-                tracing::info!(repo = %handle.id, packs = to_remove.len(), "superseded packs kept for now: readers active; retried on the next sync");
-                still_pending.extend(to_remove.iter().map(|(s, _)| s.clone()));
-            }
+        } else {
+            tracing::info!(repo = %handle.id, packs = to_remove.len(), "superseded packs kept for now: readers active; retried on the next sync");
+            still_pending.extend(to_remove.iter().map(|(s, _)| s.clone()));
         }
     }
     span.record("removed", removed);
     if !still_pending.is_empty() {
         handle.state.lock().pending_pack_removals = still_pending;
+    }
+
+    if segmented {
+        if remote_served.is_empty() {
+            let ids = manifest
+                .packs
+                .iter()
+                .map(|p| {
+                    gix_hash::ObjectId::from_hex(p.checksum.as_bytes())
+                        .map_err(|e| WalError::Corrupt(format!("pack checksum: {e}")))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let pin = handle.pin_local_objects().await;
+            let repo = local.clone();
+            let (refs, pin) = tokio::task::spawn_blocking(move || {
+                let refs = repo.refs();
+                (refs, pin)
+            })
+            .await
+            .map_err(|e| WalError::Corrupt(format!("MIDX refs: {e}")))?;
+            let refs = refs?;
+            if let Some(commit) = refs.refs.iter().find(|r| r.name.starts_with("refs/heads/")) {
+                let oid = gix_hash::ObjectId::from_hex(commit.oid.as_bytes())
+                    .map_err(|e| WalError::Corrupt(format!("MIDX root: {e}")))?;
+                // Bitmap verification is strict; a concurrent ref move can
+                // legitimately outpace the captured pack inventory. Failure
+                // leaves ordinary non-bitmap object traversal available.
+                if let Err(error) = local.write_verified_midx(&ids, oid, pin).await {
+                    tracing::warn!(repo = %handle.id, %error, "segmented MIDX unavailable; ordinary traversal remains active");
+                }
+            }
+        } else {
+            // A MIDX bitmap over absent pack bytes is not native-readable.
+            // Invalidation never queues a writer behind long-lived readers.
+            if let Ok(_guard) = handle.rw.try_write() {
+                local.invalidate_midx()?;
+            }
+        }
     }
 
     {
@@ -792,10 +890,10 @@ pub(crate) async fn maintain_commit_graph(
                 Ok(Ok(true)) => base_changed = true,
                 Ok(Ok(false)) => {}
                 Ok(Err(e)) => {
-                    tracing::warn!(pack = %p.checksum, error = %e, "commit-graph base install failed")
+                    tracing::warn!(pack = %p.checksum, error = %e, "commit-graph base install failed");
                 }
                 Err(e) => {
-                    tracing::warn!(pack = %p.checksum, error = %e, "commit-graph base install task failed")
+                    tracing::warn!(pack = %p.checksum, error = %e, "commit-graph base install task failed");
                 }
             }
         }
@@ -803,7 +901,11 @@ pub(crate) async fn maintain_commit_graph(
     // After a base change every non-base pack must be re-added (the old chain
     // layers were dropped); otherwise only what was just installed.
     // History packs hold the base's commits, already covered by its layer.
-    let is_history = |p: &&PackRef| p.kind == walgit_proto::v1::PackKind::History as i32;
+    let is_history = |p: &&PackRef| {
+        p.kind == walgit_proto::v1::PackKind::History as i32
+            && p.pack_groups.is_empty()
+            && !p.derived_from.is_empty()
+    };
     let candidates: Vec<&PackRef> = if base_changed {
         manifest
             .packs
@@ -831,11 +933,11 @@ pub(crate) async fn maintain_commit_graph(
     {
         tracing::warn!(repo = %handle.id, error = %e, "commit-graph update failed");
     } else {
-        tracing::info!(repo = %handle.id, packs = packs.len(), ms = started.elapsed().as_millis() as u64, "commit-graph updated");
+        tracing::info!(repo = %handle.id, packs = packs.len(), ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX), "commit-graph updated");
     }
 }
 
-/// Replay log entries in (from_seq, to_seq] from the manifest's log segments.
+/// Replay log entries in (`from_seq`, `to_seq`] from the manifest's log segments.
 pub(crate) async fn replay_log(
     handle: &super::handle::RepoHandle,
     manifest: &Manifest,
@@ -867,9 +969,14 @@ pub(crate) async fn replay_log(
                 async move {
                     let res = store.get(&key, GetOptions::default()).await?;
                     Ok::<Option<bytes::Bytes>, WalError>(match res {
-                        GetResult::Object { meta, body } => {
-                            Some(walgit_store::util::collect(body, meta.size as usize).await?)
-                        }
+                        GetResult::Object { meta, body } => Some(
+                            walgit_store::util::collect(
+                                body,
+                                usize::try_from(meta.size)
+                                    .map_err(|e| WalError::Corrupt(e.to_string()))?,
+                            )
+                            .await?,
+                        ),
                         GetResult::NotModified { .. } => None,
                     })
                 }
@@ -946,9 +1053,8 @@ pub(crate) fn apply_entries(
             EntryKind::Compact => {
                 supersedes.extend(entry.supersedes.iter().cloned());
             }
-            EntryKind::Checkpoint => {}
+            EntryKind::Checkpoint | EntryKind::Settings => {}
             // Settings live on the manifest; the entry is history only.
-            EntryKind::Settings => {}
             EntryKind::Unspecified => {
                 tracing::warn!(seq = entry.seq, "unspecified log entry kind, skipping");
             }
@@ -992,22 +1098,86 @@ pub(crate) async fn materialize_from_scratch(
         .await
 }
 
+/// The **bulk runtime**: a small dedicated tokio runtime (own worker threads)
+/// that runs pack materialization (striped downloads, 32 MiB chunk copies,
+/// tmpfs writes, install renames, gix reopen, commit-graph/midx subprocess
+/// waits). Whatever inside that path is CPU-heavy or secretly blocking can
+/// only delay other bulk work — request workers on the main runtime keep
+/// serving refs in milliseconds (prod 2026-08-20: the main runtime stalled
+/// 2.6–43 s repeatedly for the whole duration of one repo's 7.5 GB + another's
+/// 12 GB materializations; the watchdog caught it, the cause hid among a dozen
+/// candidates; isolation makes the question moot).
+static BULK_RUNTIME: std::sync::OnceLock<std::io::Result<tokio::runtime::Runtime>> =
+    std::sync::OnceLock::new();
+
+fn bulk_runtime() -> Result<&'static tokio::runtime::Runtime, WalError> {
+    BULK_RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .thread_name("walgit-bulk")
+                .enable_all()
+                .build()
+        })
+        .as_ref()
+        .map_err(|e| std::io::Error::new(e.kind(), format!("bulk runtime: {e}")).into())
+}
+
+/// Run `fut` on the bulk runtime and await its result from the caller's
+/// runtime. The future must be `'static + Send` (use `Arc<RepoHandle>`).
+pub(crate) async fn on_bulk_runtime<T: Send + 'static>(
+    fut: impl std::future::Future<Output = Result<T, WalError>> + Send + 'static,
+) -> Result<T, WalError> {
+    let span = tracing::Span::current();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    bulk_runtime()?.spawn(async move {
+        let r = fut.instrument(span).await;
+        let _ = tx.send(r);
+    });
+    rx.await
+        .map_err(|_| WalError::Corrupt("bulk runtime task dropped".into()))?
+}
+
 #[cfg(test)]
 mod download_tests {
     use super::download_object;
     use walgit_store::{ObjectStoreExt, Prefixed, PutMode, memory::MemoryStore};
 
     #[tokio::test]
+    async fn clean_early_eof_is_rejected_and_retry_replaces_partial_bytes() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join("download.tmp");
+        let body = |bytes: &'static [u8]| -> walgit_store::ByteStream {
+            Box::pin(futures::stream::once(async move {
+                Ok(bytes::Bytes::from_static(bytes))
+            }))
+        };
+        assert!(
+            super::write_complete_body("pack", &dest, body(b"short"), 8, &|_| {})
+                .await
+                .is_err()
+        );
+        assert!(
+            super::write_complete_body("pack", &dest, body(b"too many bytes"), 8, &|_| {})
+                .await
+                .is_err()
+        );
+        super::write_complete_body("pack", &dest, body(b"complete"), 8, &|_| {}).await?;
+        assert_eq!(std::fs::read(&dest)?, b"complete");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn striped_download_matches_source() {
         // > CHUNK (32 MiB) so the ranged/striped path runs, with a ragged tail.
         let size = 70 * 1024 * 1024 + 12345;
         let mut data = vec![0u8; size];
-        let mut x: u64 = 0x9E3779B97F4A7C15;
-        for b in data.iter_mut() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for b in &mut data {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            *b = x as u8;
+            *b = x.to_le_bytes()[0];
         }
         let store = MemoryStore::shared();
         store
@@ -1031,41 +1201,4 @@ mod download_tests {
             .unwrap();
         assert_eq!(std::fs::read(&small).unwrap(), b"tiny");
     }
-}
-
-/// The **bulk runtime**: a small dedicated tokio runtime (own worker threads)
-/// that runs pack materialization (striped downloads, 32 MiB chunk copies,
-/// tmpfs writes, install renames, gix reopen, commit-graph/midx subprocess
-/// waits). Whatever inside that path is CPU-heavy or secretly blocking can
-/// only delay other bulk work — request workers on the main runtime keep
-/// serving refs in milliseconds (prod 2026-08-20: the main runtime stalled
-/// 2.6–43 s repeatedly for the whole duration of one repo's 7.5 GB + another's
-/// 12 GB materializations; the watchdog caught it, the cause hid among a dozen
-/// candidates; isolation makes the question moot).
-static BULK_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-
-fn bulk_runtime() -> &'static tokio::runtime::Runtime {
-    BULK_RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .thread_name("walgit-bulk")
-            .enable_all()
-            .build()
-            .expect("bulk runtime")
-    })
-}
-
-/// Run `fut` on the bulk runtime and await its result from the caller's
-/// runtime. The future must be `'static + Send` (use `Arc<RepoHandle>`).
-pub(crate) async fn on_bulk_runtime<T: Send + 'static>(
-    fut: impl std::future::Future<Output = Result<T, WalError>> + Send + 'static,
-) -> Result<T, WalError> {
-    let span = tracing::Span::current();
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    bulk_runtime().spawn(async move {
-        let r = fut.instrument(span).await;
-        let _ = tx.send(r);
-    });
-    rx.await
-        .map_err(|_| WalError::Corrupt("bulk runtime task dropped".into()))?
 }
