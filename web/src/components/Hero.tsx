@@ -48,9 +48,21 @@ function DagCanvas() {
     const canvas = ref.current!;
     const ctx = canvas.getContext("2d")!;
     const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    const styles = getComputedStyle(canvas);
-    // Greyscale lanes from the theme scale (--l6 … --la).
-    const palette = ["--la", "--l8", "--l9", "--l7", "--l6"].map((v) => styles.getPropertyValue(v).trim() || "#aaaaaa");
+    // Greyscale lanes from the theme scale (--l6 … --la); re-read when the theme toggles.
+    const PALETTE = ["--la", "--l8", "--l9", "--l7", "--l6"];
+    let palette: string[] = [];
+    let ink = "#e8e8e8";
+    let paper = "#070707";
+    const readColors = () => {
+      const styles = getComputedStyle(canvas);
+      const v = (name: string) => styles.getPropertyValue(name).trim() || "#aaaaaa";
+      palette = PALETTE.map(v);
+      ink = v("--la");
+      paper = v("--l0");
+      nodes.forEach((n) => (n.c = palette[n.lane % palette.length]!));
+    };
+    const themeObserver = new MutationObserver(readColors);
+    themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
 
     type Node = { x: number; y: number; lane: number; r: number; c: string; parents: Node[]; born: number };
     let w = 0;
@@ -105,7 +117,7 @@ function DagCanvas() {
       // Lane guides.
       ctx.lineWidth = 1;
       for (let l = 0; l < LANES; l++) {
-        ctx.strokeStyle = "rgba(255,255,255,0.04)";
+        ctx.strokeStyle = hexA(ink, 0.04);
         ctx.beginPath();
         ctx.moveTo(0, laneY(l));
         ctx.lineTo(w, laneY(l));
@@ -133,16 +145,16 @@ function DagCanvas() {
         ctx.beginPath();
         ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
         ctx.fill();
-        ctx.strokeStyle = "rgba(7,7,7,0.9)";
+        ctx.strokeStyle = hexA(paper, 0.9);
         ctx.lineWidth = 1.25;
         ctx.stroke();
       }
       // The pulse itself.
       if (pulseX >= 0) {
         const g = ctx.createLinearGradient(pulseX - 120, 0, pulseX + 20, 0);
-        g.addColorStop(0, "rgba(232,232,232,0)");
-        g.addColorStop(0.8, "rgba(232,232,232,0.06)");
-        g.addColorStop(1, "rgba(232,232,232,0)");
+        g.addColorStop(0, hexA(ink, 0));
+        g.addColorStop(0.8, hexA(ink, 0.06));
+        g.addColorStop(1, hexA(ink, 0));
         ctx.fillStyle = g;
         ctx.fillRect(pulseX - 120, 0, 140, h);
       }
@@ -156,6 +168,7 @@ function DagCanvas() {
         raf = requestAnimationFrame(draw);
       }
     };
+    readColors();
     const ro = new ResizeObserver(resize);
     ro.observe(canvas);
     resize();
@@ -164,6 +177,7 @@ function DagCanvas() {
     return () => {
       cancelAnimationFrame(raf);
       ro.disconnect();
+      themeObserver.disconnect();
       document.removeEventListener("visibilitychange", onVis);
     };
   }, []);

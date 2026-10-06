@@ -3,7 +3,11 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="color-scheme" content="dark" />
+    <meta name="color-scheme" content="dark light" />
+    <script>
+      // Apply the saved theme before first paint (the nav toggle writes it).
+      try { var t = localStorage.getItem("theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch (e) {}
+    </script>
     <title>walgit</title>
     <style>
       /* Pre-JS boot state: painted from the HTML alone, replaced by the app on mount. */
@@ -12,6 +16,10 @@
       .boot-bar { height: 48px; border-bottom: 1px solid rgba(255,255,255,.04); }
       .boot-main { max-width: 1080px; margin: 32px auto; padding: 0 24px; }
       .boot-sk { background: linear-gradient(90deg, #131313 25%, #1a1a1a 50%, #131313 75%); background-size: 400% 100%; animation: boot-sh 1.4s ease infinite; }
+      html[data-theme="light"], html[data-theme="light"] body { background: #fafafa; }
+      html[data-theme="light"] .boot { color: #444; }
+      html[data-theme="light"] .boot-bar { border-bottom-color: rgba(0,0,0,.06); }
+      html[data-theme="light"] .boot-sk { background-image: linear-gradient(90deg, #ececec 25%, #e2e2e2 50%, #ececec 75%); }
       @keyframes boot-sh { from { background-position: 100% 0 } to { background-position: 0 0 } }
       @media (prefers-reduced-motion: reduce) { .boot-sk { animation: none } }
     </style>

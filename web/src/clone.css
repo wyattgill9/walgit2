@@ -22,7 +22,7 @@
   background: var(--l1);
   border: 1px solid var(--l4);
   padding: 12px 14px;
-  box-shadow: 0 16px 48px -16px rgba(0, 0, 0, 0.8);
+  box-shadow: 0 16px 48px -16px var(--shadow);
 }
 .clone-pop .small {
   margin-top: 10px;

@@ -1,5 +1,6 @@
-/* One theme, dark only: greyscale, monospace, hairlines — after wyattgill.com/knowledge-base.
-   Hue appears only where it carries meaning: syntax, diff +/- and status (ok / failed). */
+/* Greyscale, monospace, hairlines — after wyattgill.com/knowledge-base. Dark is the default;
+   [data-theme="light"] on <html> inverts the ramp (set by the nav toggle, applied pre-paint in
+   index.html). Hue appears only where it carries meaning: syntax, diff +/- and status. */
 @font-face {
   font-family: "JetBrains Mono";
   src: url("./fonts/jetbrains-mono-latin-wght.woff2") format("woff2");
@@ -13,6 +14,12 @@
   --l5: #333; --l6: #4a4a4a; --l7: #777; --l8: #aaa; --l9: #ccc; --la: #e8e8e8;
   /* One Dark: the only hues on the page. */
   --s-red: #e06c75; --s-green: #98c379; --s-yellow: #e5c07b;
+  --prose: #b0b0b0;
+  --glass: rgba(7, 7, 7, 0.85);
+  --hair: rgba(255, 255, 255, 0.04);
+  --sel: rgba(200, 200, 200, 0.15);
+  --lift: rgba(255, 255, 255, 0.06);
+  --shadow: rgba(0, 0, 0, 0.8);
   /* Names the components and canvas read. */
   --fg: var(--l9); --fg2: var(--l8); --muted: var(--l7); --border: var(--l3);
   --bg: var(--l0); --bg2: var(--l1); --bg3: var(--l2); --accent: var(--la); --link: var(--l9);
@@ -23,6 +30,19 @@
   --diffs-header-font-family: var(--f);
   --diffs-font-size: 12px;
   color-scheme: dark;
+}
+:root[data-theme="light"] {
+  --l0: #fafafa; --l1: #f4f4f4; --l2: #ececec; --l3: #e2e2e2; --l4: #d4d4d4;
+  --l5: #c4c4c4; --l6: #9a9a9a; --l7: #6b6b6b; --l8: #444; --l9: #2a2a2a; --la: #0a0a0a;
+  /* One Light */
+  --s-red: #e45649; --s-green: #50a14f; --s-yellow: #c18401;
+  --prose: #3a3a3a;
+  --glass: rgba(250, 250, 250, 0.85);
+  --hair: rgba(0, 0, 0, 0.06);
+  --sel: rgba(0, 0, 0, 0.1);
+  --lift: transparent;
+  --shadow: rgba(0, 0, 0, 0.15);
+  color-scheme: light;
 }
 * {
   box-sizing: border-box;
@@ -45,7 +65,7 @@ body::before {
   background-image: radial-gradient(circle, var(--l4) 0.5px, transparent 0.5px);
   background-size: 24px 24px;
 }
-::selection { background: rgba(200, 200, 200, 0.15); }
+::selection { background: var(--sel); }
 ::-webkit-scrollbar { width: 3px; height: 3px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--l4); }
@@ -101,9 +121,9 @@ textarea:focus { border-color: var(--l7); background: var(--l2); }
   gap: 16px;
   height: 48px;
   padding: 0 max(24px, calc((100vw - var(--w)) / 2 + 24px));
-  background: rgba(7, 7, 7, 0.85);
+  background: var(--glass);
   backdrop-filter: blur(24px) saturate(150%);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  border-bottom: 1px solid var(--hair);
 }
 .brand {
   color: var(--l9);
@@ -137,6 +157,7 @@ textarea:focus { border-color: var(--l7); background: var(--l2); }
 .topnav-link.active { color: var(--la); }
 .topnav-link:hover::after,
 .topnav-link.active::after { width: 100%; }
+.theme-toggle { background: none; border: 0; padding: 0; font: inherit; font-size: 12px; cursor: pointer; }
 
 .container {
   max-width: var(--w);
@@ -403,7 +424,7 @@ strong { font-weight: 500; color: var(--l9); }
   overflow: auto;
   background: var(--l1);
   border: 1px solid var(--l4);
-  box-shadow: 0 16px 48px -16px rgba(0, 0, 0, 0.8);
+  box-shadow: 0 16px 48px -16px var(--shadow);
 }
 .menu input {
   width: calc(100% - 16px);
@@ -613,7 +634,7 @@ strong { font-weight: 500; color: var(--l9); }
   margin: 0 0 12px;
   font-size: 12.5px;
   line-height: 1.8;
-  color: #b0b0b0;
+  color: var(--prose);
 }
 .commit-foot {
   background: var(--l1);
@@ -653,7 +674,7 @@ strong { font-weight: 500; color: var(--l9); }
   font-size: 13px;
   line-height: 1.8;
   max-width: 760px;
-  color: #b0b0b0;
+  color: var(--prose);
 }
 .markdown-body > :first-child {
   margin-top: 0;
@@ -864,7 +885,7 @@ strong { font-weight: 500; color: var(--l9); }
   line-height: 1.3;
   letter-spacing: -0.03em;
   color: var(--la);
-  text-shadow: 0 0.5px 0 rgba(255, 255, 255, 0.06);
+  text-shadow: 0 0.5px 0 var(--lift);
   margin-bottom: 12px;
 }
 .hero-lede { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--l6); margin: 0 0 10px; }
@@ -922,7 +943,7 @@ details summary { cursor: pointer; margin-top: 8px; }
   width: min(520px, 90vw); display: flex; flex-direction: column; gap: 8px;
   padding: 10px 12px; font-size: 12px; text-align: left;
   background: var(--l1); border: 1px solid var(--l4);
-  box-shadow: 0 16px 48px -16px rgba(0, 0, 0, 0.8);
+  box-shadow: 0 16px 48px -16px var(--shadow);
 }
 .tasks-section { display: flex; flex-direction: column; gap: 6px; }
 .tasks-title { text-transform: uppercase; letter-spacing: 0.08em; font-size: 10px; color: var(--l6); }
@@ -953,7 +974,7 @@ details summary { cursor: pointer; margin-top: 8px; }
 .error-item {
   display: flex; align-items: flex-start; gap: 8px; padding: 8px 10px;
   background: var(--l1); border: 1px solid var(--l4); border-left: 2px solid var(--s-red);
-  box-shadow: 0 16px 48px -16px rgba(0, 0, 0, 0.8); font-size: 12px; color: var(--l9);
+  box-shadow: 0 16px 48px -16px var(--shadow); font-size: 12px; color: var(--l9);
 }
 .error-item .error-text { flex: 1 1 auto; word-break: break-word; }
 .error-tray .dismiss-all { align-self: flex-end; }
@@ -977,7 +998,7 @@ details summary { cursor: pointer; margin-top: 8px; }
 
 /* Instance footer: which machine answered, by name. */
 .instance-footer { position: fixed; right: 10px; bottom: 8px; display: flex; gap: 8px; align-items: center;
-  font: 10px/1 var(--f); color: var(--l6); background: rgba(7, 7, 7, 0.85); backdrop-filter: blur(12px);
+  font: 10px/1 var(--f); color: var(--l6); background: var(--glass); backdrop-filter: blur(12px);
   border: 1px solid var(--l3); padding: 5px 8px; z-index: 40; }
 .instance-footer .instance-kind { color: var(--l8); }
 .instance-footer .instance-version { opacity: 0.7; }
