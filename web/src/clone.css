@@ -1,16 +1,17 @@
 /* clone dropdown + copyable code samples */
 .btn-primary {
-  background: #1f883d;
-  color: #fff;
-  border-color: rgba(31, 35, 40, 0.15);
+  background: var(--l2);
+  color: var(--la);
+  border-color: var(--l7);
 }
 .btn-primary:hover {
-  background: #1a7f37;
+  color: var(--la);
+  border-color: var(--l9);
 }
 .clone-menu {
   position: relative;
   float: right;
-  margin-top: -34px;
+  margin-top: -30px;
 }
 .clone-pop {
   position: absolute;
@@ -18,11 +19,10 @@
   top: 36px;
   z-index: 20;
   width: min(720px, 90vw);
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  background: var(--l1);
+  border: 1px solid var(--l4);
   padding: 12px 14px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+  box-shadow: 0 16px 48px -16px rgba(0, 0, 0, 0.8);
 }
 .clone-pop .small {
   margin-top: 10px;
@@ -50,11 +50,11 @@
   font-size: 11px;
   line-height: 1;
   padding: 5px 6px;
-  border-radius: 6px;
-  border: 1px solid var(--border);
-  background: var(--bg);
-  color: var(--fg);
+  border: 1px solid var(--l4);
+  background: var(--l1);
+  color: var(--l7);
   cursor: pointer;
+  transition: all 0.2s;
 }
 .copy-btn-labelled,
 .clone-actions .copy-btn {
@@ -79,5 +79,6 @@
   padding: 5px 10px;
 }
 .copy-btn:hover {
-  background: var(--bg3);
+  color: var(--l9);
+  border-color: var(--l6);
 }

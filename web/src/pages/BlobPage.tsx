@@ -7,6 +7,7 @@ import { useRepo } from "./RepoLayout";
 import { Box } from "../components/Layout";
 import { fmtSize } from "../format";
 import { RefBar } from "../components/RefBar";
+import { CODE } from "../code-theme";
 import { Markdown } from "../components/Markdown";
 
 export function BlobPage() {
@@ -58,7 +59,7 @@ export function BlobPage() {
           ) : (
             <File
               file={{ name: b.name, contents: b.contents.replace(/\n$/, "") }}
-              options={{ disableFileHeader: true, themeType: "light", overflow: "scroll" }}
+              options={{ ...CODE, disableFileHeader: true }}
             />
           ))}
       </Box>

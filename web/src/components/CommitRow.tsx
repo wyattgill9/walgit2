@@ -4,10 +4,8 @@ import { relTime } from "../format";
 import { Linkified, Trailers } from "./CommitMessage";
 
 export function Avatar({ name }: { name: string }) {
-  let h = 0;
-  for (const ch of name) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
   return (
-    <span className="avatar" style={{ background: `hsl(${h % 360} 45% 55%)` }} title={name}>
+    <span className="avatar" title={name}>
       {name.trim().slice(0, 1).toUpperCase()}
     </span>
   );

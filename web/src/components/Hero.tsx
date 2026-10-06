@@ -49,10 +49,8 @@ function DagCanvas() {
     const ctx = canvas.getContext("2d")!;
     const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     const styles = getComputedStyle(canvas);
-    const accent = styles.getPropertyValue("--accent").trim() || "#0969da";
-    const add = styles.getPropertyValue("--add").trim() || "#1a7f37";
-    const del = styles.getPropertyValue("--del").trim() || "#cf222e";
-    const palette = [accent, add, "#8250df", del, "#bf8700"];
+    // Greyscale lanes from the theme scale (--l6 … --la).
+    const palette = ["--la", "--l8", "--l9", "--l7", "--l6"].map((v) => styles.getPropertyValue(v).trim() || "#aaaaaa");
 
     type Node = { x: number; y: number; lane: number; r: number; c: string; parents: Node[]; born: number };
     let w = 0;
@@ -107,7 +105,7 @@ function DagCanvas() {
       // Lane guides.
       ctx.lineWidth = 1;
       for (let l = 0; l < LANES; l++) {
-        ctx.strokeStyle = "rgba(120,130,145,0.10)";
+        ctx.strokeStyle = "rgba(255,255,255,0.04)";
         ctx.beginPath();
         ctx.moveTo(0, laneY(l));
         ctx.lineTo(w, laneY(l));
@@ -135,16 +133,16 @@ function DagCanvas() {
         ctx.beginPath();
         ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
         ctx.fill();
-        ctx.strokeStyle = "rgba(255,255,255,0.9)";
+        ctx.strokeStyle = "rgba(7,7,7,0.9)";
         ctx.lineWidth = 1.25;
         ctx.stroke();
       }
       // The pulse itself.
       if (pulseX >= 0) {
         const g = ctx.createLinearGradient(pulseX - 120, 0, pulseX + 20, 0);
-        g.addColorStop(0, "rgba(9,105,218,0)");
-        g.addColorStop(0.8, "rgba(9,105,218,0.10)");
-        g.addColorStop(1, "rgba(9,105,218,0)");
+        g.addColorStop(0, "rgba(232,232,232,0)");
+        g.addColorStop(0.8, "rgba(232,232,232,0.06)");
+        g.addColorStop(1, "rgba(232,232,232,0)");
         ctx.fillStyle = g;
         ctx.fillRect(pulseX - 120, 0, 140, h);
       }
@@ -173,7 +171,8 @@ function DagCanvas() {
 }
 
 function hexA(hex: string, a: number): string {
-  const m = /^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(hex);
+  const full = hex.replace(/^#?([\da-f])([\da-f])([\da-f])$/i, "#$1$1$2$2$3$3");
+  const m = /^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(full);
   if (!m) return hex;
   return `rgba(${parseInt(m[1]!, 16)},${parseInt(m[2]!, 16)},${parseInt(m[3]!, 16)},${a.toFixed(3)})`;
 }

@@ -8,6 +8,7 @@ import { useRepo } from "./RepoLayout";
 import { Box } from "../components/Layout";
 import { relTime } from "../format";
 import { Avatar } from "../components/CommitRow";
+import { CODE } from "../code-theme";
 import { Linkified, Trailers } from "../components/CommitMessage";
 
 export function CommitPage() {
@@ -40,7 +41,7 @@ export function CommitPage() {
           <div className="row wrap gap">
             <Trailers repo={full} trailers={c.trailers ?? []} open />
             <span className="spacer" />
-            <Link className="btn small" to={`/${full}/tree/${c.sha}`}>
+            <Link className="btn small" style={{ alignSelf: "flex-start" }} to={`/${full}/tree/${c.sha}`}>
               Browse files
             </Link>
           </div>
@@ -110,7 +111,7 @@ export function CommitPage() {
 
       {files.map((f, i) => (
         <div key={f.name + i} id={`d-${encodeURIComponent(f.name)}`} className="diff-file">
-          <FileDiff fileDiff={f} options={{ diffStyle: split ? "split" : "unified", themeType: "light", overflow: "scroll" }} />
+          <FileDiff fileDiff={f} options={{ ...CODE, diffStyle: split ? "split" : "unified" }} />
         </div>
       ))}
       {files.length === 0 && stats.length > 0 && (
