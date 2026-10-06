@@ -132,11 +132,6 @@ textarea:focus { border-color: var(--l7); background: var(--l2); }
   letter-spacing: -0.02em;
 }
 .brand:hover { color: var(--la); }
-.brand .c {
-  display: inline-block;
-  animation: blink 1s step-end infinite;
-}
-@keyframes blink { 50% { opacity: 0; } }
 .topnav { margin-left: auto; display: flex; align-items: center; gap: 20px; }
 .topnav-link {
   position: relative;
@@ -859,7 +854,7 @@ strong { font-weight: 500; color: var(--l9); }
 }
 @media (prefers-reduced-motion: reduce) {
   .progress.on::before { animation: none; width: 100%; opacity: 0.6; }
-  .sk, .brand .c { animation: none; }
+  .sk { animation: none; }
 }
 
 /* ---- landing hero ---- */

@@ -13,7 +13,7 @@ export function Layout() {
     <>
       <header className="topbar">
         <Link to="/" className="brand">
-          walgit<span className="c">_</span>
+          walgit/
         </Link>
         <nav className="topnav">
           <NavLink to={apiHref} className={({ isActive }) => (isActive ? "topnav-link active" : "topnav-link")}>
