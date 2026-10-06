@@ -40,7 +40,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `walgit.example.toml` | Every config key with its default and a comment. Change it with the code. |
 | `walgit.standalone.toml` | The one-machine shape: `walgit-server --config walgit.standalone.toml` → `https://walgit.localhost:8080/`. |
 | `deploy/nginx.conf.example` | An optional nginx in front; documents the `X-Accel-Redirect` byte-offload contract. |
-| `Containerfile`, `flake.nix` | An OCI image; a Nix package, image and devshell. |
+| `Containerfile`, `flake.nix` | An OCI image; a Nix package, image, devshell and NixOS module (`services.walgit`, `nix/nixos.nix`). |
 
 ---
 

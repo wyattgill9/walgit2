@@ -39,6 +39,7 @@
         ./nix/packages.nix
         ./nix/devshell.nix
         ./nix/fmt.nix
+        ./nix/nixos.nix
       ];
     };
 }
