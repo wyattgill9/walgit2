@@ -601,6 +601,11 @@ strong { font-weight: 500; color: var(--l9); }
 .commit-subject:hover {
   color: var(--la);
 }
+/* Inline, so the "…" toggle sits right after the subject; the opened message (a block <pre>)
+   still drops to its own line below. */
+.commit-body {
+  display: inline;
+}
 .commit-body summary {
   cursor: pointer;
   display: inline-block;

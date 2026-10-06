@@ -7,6 +7,12 @@ import { precompress } from "./plugins/precompress.ts";
 // /_ui/ with immutable caching; in dev, the JSON API (`/api/v1/…`, D20, plus the
 // older `/services/api` and `/{owner}/{repo}/api` shapes, API.md §1) is proxied
 // to a running `walgit serve`.
+// Proxied requests keep the browser's Host (changeOrigin: false). Vite's string shorthand
+// rewrites it to the target (127.0.0.1:8080), and walgit sends a browser on a loopback host to
+// walgit.localhost (web/mod.rs canonical_browser_host) — another origin, so every API call fails.
+// Open the dev server as http://walgit.localhost:5173, which walgit leaves alone.
+const walgit = { target: process.env.WALGIT_URL ?? "http://127.0.0.1:8080", changeOrigin: false };
+
 export default defineConfig(({ command }) => ({
   plugins: [react(), importMap(), precompress()],
   // Embedded assets live under /_ui/; the dev server serves the SPA at / so
@@ -14,11 +20,11 @@ export default defineConfig(({ command }) => ({
   base: command === "build" ? "/_ui/" : "/",
   server: {
     proxy: {
-      "/api/": process.env.WALGIT_URL ?? "http://127.0.0.1:8080",
-      "/api-browser/": process.env.WALGIT_URL ?? "http://127.0.0.1:8080",
-      "/services/api/": process.env.WALGIT_URL ?? "http://127.0.0.1:8080",
-      "^/[^/]+/[^/]+/api(-browser)?(/|$)": process.env.WALGIT_URL ?? "http://127.0.0.1:8080",
-      "^/[^/]+/[^/]+(\\.git)?/(info/refs|git-upload-pack|git-receive-pack)": process.env.WALGIT_URL ?? "http://127.0.0.1:8080",
+      "/api/": walgit,
+      "/api-browser/": walgit,
+      "/services/api/": walgit,
+      "^/[^/]+/[^/]+/api(-browser)?(/|$)": walgit,
+      "^/[^/]+/[^/]+(\\.git)?/(info/refs|git-upload-pack|git-receive-pack)": walgit,
     },
   },
   build: {
