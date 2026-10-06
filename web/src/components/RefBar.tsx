@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { refListStream, type RefInfo } from "../api";
-import { reportError } from "../data";
+import { api, refListStream, type RefInfo } from "../api";
+import { reportError, useData } from "../data";
 import { useRepo } from "../pages/RepoLayout";
 
 const PAGE = 50;
@@ -130,6 +130,12 @@ export function RefBar({
           </div>
         )}
       </div>
+      {page === "tree" && (
+        // Its own boundary: the count never holds up the listing.
+        <Suspense fallback={null}>
+          <BranchCount full={full} />
+        </Suspense>
+      )}
       <div className="crumbs">
         <Link to={`/${full}/${crumbKind}/${refname}`} className="strong">
           {full.split("/")[1]}
@@ -152,5 +158,15 @@ export function RefBar({
         </Link>
       )}
     </div>
+  );
+}
+
+/** GitHub's "N branches" link beside the picker; the count is the O(1) repo summary. */
+function BranchCount({ full }: { full: string }) {
+  const s = useData(`summary:${full}`, () => api.summary(full));
+  return (
+    <Link to={`/${full}/branches`} className="ref-count">
+      <strong>{s.branches}</strong> {s.branches === 1 ? "branch" : "branches"}
+    </Link>
   );
 }

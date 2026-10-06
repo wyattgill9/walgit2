@@ -18,6 +18,7 @@ const BlobPage = lazy(() => track(import("./pages/BlobPage")).then((m) => ({ def
 const CommitPage = lazy(() => track(import("./pages/CommitPage")).then((m) => ({ default: m.CommitPage })));
 const OverviewPage = lazy(() => track(import("./pages/OverviewPage")).then((m) => ({ default: m.OverviewPage })));
 const SettingsPage = lazy(() => track(import("./pages/SettingsPage")).then((m) => ({ default: m.SettingsPage })));
+const BranchesPage = lazy(() => track(import("./pages/BranchesPage")).then((m) => ({ default: m.BranchesPage })));
 const ApiPage = lazy(() => track(import("./pages/ApiPage")).then((m) => ({ default: m.ApiPage })));
 
 createRoot(document.getElementById("root")!).render(
@@ -37,6 +38,8 @@ createRoot(document.getElementById("root")!).render(
             <Route path="commits" element={<CommitsPage />} />
             <Route path="commits/*" element={<CommitsPage />} />
             <Route path="commit/:sha" element={<CommitPage />} />
+            <Route path="branches" element={<BranchesPage />} />
+            <Route path="branches/:view" element={<BranchesPage />} />
           </Route>
         </Route>
       </Routes>

@@ -1066,3 +1066,46 @@ input.text.small { font-size: 11px; padding: 2px 6px; margin-left: 8px; }
   .topbar { padding: 0 16px; }
   .container { padding: 24px 16px 72px; }
 }
+
+/* ---- branches page ---- */
+.branches-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+.branches-bar .subtabs { margin: 0; }
+.subtab:hover { text-decoration: none; }
+.branch-search { flex: 1 1 220px; max-width: 320px; margin-left: auto; padding: 5px 10px; font-size: 12px; }
+.branch-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 240px) 180px;
+  align-items: center;
+  gap: 16px;
+  padding: 9px 16px;
+  border-top: 1px solid var(--l3);
+  font-size: 12.5px;
+  transition: background 0.2s;
+}
+.branch-row:first-child { border-top: 0; }
+.branch-row:not(.branch-cols):hover { background: linear-gradient(90deg, var(--l2), transparent 70%); }
+.branch-cols { font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--l6); padding-top: 7px; padding-bottom: 7px; }
+.branch-name { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.branch-name a { color: var(--l9); }
+.branch-name a:hover { color: var(--la); }
+.copy-btn.branch-copy { position: static; padding: 2px 4px; opacity: 0; transition: opacity 0.2s; }
+.branch-row:hover .branch-copy,
+.branch-copy:focus-visible { opacity: 1; }
+.branch-updated { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.ab-head { text-align: center; }
+/* behind | ahead: counts over two bars growing out from a center line */
+.ab { display: grid; grid-template-columns: 1fr 1fr; font-size: 11px; color: var(--l7); }
+.ab-side { display: flex; flex-direction: column; gap: 3px; padding: 0 6px; }
+.ab-behind { align-items: flex-end; }
+.ab-ahead { align-items: flex-start; border-left: 1px solid var(--l4); }
+.ab-side i { display: block; height: 3px; background: var(--l6); }
+.branch-more { padding: 9px 16px; border-top: 1px solid var(--l3); font-size: 12px; }
+.pager { display: flex; align-items: center; justify-content: center; gap: 12px; margin: 4px 0 20px; }
+.ref-count { font-size: 12px; color: var(--l7); white-space: nowrap; }
+.ref-count strong { color: var(--l9); }
+.ref-count:hover, .ref-count:hover strong { color: var(--la); }
+@media (max-width: 640px) {
+  .branch-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .branch-updated, .branch-cols span:nth-child(2) { display: none; }
+  .branch-search { max-width: none; margin-left: 0; }
+}

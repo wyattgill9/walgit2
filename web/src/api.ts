@@ -12,6 +12,9 @@ export type {
   RefInfo,
   Refs,
   RefPage,
+  BranchRow,
+  BranchPage,
+  BranchQuery,
   Resolved,
   Commit,
   CommitTrailer,
@@ -29,7 +32,7 @@ export type {
   RepoSummary,
   Me,
 } from "../sdk/repos";
-import type { RefInfo, OpEvent, OpSpec, OpRecord, Tasks } from "../sdk/repos";
+import type { RefInfo, OpEvent, OpSpec, OpRecord, Tasks, BranchQuery } from "../sdk/repos";
 export type { SettingsDescribe, SettingsValidation, SettingsHistory, SettingsField, Policy, PolicyValidation, PolicyDryRun, RepoSettings } from "../sdk/repos";
 
 /** Kept for callers: the SDK's error class under the UI's historical name. */
@@ -88,6 +91,9 @@ export const api = {
   owners: () => authRedirect(client.owners.list()),
   repos: (owner: string) => authRedirect(client.owners.repos(owner)),
   refs: (repo: string) => authRedirect(client.repo(repo).refs()),
+  /** Repo summary (O(1) ref counts) — the "N branches" link. */
+  summary: (repo: string) => authRedirect(client.repo(repo).get()),
+  branchPage: (repo: string, q: BranchQuery) => authRedirect(client.repo(repo).branchPage(q)),
   refList: (repo: string, kind: "branches" | "tags", q: { q?: string; prefix?: string; after?: string; n?: number } = {}) =>
     authRedirect(kind === "branches" ? client.repo(repo).branches(q) : client.repo(repo).tags(q)),
   resolve: (repo: string, rest: string) => authRedirect(client.repo(repo).resolve(rest)),
