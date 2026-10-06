@@ -5,44 +5,44 @@
 # Validate with: walgit --config walgit.toml config check
 
 [server]
-listen = "127.0.0.1:8080"        # default; `mode = none` is refused unless this is loopback. Public bind: 0.0.0.0 with token/oidc.
-http2 = true                      # HTTP/2 (h2c when TLS is off, ALPN when on)
-max_concurrent_requests = 512     # global cap on in-flight git requests
-max_concurrent_per_repo = 64      # per-repo cap (upload-pack / receive-pack)
+listen = "127.0.0.1:8080"     # default; `mode = none` is refused unless this is loopback. Public bind: 0.0.0.0 with token/oidc.
+http2 = true                  # HTTP/2 (h2c when TLS is off, ALPN when on)
+max_concurrent_requests = 512 # global cap on in-flight git requests
+max_concurrent_per_repo = 64  # per-repo cap (upload-pack / receive-pack)
 request_timeout = "1h"
-drain_timeout = "20s"             # after SIGTERM, phase 2: how long in-flight requests may finish once /readyz is 503
-                                  # and new fetch/push/LFS are refused (503 + Retry-After). The running maintenance unit
-                                  # is interrupted at once in phase 1 while serving continues.
-max_push_bytes = "64GiB"          # largest accepted push
+drain_timeout = "20s"         # after SIGTERM, phase 2: how long in-flight requests may finish once /readyz is 503
+# and new fetch/push/LFS are refused (503 + Retry-After). The running maintenance unit
+# is interrupted at once in phase 1 while serving continues.
+max_push_bytes = "64GiB" # largest accepted push
 # Roles this instance performs: "serve" (git, API, UI, LFS), "maintain" (checkpoints,
 # compaction, fsck/repair — implies compact), "events" (the webhook bridge).
 # Empty = all of them: the one-box shape.
 roles = []
-auto_create_on_push = false       # create a repo on first push if missing
-accel_redirect = false            # behind an nginx edge that announces `X-Walgit-Capabilities: accel-redirect`
-                                  # (deploy/nginx.conf.example): answer LFS byte requests with X-Accel-Redirect
-                                  # so the edge streams + caches the bytes from the bucket itself. Never on a host
-                                  # clients reach directly (the answer carries a store credential).
+auto_create_on_push = false # create a repo on first push if missing
+accel_redirect = false      # behind an nginx edge that announces `X-Walgit-Capabilities: accel-redirect`
+# (deploy/nginx.conf.example): answer LFS byte requests with X-Accel-Redirect
+# so the edge streams + caches the bytes from the bucket itself. Never on a host
+# clients reach directly (the answer carries a store credential).
 # public_url = "https://git.example.com"   # pins absolute URIs (LFS, clone recipes, OAuth callback) behind a proxy
 # Browser origins allowed to call /{owner}/{repo}/api-browser/* cross-origin with credentials (the
 # repos.js browser lane from another site). Exact origins or one leading `*.`; empty = no
 # cross-origin lane (no CORS headers).
 # cors_origins = ["https://docs.example.com"]
 
-[server.tls]                      # walgit can terminate TLS itself; behind a proxy leave it "off"
-mode = "off"                      # "off" (HTTP/1.1 + h2c) | "self_signed" (generated once under <cache.dir>/tls/, served at
-                                  # /services/public/ca.pem, pinned for git by install.sh) | "files" (cert + key below)
+[server.tls] # walgit can terminate TLS itself; behind a proxy leave it "off"
+mode = "off" # "off" (HTTP/1.1 + h2c) | "self_signed" (generated once under <cache.dir>/tls/, served at
+# /services/public/ca.pem, pinned for git by install.sh) | "files" (cert + key below)
 # cert = "/etc/walgit/cert.pem"   # files mode: PEM chain
 # key = "/etc/walgit/key.pem"     # files mode: PKCS#8/PKCS#1 key
 # hostnames = ["git.example.com"] # self_signed SANs; empty = localhost, *.localhost, 127.0.0.1, ::1 + public_url's host
 
 [server.auth]
-mode = "none"                     # "none" | "token" | "oidc"
-                                  #   none  — everyone is `anon` with write+admin; loopback listen only
-                                  #   token — static `tokens` below, as `Authorization: Bearer` or the password of HTTP Basic
-                                  #   oidc  — any OpenID Connect issuer: browser sign-in through it, ID tokens as bearers,
-                                  #           walgit-issued access tokens for git (/_auth/tokens), plus `tokens` for robots
-anonymous_read = true             # must be false in oidc mode
+mode = "none" # "none" | "token" | "oidc"
+#   none  — everyone is `anon` with write+admin; loopback listen only
+#   token — static `tokens` below, as `Authorization: Bearer` or the password of HTTP Basic
+#   oidc  — any OpenID Connect issuer: browser sign-in through it, ID tokens as bearers,
+#           walgit-issued access tokens for git (/_auth/tokens), plus `tokens` for robots
+anonymous_read = true # must be false in oidc mode
 # tokens = [                      # token → principal; `token_env` reads the value from the environment at startup
 #   { principal = "alice", token_env = "WALGIT_TOKEN_ALICE", write = true, admin = true },
 #   { principal = "ci", token = "literal-secret", write = false },
@@ -64,108 +64,113 @@ anonymous_read = true             # must be false in oidc mode
 # trusted_forwarders = []                  # principals allowed to set X-Walgit-Principal (a front in front of a push broker)
 
 [store]
-backend = "s3"                    # "s3" (AWS, MinIO, rustfs, R2, Ceph, …) | "gcs" | "memory" (tests)
+backend = "s3"                # "s3" (AWS, MinIO, rustfs, R2, Ceph, …) | "gcs" | "memory" (tests)
 bucket = "walgit"
-prefix = ""                       # global key prefix inside the bucket
-max_retries = 8                   # retries on retryable store errors (jittered backoff)
-multipart_threshold = "64MiB"     # PUTs above this use multipart/resumable uploads
+prefix = ""                   # global key prefix inside the bucket
+max_retries = 8               # retries on retryable store errors (jittered backoff)
+multipart_threshold = "64MiB" # PUTs above this use multipart/resumable uploads
 multipart_part_size = "32MiB"
 
 [store.s3]
-endpoint = "https://s3.us-east-1.amazonaws.com"   # or http://127.0.0.1:9000 for rustfs/MinIO
+endpoint = "https://s3.us-east-1.amazonaws.com" # or http://127.0.0.1:9000 for rustfs/MinIO
 region = "us-east-1"
-access_key_env = "AWS_ACCESS_KEY_ID"     # env var names read at runtime; AWS_SESSION_TOKEN is also honored when set
+access_key_env = "AWS_ACCESS_KEY_ID"            # env var names read at runtime; AWS_SESSION_TOKEN is also honored when set
 secret_key_env = "AWS_SECRET_ACCESS_KEY"
-force_path_style = false          # true for most self-hosted S3 implementations
+force_path_style = false                        # true for most self-hosted S3 implementations
 
 [store.gcs]
-endpoint = "https://storage.googleapis.com"  # gRPC endpoint; credentials = Application Default Credentials
+endpoint = "https://storage.googleapis.com" # gRPC endpoint; credentials = Application Default Credentials
 direct_connectivity = true
 # signing_service_account = "sa@project.iam.gserviceaccount.com"   # for lfs serve_via = "signed_url"
-bulk_clients = 4                  # separate data channels for pack/idx/side-file/LFS bytes + ranged reads
-bulk_concurrency = 32             # max concurrent bulk requests per process (control plane never queues behind them)
+bulk_clients = 4      # separate data channels for pack/idx/side-file/LFS bytes + ranged reads
+bulk_concurrency = 32 # max concurrent bulk requests per process (control plane never queues behind them)
 
 [cache]
-dir = "/tmp/walgit"               # local materialized repos (+ tls/ for a self-signed certificate)
-mode = "auto"                     # "budget" (max_bytes caps disk; too-large repos are served remotely) | "disk" (no budget,
-                                  # full materialization, watermark eviction — a host with a real SSD) | "auto" = disk when
-                                  # maintenance.disk = "ssd"
-max_bytes = "20GiB"               # budget mode only
-disk_high_watermark = 0.9         # disk mode: evict idle repos when the filesystem holding `dir` is fuller than this (0 = never)
+dir = "/tmp/walgit" # local materialized repos (+ tls/ for a self-signed certificate)
+mode = "auto"       # "budget" (max_bytes caps disk; too-large repos are served remotely) | "disk" (no budget,
+# full materialization, watermark eviction — a host with a real SSD) | "auto" = disk when
+# maintenance.disk = "ssd"
+max_bytes = "20GiB"            # budget mode only
+disk_high_watermark = 0.9      # disk mode: evict idle repos when the filesystem holding `dir` is fuller than this (0 = never)
 evict_idle_after = "6h"
-prewarm = []                      # "owner/name" repos to materialize at startup
+prewarm = []                   # "owner/name" repos to materialize at startup
 prewarm_parallelism = 2
-prewarm_ready_timeout = "0s"      # >0: /readyz answers 503 until prewarm finished (or this long)
-ref_advert_entries = 256          # max rendered ref advertisement cache entries
-object_info_entries = 4096        # max object info (size/has) cache entries
-remote_block_bytes = "1GiB"       # pack-data block LRU for repos too large to materialize (range reads)
-remote_object_bytes = "256MiB"    # decoded-object LRU for the remote reader
-shared_render_cache = true        # mirror rendered sha-addressed API JSON into the store (all instances share)
+prewarm_ready_timeout = "0s"   # >0: /readyz answers 503 until prewarm finished (or this long)
+ref_advert_entries = 256       # max rendered ref advertisement cache entries
+object_info_entries = 4096     # max object info (size/has) cache entries
+remote_block_bytes = "1GiB"    # pack-data block LRU for repos too large to materialize (range reads)
+remote_object_bytes = "256MiB" # decoded-object LRU for the remote reader
+shared_render_cache = true     # mirror rendered sha-addressed API JSON into the store (all instances share)
 # store_mount = "/mnt/store"      # optional read-only mount of the bucket (gcsfuse, s3fs, mountpoint-s3): Serve-level
-                                  # syncs link tier-2 base packs from it (side-files local) instead of copying them to disk
+# syncs link tier-2 base packs from it (side-files local) instead of copying them to disk
 
 [wal]
-batch_window = "5ms"              # coalesce concurrent publishes into one CAS
-max_batch = 64                    # max pushes per batched index update
+batch_window = "5ms" # coalesce concurrent publishes into one CAS
+max_batch = 64       # max pushes per batched index update
 # push_broker_url = ""            # forward receive-pack to a single-writer broker host (empty = publish locally)
 # push_broker_token = ""          # static token this host presents to the broker (or WALGIT_BROKER_TOKEN); the broker
-                                  # lists it in server.auth.tokens and its principal in trusted_forwarders
+# lists it in server.auth.tokens and its principal in trusted_forwarders
 push_broker_buffer_bytes = "64MiB" # largest receive-pack body kept replayable for broker → local fallback
-snapshot_every_entries = 256      # checkpoint (ref snapshot + pack inventory, log folded) every N entries …
-checkpoint_interval = "1h"        # … or when the last checkpoint is this old (0 = off) …
-checkpoint_tail_bytes = "8MiB"    # … or when the log tail after it exceeds this (0 = off); refs-level work
-cas_max_retries = 16              # CAS retry cap on PreconditionFailed
-fsck_objects = true               # verify pushed objects before publish
-check_connectivity = true         # require ref tips connected to existing objects
-freshness_ttl = "0s"              # 0 = always revalidate manifest.pb
-prefetch_packs = true             # after a refs-only sync, download packs in the background …
-prefetch_max_bytes = "1GiB"       # … only when the serving copy puts at most this on disk; bigger sets wait for a request that needs objects (0 = no bound)
-remote_objects = true             # pack set > cache.max_bytes: read objects from the store by range (web API)
+snapshot_every_entries = 256       # checkpoint (ref snapshot + pack inventory, log folded) every N entries …
+checkpoint_interval = "1h"         # … or when the last checkpoint is this old (0 = off) …
+checkpoint_tail_bytes = "8MiB"     # … or when the log tail after it exceeds this (0 = off); refs-level work
+cas_max_retries = 16               # CAS retry cap on PreconditionFailed
+fsck_objects = true                # verify pushed objects before publish
+check_connectivity = true          # require ref tips connected to existing objects
+freshness_ttl = "0s"               # 0 = always revalidate manifest.pb
+prefetch_packs = true              # after a refs-only sync, download packs in the background …
+prefetch_max_bytes = "1GiB"        # … only when the serving copy puts at most this on disk; bigger sets wait for a request that needs objects (0 = no bound)
+remote_objects = true              # pack set > cache.max_bytes: read objects from the store by range (web API)
 
-[maintenance]                     # the `maintain` role: a priority loop, one bounded unit per assigned repo per pass
-interval = "60s"                  # pause between passes
-checkpoints = true                # unit 1: checkpoint repos whose wal.* trigger fired (refs-level)
-max_pack_bytes = "0B"             # declared capacity for units needing a local copy (0 = cache.max_bytes); above it: plan state "wrong-host"
-disk = "tmpfs"                    # "tmpfs" (memory-backed disk) | "ssd" (a real disk: may rebuild bases)
+[maintenance] # the `maintain` role: a priority loop, one bounded unit per assigned repo per pass
+interval = "60s"      # pause between passes
+checkpoints = true    # unit 1: checkpoint repos whose wal.* trigger fired (refs-level)
+max_pack_bytes = "0B" # declared capacity for units needing a local copy (0 = cache.max_bytes); above it: plan state "wrong-host"
+disk = "tmpfs"        # "tmpfs" (memory-backed disk) | "ssd" (a real disk: may rebuild bases)
 # host = "maintainer-1"           # heartbeat object maintain/<host>.pb (default: instance id) — the plan shows who maintains a repo
-fsck_interval = "7d"              # lowest-priority unit: git fsck --connectivity-only over a complete local copy → repos/<o>/<r>/fsck.pb
-                                  # (missing objects → walgit_repo_missing_objects{repo} + the `repair` unit from upstream.git); 0 = off
-follow_interval = "30s"           # upstream-follow loop (its own loop next to the priority loop): fetch each assigned repo's
-                                  # `upstream.follow` refs from upstream.git and publish the delta as a push; 0 = off on this host
+fsck_interval = "7d" # lowest-priority unit: git fsck --connectivity-only over a complete local copy → repos/<o>/<r>/fsck.pb
+# (missing objects → walgit_repo_missing_objects{repo} + the `repair` unit from upstream.git); 0 = off
+follow_interval = "30s" # upstream-follow loop (its own loop next to the priority loop): fetch each assigned repo's
+# `upstream.follow` refs from upstream.git and publish the delta as a push; 0 = off on this host
 
 # Which repositories this host attends to — by rule, not by capacity. Globs "owner/name" | "owner/*" | "*",
 # each list minus its exclude list. One box: leave the defaults. Several: e.g. the big repository on the host
 # with the SSD (serve = maintain = ["acme/monorepo"]) and everything else on the small ones (serve_exclude).
 [placement]
-serve = ["*"]                     # object work here: git-upload-pack, git-receive-pack, LFS transfer, pack prefetch/prewarm …
-serve_exclude = []                # … except these: 503 + Retry-After before any sync; refs-level reads (info/refs,
-                                  # ls-refs, API via the remote reader, UI) stay available everywhere
-maintain = ["*"]                  # maintainer units here (with roles ∋ maintain): checkpoints, compaction, fsck/repair …
-maintain_exclude = []             # … except these
+serve = [
+  "*",
+] # object work here: git-upload-pack, git-receive-pack, LFS transfer, pack prefetch/prewarm …
+serve_exclude = [
+] # … except these: 503 + Retry-After before any sync; refs-level reads (info/refs,
+# ls-refs, API via the remote reader, UI) stay available everywhere
+maintain = [
+  "*",
+] # maintainer units here (with roles ∋ maintain): checkpoints, compaction, fsck/repair …
+maintain_exclude = [] # … except these
 
 [packs]
 enabled = true
-geometric_factor = 2              # fold compatible fresh pack families independently
+geometric_factor = 2             # fold compatible fresh pack families independently
 fold_when_fresh_packs_reach = 16
-fold_when_max_age = "1d"           # zero disables the age arm
-fold_needs_at_least_packs = 2      # never fold one pack into itself
-                                  # byte trigger: max(live bytes / geometric_factor², packfile_uri.uri_min_bytes)
-segment_max_bytes = "2GiB"         # Git target, not an absolute cap for an oversized single object
-segment_target_bytes = "0B"        # zero derives from segment_max_bytes; otherwise 1MiB..=max
+fold_when_max_age = "1d"         # zero disables the age arm
+fold_needs_at_least_packs = 2    # never fold one pack into itself
+# byte trigger: max(live bytes / geometric_factor², packfile_uri.uri_min_bytes)
+segment_max_bytes = "2GiB"               # Git target, not an absolute cap for an oversized single object
+segment_target_bytes = "0B"              # zero derives from segment_max_bytes; otherwise 1MiB..=max
 segment_delta_window = 250
 segment_delta_depth = 50
-segment_delta_window_memory = "2GiB" # whole-operation budget, divided over explicit resolved threads
-segment_reuse_objects = true       # reuse compressed undeltified objects; whole cuts recompute deltas
-segment_threads = 0                # resolve available CPUs before invoking Git; host memory also clamps
-freeze_when_settled = "14d"         # useful fold freezes after settlement; zero disables age arm
-frozen_coverage_target = 0.75       # 0 disables first-freeze coverage trigger
+segment_delta_window_memory = "2GiB"     # whole-operation budget, divided over explicit resolved threads
+segment_reuse_objects = true             # reuse compressed undeltified objects; whole cuts recompute deltas
+segment_threads = 0                      # resolve available CPUs before invoking Git; host memory also clamps
+freeze_when_settled = "14d"              # useful fold freezes after settlement; zero disables age arm
+frozen_coverage_target = 0.75            # 0 disables first-freeze coverage trigger
 resegment_when_frozen_folds_exceed = 0.5 # fold-derived frozen bytes / previous global-cut bytes
 lease_ttl = "10m"
 # Retired pack bytes and URL authority have no time-based retention knob.
 
 [lfs]
 enabled = true
-serve_via = "proxy"               # "proxy" | "signed_url"
+serve_via = "proxy"        # "proxy" | "signed_url"
 signed_url_ttl = "1h"
 max_object_bytes = "16GiB"
 
@@ -176,29 +181,29 @@ max_object_bytes = "16GiB"
 # lfs = "https://github.com/acme/monorepo.git/info/lfs"  # read-through for LFS objects we lack (batch upload → "present", download/GET → stream + persist)
 # token_env = "WALGIT_UPSTREAM_TOKEN"                     # env var on the maintaining host holding the token; Basic x-access-token:<token>
 # follow = ["refs/heads/main"]                            # refs kept equal to upstream's by the maintaining host: fetched every
-                                                          # maintenance.follow_interval, published through the WAL as a push; fast-forward only
+# maintenance.follow_interval, published through the WAL as a push; fast-forward only
 
 [git]
-binary = "git"                    # path to upstream git binary (>= 2.47 recommended: pack.writeReverseIndex)
-upload_pack_engine = "auto"       # "auto" = stock git when packs are local/mount-linked, gix only for remote-served bases | "git" | "gix"
-allow_filter = true               # uploadpack.allowFilter
-allow_any_sha1_in_want = false    # uploadpack.allowAnySHA1InWant
-object_format = "sha1"            # default for new repos: "sha1" | "sha256"
-commit_graph = true               # maintain a split commit-graph chain per repo (tier-2 layer from the WAL + incremental)
-history_pack = true               # base rebuild also publishes commits+trees as a local "history pack"
+binary = "git"                     # path to upstream git binary (>= 2.47 recommended: pack.writeReverseIndex)
+upload_pack_engine = "auto"        # "auto" = stock git when packs are local/mount-linked, gix only for remote-served bases | "git" | "gix"
+allow_filter = true                # uploadpack.allowFilter
+allow_any_sha1_in_want = false     # uploadpack.allowAnySHA1InWant
+object_format = "sha1"             # default for new repos: "sha1" | "sha256"
+commit_graph = true                # maintain a split commit-graph chain per repo (tier-2 layer from the WAL + incremental)
+history_pack = true                # base rebuild also publishes commits+trees as a local "history pack"
 commit_graph_changed_paths = false # Bloom filters for incremental layers (diffs against parent trees = base pack reads)
-max_wants = 0                     # refuse a fetch wanting more objects than this (0 = off): a blobless clone without
-                                  # --sparse/--no-checkout lazily fetches every blob of HEAD at once; the ERR names the fix
+max_wants = 0                      # refuse a fetch wanting more objects than this (0 = off): a blobless clone without
+# --sparse/--no-checkout lazily fetches every blob of HEAD at once; the ERR names the fix
 
 [telemetry]
-log_format = "pretty"             # "json" | "pretty"
-log_filter = "info,walgit=debug"  # EnvFilter; overridden by RUST_LOG
-metrics = true                    # Prometheus on /metrics
+log_format = "pretty"            # "json" | "pretty"
+log_filter = "info,walgit=debug" # EnvFilter; overridden by RUST_LOG
+metrics = true                   # Prometheus on /metrics
 # trace_project = ""              # GCP project for trace-id correlation in JSON logs (optional)
-lock_wait_warn = "1s"             # WARN "lock wait" (lock, repo, wait_ms, request_id) when a request waits longer than this on
-                                  # rw/sync_mutex/pack_mutex/bulk permits; histogram walgit_lock_wait_seconds{lock}
+lock_wait_warn = "1s" # WARN "lock wait" (lock, repo, wait_ms, request_id) when a request waits longer than this on
+# rw/sync_mutex/pack_mutex/bulk permits; histogram walgit_lock_wait_seconds{lock}
 
-[events]                          # docs/EVENTS.md — read only by the bridge (roles ∋ "events"); never gates a push
+[events] # docs/EVENTS.md — read only by the bridge (roles ∋ "events"); never gates a push
 # webhook_url = "https://hooks.example.com/walgit"   # each batch of ref events is POSTed as a JSON array
 # webhook_secret = ""             # X-Walgit-Signature: sha256=<HMAC-SHA256 of the body>; unset = unsigned
 # sweep_interval = "5m"           # backstop + health check (warns when a sweep finds unpublished entries); 0 = off
@@ -206,16 +211,21 @@ lock_wait_warn = "1s"             # WARN "lock wait" (lock, repo, wait_ms, reque
 # Packfile foundations: these policies are validated and stored, but URI delivery and
 # ref filtering are not enabled by the foundation-only change.
 [refs]
-advertise = ["refs/heads/*", "refs/tags/*"] # discovery policy, independent of packing identity
+advertise = [
+  "refs/heads/*",
+  "refs/tags/*",
+] # discovery policy, independent of packing identity
 [refs.packfiles.code]
-kind = "code"                     # excludes metadata by kind, not an access control
-include = ["refs/*"]              # exact/trailing-prefix selectors; HEAD uses captured symbolic target
-subtract = []                     # code-group dependencies; complete same-generation proof required
+kind = "code" # excludes metadata by kind, not an access control
+include = [
+  "refs/*",
+] # exact/trailing-prefix selectors; HEAD uses captured symbolic target
+subtract = [] # code-group dependencies; complete same-generation proof required
 [refs.packfiles.meta]
 kind = "meta"
 include = ["refs/meta", "refs/meta/*"]
 subtract = []
 
 [packfile_uri]
-uri_min_bytes = "32MiB"           # at least one useful pack; smaller required companions may accompany it
-max_uris_per_fetch = 64           # complete sets only; over-cap selections fall back dynamically
+uri_min_bytes = "32MiB" # at least one useful pack; smaller required companions may accompany it
+max_uris_per_fetch = 64 # complete sets only; over-cap selections fall back dynamically

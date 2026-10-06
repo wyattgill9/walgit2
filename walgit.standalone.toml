@@ -16,15 +16,16 @@
 # Every key not set here keeps the default documented in walgit.example.toml.
 
 [server]
-listen = "127.0.0.1:8080"                      # PORT env wins; also binds the ::1 twin
-public_url = "https://walgit.localhost:8080"   # browser origin; PORT rewrites the port
-auto_create_on_push = true                     # `git push` to a repository that does not exist yet creates it
-roles = []                                     # empty = every role: serve, maintain (checkpoints, compaction), events
+listen = "127.0.0.1:8080" # PORT env wins; also binds the ::1 twin
+public_url = "https://walgit.localhost:8080" # browser origin; PORT rewrites the port
+auto_create_on_push = true # `git push` to a repository that does not exist yet creates it
+roles = [
+] # empty = every role: serve, maintain (checkpoints, compaction), events
 
 [server.tls]
-mode = "self_signed"              # generated once under <cache.dir>/tls/, published at /services/public/ca.pem.
-                                  # *.localhost is not a public CA name: the browser warns once (Advanced → proceed);
-                                  # git pins the cert via the installer. Real certificate: mode = "files", cert, key.
+mode = "self_signed" # generated once under <cache.dir>/tls/, published at /services/public/ca.pem.
+# *.localhost is not a public CA name: the browser warns once (Advanced → proceed);
+# git pins the cert via the installer. Real certificate: mode = "files", cert, key.
 
 [server.auth]
 # Local play: everyone is `anon` with write. Nobody else can reach 127.0.0.1.
@@ -60,7 +61,7 @@ prefix = ""
 [store.s3]
 endpoint = "http://127.0.0.1:9000"
 region = "us-east-1"
-access_key_env = "AWS_ACCESS_KEY_ID"       # compose.yaml fixes walgit-dev / walgit-dev-secret for rustfs
+access_key_env = "AWS_ACCESS_KEY_ID"     # compose.yaml fixes walgit-dev / walgit-dev-secret for rustfs
 secret_key_env = "AWS_SECRET_ACCESS_KEY"
 force_path_style = true
 # A GCS bucket instead (Application Default Credentials):
@@ -69,7 +70,7 @@ force_path_style = true
 # prefix = ""
 
 [cache]
-dir = "/tmp/walgit"               # materialized repositories + tls/; wiped = warmth lost, nothing else
+dir = "/tmp/walgit" # materialized repositories + tls/; wiped = warmth lost, nothing else
 max_bytes = "20GiB"
 
 [telemetry]

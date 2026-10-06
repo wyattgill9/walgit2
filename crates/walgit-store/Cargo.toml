@@ -6,7 +6,12 @@ license.workspace = true
 
 [features]
 default = ["gcs", "s3"]
-gcs = ["dep:google-cloud-storage", "dep:google-cloud-gax", "dep:google-cloud-auth", "dep:reqwest"]
+gcs = [
+  "dep:google-cloud-storage",
+  "dep:google-cloud-gax",
+  "dep:google-cloud-auth",
+  "dep:reqwest",
+]
 s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:aws-smithy-types", "dep:reqwest"]
 
 [dependencies]
@@ -42,7 +47,10 @@ tempfile.workspace = true
 sha1 = { workspace = true }
 bytesize = { workspace = true }
 uuid = { workspace = true }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23", default-features = false, features = [
+  "ring",
+  "std",
+] }
 
 [lints]
 workspace = true

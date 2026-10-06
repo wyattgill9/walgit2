@@ -44,7 +44,12 @@ futures.workspace = true
 bytes.workspace = true
 toml.workspace = true
 reqwest.workspace = true
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
+rustls = { version = "0.23", default-features = false, features = [
+  "aws_lc_rs",
+  "std",
+  "tls12",
+  "logging",
+] }
 axum.workspace = true
 tempfile.workspace = true
 
