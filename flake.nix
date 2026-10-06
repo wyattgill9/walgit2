@@ -1,10 +1,5 @@
 {
-  description = "NixOS Rust workspace";
-
-  nixConfig = {
-    extra-substituters = [];
-    extra-trusted-public-keys = [];
-  };
+  description = "walgit workspace";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

@@ -1,22 +1,19 @@
 {self, ...}: {
   perSystem = {
     pkgs,
-    craneLib,
     lib,
+    craneLib,
+    config,
     ...
   }: let
-    # Only the cargo inputs go into the rust build — docs/ and web/ are
-    # deliberately excluded so the sandbox stays lean.
-    src = lib.fileset.toSource {
-      root = ../.;
-      fileset = lib.fileset.unions [
-        ../Cargo.toml
-        ../Cargo.lock
-        ../crates
-        ../clippy.toml
-        ../rust-toolchain.toml
-        ../.cargo
-      ];
+    src = lib.cleanSourceWith {
+      src = ../.;
+      # crane's cargo filter keeps every *.toml, which walgit-config's tests need (they
+      # include_str! the root walgit.*.toml configs); walgit-proto's build.rs compiles the
+      # .proto schema, which the filter would drop.
+      filter = path: type:
+        (craneLib.filterCargoSources path type)
+        || builtins.match ".*\\.proto$" path != null;
     };
 
     commonArgs = {
@@ -24,15 +21,17 @@
       strictDeps = true;
 
       # protoc builds walgit-proto; the rest cover the gix/aws/rustls C bits.
+      # Native deps go here; the devshell inherits both lists.
       nativeBuildInputs = with pkgs; [protobuf pkg-config cmake perl python3];
       buildInputs = with pkgs; [];
     };
 
     cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
-    # The web UI (pnpm/vite) is built separately and embedded into the server
-    # binary at compile time (crates/walgit-server/build.rs reads web/dist).
-    # After changing web/pnpm-lock.yaml: `nix build .#web`, paste the hash it prints.
+    # The SPA (pnpm/vite), embedded into the server binary at compile time
+    # (crates/walgit-server/build.rs reads web/dist; without it, a placeholder page).
+    # After changing web/pnpm-lock.yaml: set `hash` to lib.fakeHash, `nix build .#web`,
+    # paste the hash it prints.
     web = pkgs.stdenv.mkDerivation (finalAttrs: {
       pname = "walgit-web";
       version = "0.1.0";
@@ -54,8 +53,6 @@
       pnpmDeps = pkgs.fetchPnpmDeps {
         inherit (finalAttrs) pname version src;
         fetcherVersion = 4;
-        # After changing web/pnpm-lock.yaml, set to lib.fakeHash and re-run `nix build .#web`
-        # to print the new value.
         hash = "sha256-VYzzmHKWPuWmTYwEOt/4OENmXVl1Ys7lZq44vQT404M=";
       };
       nativeBuildInputs = [pkgs.nodejs_24 pkgs.pnpm pkgs.pnpmConfigHook];
@@ -71,57 +68,66 @@
         runHook postInstall
       '';
     });
-
-    # `walgit serve` shells out to git (upload-pack, repack, bundle, index-pack).
-    walgit = craneLib.buildPackage (commonArgs
-      // {
-        inherit cargoArtifacts;
-        pname = "walgit";
-        cargoExtraArgs = "-p walgit-cli --locked";
-        doCheck = false;
-
-        WALGIT_BUILD_SHA = self.shortRev or self.dirtyShortRev or "dev";
-
-        nativeBuildInputs = commonArgs.nativeBuildInputs ++ [pkgs.makeWrapper];
-        preConfigure = ''
-          mkdir -p web
-          cp -a ${web} web/dist
-        '';
-        postInstall = ''
-          for b in walgit walgit-server; do
-            wrapProgram "$out/bin/$b" \
-              --prefix PATH : ${lib.makeBinPath [pkgs.git pkgs.git-lfs]}
-          done
-        '';
-
-        meta = {
-          description = "git hosting on an object store: smart HTTP, packfile-uri, LFS, web UI — one binary";
-          mainProgram = "walgit";
-          license = lib.licenses.mit;
-        };
-      });
   in {
     packages = {
-      inherit walgit web;
-      default = walgit;
+      inherit web;
+
+      walgit = craneLib.buildPackage (
+        commonArgs
+        // {
+          inherit cargoArtifacts;
+          pname = "walgit";
+          # Overriding cargoExtraArgs drops crane's default --locked; keep it.
+          cargoExtraArgs = "-p walgit-cli --locked";
+          # checks.test runs the suite; the package build should not run it again.
+          doCheck = false;
+
+          WALGIT_BUILD_SHA = self.shortRev or self.dirtyShortRev or "dev";
+
+          nativeBuildInputs = commonArgs.nativeBuildInputs ++ [pkgs.makeWrapper];
+          preConfigure = ''
+            mkdir -p web
+            cp -a ${web} web/dist
+          '';
+          # `walgit serve` shells out to git (upload-pack, repack, index-pack) and git-lfs.
+          postInstall = ''
+            for b in walgit walgit-server; do
+              wrapProgram "$out/bin/$b" \
+                --prefix PATH : ${lib.makeBinPath [pkgs.git pkgs.git-lfs]}
+            done
+          '';
+
+          meta = {
+            description = "git hosting on an object store: smart HTTP, packfile-uri, LFS, web UI — one binary";
+            mainProgram = "walgit";
+            license = lib.licenses.mit;
+          };
+        }
+      );
+
+      default = config.packages.walgit;
     };
 
     # `nix flake check` runs these plus treefmt (added by the treefmt-nix module).
+    # build.rs writes a placeholder web/dist when it is missing, so these compile without
+    # the (separately built) web derivation.
     checks = {
-      # build.rs writes a placeholder web/dist when it's missing, so clippy/tests
-      # compile without the (separately-built) web derivation.
-      clippy = craneLib.cargoClippy (commonArgs
+      clippy = craneLib.cargoClippy (
+        commonArgs
         // {
           inherit cargoArtifacts;
           cargoClippyExtraArgs = "--all-targets -- --deny warnings";
-        });
+        }
+      );
 
-      # git-spawning tests need git + git-lfs on PATH.
-      test = craneLib.cargoNextest (commonArgs
+      test = craneLib.cargoNextest (
+        commonArgs
         // {
           inherit cargoArtifacts;
+          # git-spawning tests need git + git-lfs on PATH.
           nativeBuildInputs = commonArgs.nativeBuildInputs ++ [pkgs.git pkgs.git-lfs];
-        });
+        }
+      );
     };
 
     _module.args = {inherit commonArgs;};
