@@ -333,6 +333,32 @@ One **name-sorted page** of one namespace, for the branch/tag picker.
   ref-state version; the picker's typical traffic is the same handful of
   queries repeated.
 
+### `GET /{owner}/{repo}/api/branches?view=&q=&page=`
+
+The branches screen (GitHub's `/branches`): one page, newest tip first.
+
+```json
+{ "default": { "name": "main", "sha": "807d45a6…", "updated": "2026-10-05T19:01:02-07:00",
+               "author": "Ada", "author_email": "ada@example.com", "ahead": null, "behind": null },
+  "branches": [ { "name": "feature/x", "sha": "…", "updated": "…", "author": "…",
+                  "author_email": "…", "ahead": 3, "behind": 12 } ],
+  "page": 1, "more": false }
+```
+
+- `view`: `overview` (default) = the 5 newest active branches; `active` = tip
+  committed within 90 days; `stale` = older; `all`. An unknown view is `404`.
+  The default branch is never in `branches`; it is `default` (`null` when
+  HEAD is unborn).
+- `q`: case-insensitive substring on the name; on `overview` it searches
+  like `all`. `page`: 1-based, 20 rows per page (`more` = another page exists).
+- `updated` is the tip's committer date; `ahead`/`behind` count commits on the
+  branch only / on the default branch only (`null` on `default`).
+- Cost: the dated list is built once per ref-state version (one
+  `for-each-ref`, cached); a request filters it in memory and counts
+  ahead/behind for its ≤ 20 rows in one call. Remote-pack repositories answer
+  names and shas only (`updated`/`ahead`/`behind` null, every view = `all`).
+- Cache: SWR.
+
 ### `GET /{owner}/{repo}/api/resolve/{rest...}`
 
 ```json

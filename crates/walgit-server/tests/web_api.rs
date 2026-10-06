@@ -390,6 +390,38 @@ async fn api_md_conformance() -> TestResult {
     assert_eq!(src_entry["name"], "src");
     assert_eq!(src_entry["updated"], inner["commit"]["commit_date"]);
 
+    // branches screen: default on its own, the rest newest first with ahead/behind of it.
+    let b = json(&server, "/o/r/api/branches?view=all").await?;
+    assert_eq!(b["default"]["name"], "main");
+    assert_eq!(b["default"]["sha"], head);
+    assert!(b["default"]["ahead"].is_null() && b["default"]["behind"].is_null());
+    assert_eq!(b["branches"].as_array().unwrap().len(), 1);
+    let fx = &b["branches"][0];
+    assert_eq!(fx["name"], "feature/x");
+    assert_eq!(fx["sha"], feature);
+    // whatever identity git recorded (.cargo/config.toml pins one for tests)
+    let who = git_in(&src, &["log", "-1", "--format=%an%x00%ae", "feature/x"])?;
+    let (name, email) = who.trim().split_once('\0').unwrap();
+    assert_eq!(
+        (fx["author"].as_str(), fx["author_email"].as_str()),
+        (Some(name), Some(email))
+    );
+    assert!(fx["updated"].is_string());
+    // merged into main: nothing ahead; behind by "second on main", the merge, 40 fillers
+    assert_eq!(
+        (fx["ahead"].as_u64(), fx["behind"].as_u64()),
+        (Some(0), Some(42))
+    );
+    assert_eq!(b["more"], false);
+    // overview = fresh branches; stale is empty for a just-made fixture; q filters
+    let b = json(&server, "/o/r/api/branches").await?;
+    assert_eq!(b["branches"][0]["name"], "feature/x");
+    let b = json(&server, "/o/r/api/branches?view=stale").await?;
+    assert_eq!(b["branches"].as_array().unwrap().len(), 0);
+    let b = json(&server, "/o/r/api/branches?view=all&q=nope").await?;
+    assert_eq!(b["branches"].as_array().unwrap().len(), 0);
+    assert_eq!(get(&server, "/o/r/api/branches?view=bogus").await?.0, 404);
+
     // unknown repo
     assert_eq!(get(&server, "/o/nope/api/refs").await?.0, 404);
     // page route -> index.html

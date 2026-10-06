@@ -256,6 +256,8 @@ pub struct ServerCaches {
     pub ref_index: RefIndexCache,
     /// Rendered sha-addressed web API JSON (immutable): key = repo\0kind\0sha\0path.
     pub api_immutable: Cache<String, bytes::Bytes>,
+    /// The branches screen's full list (newest tip first): key = repo\0manifest version.
+    pub(crate) branch_rows: Cache<String, std::sync::Arc<Vec<crate::web::api::BranchRow>>>,
 }
 
 impl ServerCaches {
@@ -268,6 +270,15 @@ impl ServerCaches {
                 .weigher(|k: &String, v: &bytes::Bytes| {
                     (k.len() + v.len()).min(u32::MAX as usize) as u32
                 })
+                .build(),
+            // Weighed by rows, so one huge repository cannot crowd out every other.
+            branch_rows: Cache::builder()
+                .max_capacity(2_000_000)
+                .weigher(
+                    |_: &String, v: &std::sync::Arc<Vec<crate::web::api::BranchRow>>| {
+                        v.len().min(u32::MAX as usize) as u32
+                    },
+                )
                 .build(),
         }
     }

@@ -232,6 +232,7 @@ async fn discovery(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Respo
             "GET|PUT|DELETE /{owner}/{repo}/api",
             "GET  /{owner}/{repo}/api/refs",
             "GET  /{owner}/{repo}/api/refs/{branches|tags}?prefix&q&after&n",
+            "GET  /{owner}/{repo}/api/branches?view&q&page",
             "GET  /{owner}/{repo}/api/resolve/{rev}[/{path}]",
             "GET  /{owner}/{repo}/api/tree/{rev}[/{path}]",
             "GET  /{owner}/{repo}/api/blob/{rev}/{path}[?raw]",

@@ -209,6 +209,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         r = r
             .route(&format!("{base}/refs"), get(refs))
             .route(&format!("{base}/refs/{{kind}}"), get(ref_list))
+            .route(&format!("{base}/branches"), get(branches))
             .route(&format!("{base}/resolve"), get(resolve_root))
             .route(&format!("{base}/resolve/"), get(resolve_root))
             .route(&format!("{base}/resolve/{{*rest}}"), get(resolve))
@@ -242,7 +243,6 @@ fn internal<E: std::fmt::Display>(e: E) -> ApiError {
 pub struct Repo {
     id: String,
     local: walgit_git::LocalRepo,
-    #[allow(dead_code)]
     version: String,
     pub(crate) index: Arc<RefIndex>,
     handle: Arc<RepoHandle>,
@@ -598,6 +598,256 @@ async fn ref_list(
         return Ok(resp);
     }
     Ok(json_swr(&RefPage { refs, more }, None).into_response(&headers))
+}
+
+// ---- branches ----------------------------------------------------------------
+
+/// Rows per page on the Active / Stale / All views (GitHub's page size).
+const BRANCH_PAGE: usize = 20;
+/// Rows in the Overview's "Active branches" section.
+const BRANCH_OVERVIEW: usize = 5;
+/// A branch whose tip commit is older than this is stale (GitHub: three months).
+const STALE_AFTER_SECS: i64 = 90 * 24 * 3600;
+
+/// One row of the branches screen. The full list (newest tip first) is built once per
+/// manifest version and cached; `ahead`/`behind` are filled per page.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BranchRow {
+    name: String,
+    sha: String,
+    /// Committer date (ISO 8601) of the tip; null on remote-pack repositories.
+    updated: Option<String>,
+    author: Option<String>,
+    author_email: Option<String>,
+    /// Commits on this branch / on the default branch only; null on the default row.
+    ahead: Option<u64>,
+    behind: Option<u64>,
+    /// `updated` as unix seconds, for the stale cutoff.
+    #[serde(skip)]
+    time: i64,
+}
+#[derive(Serialize)]
+struct BranchPage {
+    default: Option<BranchRow>,
+    branches: Vec<BranchRow>,
+    page: usize,
+    more: bool,
+}
+#[derive(serde::Deserialize, Default)]
+struct BranchQuery {
+    view: Option<String>,
+    q: Option<String>,
+    page: Option<usize>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BranchView {
+    Overview,
+    Active,
+    Stale,
+    All,
+}
+impl BranchView {
+    fn parse(s: Option<&str>) -> Option<Self> {
+        Some(match s.unwrap_or("overview") {
+            "overview" => Self::Overview,
+            "active" => Self::Active,
+            "stale" => Self::Stale,
+            "all" => Self::All,
+            _ => return None,
+        })
+    }
+}
+
+/// `GET /{o}/{r}/api/branches?view=overview|active|stale|all&q=&page=` (API.md §4): one
+/// page of the branches screen, newest tip first, ahead/behind of the default branch.
+async fn branches(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo_name)): Path<(String, String)>,
+    Query(q): Query<BranchQuery>,
+) -> Result<Response, ApiError> {
+    let view = BranchView::parse(q.view.as_deref()).ok_or_else(|| not_found("branch view"))?;
+    let page = q.page.unwrap_or(1).max(1);
+    let st2 = st.clone();
+    run(
+        &st,
+        &headers,
+        &owner,
+        &repo_name,
+        Need::Objects,
+        None,
+        move |r| async move {
+            let default_name = r.index.head().map(|(name, _)| name);
+            let remote = r.remote().is_some();
+            let rows = branch_rows(&st2, &r, remote).await?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+            // Undated (remote-pack) rows have no active/stale split: list them all by name.
+            let view = if remote { BranchView::All } else { view };
+            let (mut page_rows, more) = branch_view(
+                &rows,
+                view,
+                q.q.as_deref(),
+                now,
+                page,
+                default_name.as_deref(),
+            );
+            let default = default_name
+                .as_deref()
+                .and_then(|d| rows.iter().find(|b| b.name == d).cloned());
+            if !remote && let Some(d) = &default_name {
+                fill_ahead_behind(&r.local, d, &mut page_rows).await;
+            }
+            Ok(json_swr(
+                &BranchPage {
+                    default,
+                    branches: page_rows,
+                    page,
+                    more,
+                },
+                None,
+            ))
+        },
+    )
+    .await
+}
+
+/// Every branch, newest tip first, cached per (repo, manifest version). Local repos: one
+/// `git for-each-ref`. ponytail: that reads one commit per branch once per push — seconds
+/// at ~500k branches; precompute on publish if that ever matters. Remote-pack repos: names
+/// from the ref index only (undated; dating them means faulting every tip commit).
+async fn branch_rows(
+    st: &AppState,
+    r: &Repo,
+    remote: bool,
+) -> Result<Arc<Vec<BranchRow>>, ApiError> {
+    let key = format!("{}\0{}", r.id, r.version);
+    if let Some(hit) = st.caches.branch_rows.get(&key) {
+        return Ok(hit);
+    }
+    let rows: Vec<BranchRow> = if remote {
+        r.index
+            .branches
+            .iter()
+            .map(|(name, sha)| BranchRow {
+                name: name.clone(),
+                sha: sha.clone(),
+                updated: None,
+                author: None,
+                author_email: None,
+                ahead: None,
+                behind: None,
+                time: 0,
+            })
+            .collect()
+    } else {
+        let out = git(
+            &r.local,
+            vec![
+                "for-each-ref".into(),
+                "--sort=-committerdate".into(),
+                "--format=%(refname:lstrip=2)%00%(objectname)%00%(committerdate:unix)%00%(committerdate:iso-strict)%00%(authorname)%00%(authoremail:trim)".into(),
+                "refs/heads/".into(),
+            ],
+        )
+        .await?;
+        String::from_utf8_lossy(&out)
+            .lines()
+            .filter_map(parse_branch_line)
+            .collect()
+    };
+    let rows = Arc::new(rows);
+    if !r.version.is_empty() {
+        st.caches.branch_rows.insert(key, rows.clone());
+    }
+    Ok(rows)
+}
+
+/// One `branch_rows` line: name, sha, unix time, ISO date, author, email (NUL-separated).
+fn parse_branch_line(line: &str) -> Option<BranchRow> {
+    let mut f = line.split('\0');
+    Some(BranchRow {
+        name: f.next()?.to_string(),
+        sha: f.next()?.to_string(),
+        time: f.next()?.parse().ok()?,
+        updated: Some(f.next()?.to_string()),
+        author: Some(f.next()?.to_string()),
+        author_email: Some(f.next()?.to_string()),
+        ahead: None,
+        behind: None,
+    })
+}
+
+/// One page of `rows` (already newest first): the view's active/stale split at `now`, a
+/// case-insensitive substring `q`, `exclude` (the default branch, shown on its own), then
+/// 1-based `page`. Overview is the first few active rows; with `q` it searches like All.
+/// Returns the page and whether more rows match.
+fn branch_view(
+    rows: &[BranchRow],
+    view: BranchView,
+    q: Option<&str>,
+    now: i64,
+    page: usize,
+    exclude: Option<&str>,
+) -> (Vec<BranchRow>, bool) {
+    let needle = q.filter(|s| !s.is_empty()).map(str::to_ascii_lowercase);
+    let view = if view == BranchView::Overview && needle.is_some() {
+        BranchView::All
+    } else {
+        view
+    };
+    let cutoff = now - STALE_AFTER_SECS;
+    let mut matches = rows
+        .iter()
+        .filter(|b| Some(b.name.as_str()) != exclude)
+        .filter(|b| match view {
+            BranchView::Overview | BranchView::Active => b.time >= cutoff,
+            BranchView::Stale => b.time < cutoff,
+            BranchView::All => true,
+        })
+        .filter(|b| {
+            needle
+                .as_deref()
+                .is_none_or(|n| b.name.to_ascii_lowercase().contains(n))
+        });
+    let (size, skip) = if view == BranchView::Overview {
+        (BRANCH_OVERVIEW, 0)
+    } else {
+        (BRANCH_PAGE, (page.max(1) - 1) * BRANCH_PAGE)
+    };
+    let out: Vec<BranchRow> = matches.by_ref().skip(skip).take(size).cloned().collect();
+    let more = matches.next().is_some();
+    (out, more)
+}
+
+/// Fill `ahead`/`behind` against `default` for one page: a single `git for-each-ref` with
+/// `%(ahead-behind:…)` (git ≥ 2.41) over just these refs. Best effort.
+async fn fill_ahead_behind(local: &walgit_git::LocalRepo, default: &str, rows: &mut [BranchRow]) {
+    if rows.is_empty() {
+        return;
+    }
+    let mut a: Vec<String> = vec![
+        "for-each-ref".into(),
+        format!("--format=%(refname:lstrip=2)%00%(ahead-behind:refs/heads/{default})"),
+    ];
+    a.extend(rows.iter().map(|b| format!("refs/heads/{}", b.name)));
+    let Ok(out) = git(local, a).await else {
+        return;
+    };
+    // Patterns also match refs below a name (`feature` → `feature/x`): match by name.
+    for line in String::from_utf8_lossy(&out).lines() {
+        let Some((name, counts)) = line.split_once('\0') else {
+            continue;
+        };
+        let mut n = counts.split(' ').map(str::parse::<u64>);
+        if let (Some(Ok(ahead)), Some(Ok(behind))) = (n.next(), n.next())
+            && let Some(b) = rows.iter_mut().find(|b| b.name == name)
+        {
+            b.ahead = Some(ahead);
+            b.behind = Some(behind);
+        }
+    }
 }
 
 // ---- resolve -----------------------------------------------------------------
@@ -1540,5 +1790,53 @@ mod tests {
             super::attribute_dates(log, "src", &["inner", "q"]),
             vec![Some("2026-05-05T00:00:00Z".into()), None]
         );
+    }
+
+    fn row(name: &str, time: i64) -> super::BranchRow {
+        super::parse_branch_line(&format!("{name}\0{name}sha\0{time}\0iso\0a\0a@x")).unwrap()
+    }
+
+    #[test]
+    fn branch_view_splits_filters_and_pages() {
+        use super::{BranchView, branch_view};
+        let day = 24 * 3600;
+        let now = 1_000 * day;
+        // Newest first, as branch_rows sorts them; `main` is the default branch.
+        let mut rows = vec![
+            row("main", now),
+            row("fresh", now - day),
+            row("feat-a", now - 10 * day),
+        ];
+        rows.push(row("old", now - 91 * day));
+        let names = |v: &[super::BranchRow]| v.iter().map(|b| b.name.clone()).collect::<Vec<_>>();
+
+        let (v, more) = branch_view(&rows, BranchView::Overview, None, now, 1, Some("main"));
+        assert_eq!(
+            (names(&v), more),
+            (vec!["fresh".into(), "feat-a".into()], false)
+        );
+        let (v, _) = branch_view(&rows, BranchView::Stale, None, now, 1, Some("main"));
+        assert_eq!(names(&v), vec!["old".to_string()]);
+        let (v, _) = branch_view(&rows, BranchView::All, None, now, 1, Some("main"));
+        assert_eq!(names(&v), vec!["fresh", "feat-a", "old"]);
+        // `q` is a case-insensitive substring; from Overview it searches like All (stale too).
+        let (v, _) = branch_view(
+            &rows,
+            BranchView::Overview,
+            Some("OL"),
+            now,
+            1,
+            Some("main"),
+        );
+        assert_eq!(names(&v), vec!["old".to_string()]);
+
+        // 25 active rows: page 1 has 20 and `more`, page 2 the last 5; Overview stops at 5.
+        let many: Vec<_> = (0..25).map(|i| row(&format!("b{i:02}"), now - i)).collect();
+        let (v, more) = branch_view(&many, BranchView::Active, None, now, 1, None);
+        assert_eq!((v.len(), more), (20, true));
+        let (v, more) = branch_view(&many, BranchView::Active, None, now, 2, None);
+        assert_eq!((names(&v)[0].as_str(), v.len(), more), ("b20", 5, false));
+        let (v, more) = branch_view(&many, BranchView::Overview, None, now, 1, None);
+        assert_eq!((v.len(), more), (5, true));
     }
 }

@@ -43,6 +43,33 @@ export interface RefPage {
   refs: RefInfo[];
   more: boolean;
 }
+/** One row of the branches screen (`api/branches`). */
+export interface BranchRow {
+  name: string;
+  sha: string;
+  /** Tip committer date (ISO 8601); null on remote-pack repositories. */
+  updated: string | null;
+  author: string | null;
+  author_email: string | null;
+  /** Commits only on this branch / only on the default branch; null on the default row. */
+  ahead: number | null;
+  behind: number | null;
+}
+/** `api/branches`: the default branch on its own, then one page newest-first. */
+export interface BranchPage {
+  default: BranchRow | null;
+  branches: BranchRow[];
+  page: number;
+  more: boolean;
+}
+export interface BranchQuery {
+  /** overview (default) = 5 newest active; active = tip within 90 days; stale = older; all. */
+  view?: "overview" | "active" | "stale" | "all";
+  /** Case-insensitive substring on the name (searches like `all` from overview). */
+  q?: string;
+  /** 1-based; 20 rows per page. */
+  page?: number;
+}
 export interface RefListQuery {
   /** Path prefix under the namespace (`refs/heads/<prefix>/`). */
   prefix?: string;
@@ -617,6 +644,10 @@ export class RepoClient {
   /** One name-sorted page of branches. */
   branches(q: RefListQuery = {}, opts?: CallOptions) {
     return this.client.json<RefPage>(`${this.p}/refs/branches${qs(q)}`, opts, JSON_ONLY);
+  }
+  /** The branches screen: default branch + one newest-first page with ahead/behind. */
+  branchPage(q: BranchQuery = {}, opts?: CallOptions) {
+    return this.client.json<BranchPage>(`${this.p}/branches${qs(q)}`, opts, JSON_ONLY);
   }
   /** One name-sorted page of tags (sha = peeled commit). */
   tags(q: RefListQuery = {}, opts?: CallOptions) {

@@ -104,6 +104,11 @@ export function ApiPage() {
               cache="SWR"
             />
             <Row
+              path={`/${r}/api/branches?view=&q=&page=`}
+              desc={<>The branches screen: <code>{`{default,branches:[{name,sha,updated,author,author_email,ahead,behind}],page,more}`}</code>, newest tip first, 20 per page; <code>view</code> = <code>overview|active|stale|all</code> (stale = no commit in 90 days).</>}
+              cache="SWR"
+            />
+            <Row
               path={`/${r}/api/resolve/{ref/path…}`}
               desc={<>Splits a GitHub-shaped <code>ref/path</code> into <code>{`{ref,sha,path,kind}`}</code>; longest existing branch/tag wins, then a revision. Do this once, then address by sha.</>}
               cache="SWR + ETag"
