@@ -38,6 +38,8 @@ export type {
   TimelineItem,
   PullDetail,
   Compare,
+  LineComment,
+  ReviewState,
 } from "../sdk/repos";
 import type { RefInfo, OpEvent, OpSpec, OpRecord, Tasks, BranchQuery } from "../sdk/repos";
 export type { SettingsDescribe, SettingsValidation, SettingsHistory, SettingsField, Policy, PolicyValidation, PolicyDryRun, RepoSettings } from "../sdk/repos";

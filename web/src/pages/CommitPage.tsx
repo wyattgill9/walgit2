@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { Link, useParams } from "react-router-dom";
 import { parsePatchFiles } from "@pierre/diffs";
 import { FileDiff } from "@pierre/diffs/react";
@@ -67,8 +67,29 @@ export function CommitPage() {
   );
 }
 
-/** Diffstat, file list and one `FileDiff` per file (unified/split): a commit, a compare, a PR. */
-export function Diff({ patch, stats, cacheKey }: { patch: string; stats: FileStat[]; cacheKey: string }) {
+/** Something shown under one diff line (a review thread, a comment form). `RIGHT` = new side. */
+export interface LineNote {
+  path: string;
+  side: "LEFT" | "RIGHT";
+  line: number;
+  node: ReactNode;
+}
+
+/** Diffstat, file list and one `FileDiff` per file (unified/split): a commit, a compare, a PR.
+ * A PR's Files changed adds `notes` under lines and `onLine` (GitHub's hover "+" on a line). */
+export function Diff({
+  patch,
+  stats,
+  cacheKey,
+  notes,
+  onLine,
+}: {
+  patch: string;
+  stats: FileStat[];
+  cacheKey: string;
+  notes?: LineNote[];
+  onLine?: (path: string, side: "LEFT" | "RIGHT", line: number) => void;
+}) {
   const [split, setSplit] = useState(false);
   const files = useMemo(() => {
     if (!patch) return [];
@@ -119,7 +140,19 @@ export function Diff({ patch, stats, cacheKey }: { patch: string; stats: FileSta
 
       {files.map((f, i) => (
         <div key={f.name + i} id={`d-${encodeURIComponent(f.name)}`} className="diff-file">
-          <FileDiff fileDiff={f} options={{ ...CODE, diffStyle: split ? "split" : "unified" }} />
+          <FileDiff
+            fileDiff={f}
+            options={{
+              ...CODE,
+              diffStyle: split ? "split" : "unified",
+              enableGutterUtility: onLine !== undefined,
+              onGutterUtilityClick: (r) => onLine?.(f.name, r.side === "deletions" ? "LEFT" : "RIGHT", r.end),
+            }}
+            lineAnnotations={notes
+              ?.filter((n) => n.path === f.name)
+              .map((n) => ({ side: n.side === "LEFT" ? ("deletions" as const) : ("additions" as const), lineNumber: n.line, metadata: n.node }))}
+            renderAnnotation={(a) => a.metadata}
+          />
         </div>
       ))}
       {files.length === 0 && stats.length > 0 && (

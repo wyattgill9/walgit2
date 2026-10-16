@@ -1,6 +1,6 @@
 import { Suspense, useState, useTransition, type ReactNode } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { api, type Issue, type IssueDetail, type PullDetail, type TimelineItem } from "../api";
+import { api, type Issue, type IssueDetail, type LineComment, type PullDetail, type ReviewState, type TimelineItem } from "../api";
 import { useRepo } from "./RepoLayout";
 import { invalidate, reportError, useData } from "../data";
 import { Box } from "../components/Layout";
@@ -8,7 +8,7 @@ import { Skeleton } from "../components/Loading";
 import { Avatar, CommitRow } from "../components/CommitRow";
 import { Markdown } from "../components/Markdown";
 import { Pager } from "./BranchesPage";
-import { Diff } from "./CommitPage";
+import { Diff, type LineNote } from "./CommitPage";
 import { relTime } from "../format";
 
 // Octicons (MIT): issue-opened, issue-closed, circle-slash (not planned), comment, git-pull-request.
@@ -180,6 +180,11 @@ function IssueRow({ full, issue: i, onFilter }: { full: string; issue: Issue; on
               was closed {relTime(i.closed_at ?? i.updated_at)}
             </>
           )}
+          {i.review_decision && (
+            <button type="button" className={`btn link review-chip ${i.review_decision === "approved" ? "review-approved" : "review-changes"}`} onClick={() => onFilter(`review:${i.review_decision}`)}>
+              · {i.review_decision === "approved" ? "Approved" : "Changes requested"}
+            </button>
+          )}
         </div>
       </div>
       <div className="issue-side muted small">
@@ -229,7 +234,13 @@ export function IssuePage({ pull = false }: { pull?: boolean }) {
       {pull && <PullTabs full={full} n={n} tab={tab} />}
       {pull && tab ? (
         <Suspense fallback={<Skeleton title={false} rows={6} />}>
-          <PullChanges full={full} pr={issue as PullDetail} tab={tab} />
+          <PullChanges
+            full={full}
+            pr={issue as PullDetail}
+            tab={tab}
+            me={signedIn ? me.principal : null}
+            onReview={(review) => act("review", () => api.pulls(full).review(n, review))}
+          />
         </Suspense>
       ) : (
       <div className="issue-layout">
@@ -247,11 +258,13 @@ export function IssuePage({ pull = false }: { pull?: boolean }) {
               key={t.id}
               item={t}
               pull={pull}
+              head={issue.head_sha}
               canEdit={canEdit(t.actor)}
               onSave={(body) => act("edit comment", () => issues.editComment(n, t.id, body))}
               onDelete={() => act("delete comment", () => issues.deleteComment(n, t.id))}
             />
           ))}
+          {pull && issue.state === "open" && <ReviewStatus full={full} n={n} decision={issue.review_decision} />}
           {signedIn ? (
             <Composer
               issue={issue}
@@ -321,10 +334,30 @@ function PullTabs({ full, n, tab }: { full: string; n: number; tab?: string }) {
   );
 }
 
-/** Commits / Files changed: the three-dot compare of the tips the PR shows (immutable by sha). */
-function PullChanges({ full, pr, tab }: { full: string; pr: PullDetail; tab: string }) {
+type ReviewInput = { state: ReviewState; body?: string; comments?: LineComment[] };
+type Spot = { path: string; side: "LEFT" | "RIGHT"; line: number };
+const spotKey = (s: Spot) => `${s.path}:${s.side}:${s.line}`;
+
+/** Commits / Files changed: the three-dot compare of the tips the PR shows (immutable by sha).
+ * Files changed is also where a review is written: "+" on a line opens a comment form; comments
+ * either go out alone or collect into a pending review (kept in the page until submitted). */
+function PullChanges({
+  full,
+  pr,
+  tab,
+  me,
+  onReview,
+}: {
+  full: string;
+  pr: PullDetail;
+  tab: string;
+  me: string | null;
+  onReview: (r: ReviewInput) => Promise<boolean>;
+}) {
   const spec = `${pr.base_sha}...${pr.head_sha}`;
   const cmp = useData(`compare:${full}:${spec}`, () => api.compare(full, pr.base_sha, pr.head_sha), Infinity);
+  const [pending, setPending] = useState<LineComment[]>([]);
+  const [open, setOpen] = useState<Spot | null>(null);
   if (tab === "commits") {
     return (
       <Box title={`${cmp.commits.length} commit${cmp.commits.length === 1 ? "" : "s"}`}>
@@ -334,7 +367,167 @@ function PullChanges({ full, pr, tab }: { full: string; pr: PullDetail; tab: str
       </Box>
     );
   }
-  return <Diff patch={cmp.patch} stats={cmp.stats} cacheKey={spec} />;
+  const reviewing = me !== null && pr.state === "open";
+  // Threads at each line: earlier reviews of this head, then this page's pending comments.
+  const threads = new Map<string, { spot: Spot; items: { who: string; body: string; pending: boolean }[] }>();
+  const at = (spot: Spot) => threads.get(spotKey(spot)) ?? threads.set(spotKey(spot), { spot, items: [] }).get(spotKey(spot))!;
+  for (const t of pr.timeline) {
+    if (t.type !== "review" || t.commit_oid !== pr.head_sha) continue;
+    for (const c of t.comments) at(c).items.push({ who: t.actor, body: c.body, pending: false });
+  }
+  for (const c of pending) at(c).items.push({ who: me ?? "", body: c.body, pending: true });
+  if (open) at(open);
+  const notes: LineNote[] = [...threads.values()].map(({ spot, items }) => ({
+    path: spot.path,
+    side: spot.side,
+    line: spot.line,
+    node: (
+      <div className="review-thread">
+        {items.map((c, k) => (
+          <div key={k} className="review-thread-item small">
+            <strong>{c.who}</strong> {c.pending && <span className="pill">Pending</span>}
+            <Markdown source={c.body} />
+          </div>
+        ))}
+        {open && spotKey(open) === spotKey(spot) && (
+          <LineForm
+            pendingReview={pending.length > 0}
+            onCancel={() => setOpen(null)}
+            onSingle={async (body) => {
+              if (await onReview({ state: "commented", comments: [{ ...spot, body }] })) setOpen(null);
+            }}
+            onAdd={(body) => {
+              setPending((p) => [...p, { ...spot, body }]);
+              setOpen(null);
+            }}
+          />
+        )}
+      </div>
+    ),
+  }));
+  return (
+    <>
+      {reviewing && (
+        <ReviewPanel
+          pending={pending.length}
+          own={pr.author === me}
+          onSubmit={async (state, body) => {
+            const ok = await onReview({ state, body, comments: pending });
+            if (ok) setPending([]);
+            return ok;
+          }}
+        />
+      )}
+      <Diff patch={cmp.patch} stats={cmp.stats} cacheKey={spec} notes={notes} onLine={reviewing ? (path, side, line) => setOpen({ path, side, line }) : undefined} />
+    </>
+  );
+}
+
+function LineForm({
+  pendingReview,
+  onCancel,
+  onSingle,
+  onAdd,
+}: {
+  pendingReview: boolean;
+  onCancel: () => void;
+  onSingle: (body: string) => Promise<void>;
+  onAdd: (body: string) => void;
+}) {
+  const [text, setText] = useState("");
+  const body = text.trim();
+  return (
+    <div className="line-form">
+      <Editor value={text} onChange={setText} placeholder="Leave a comment" />
+      <div className="composer-actions">
+        <button type="button" className="btn" onClick={onCancel}>
+          Cancel
+        </button>
+        {!pendingReview && (
+          <button type="button" className="btn" disabled={!body} onClick={() => void onSingle(body)}>
+            Add single comment
+          </button>
+        )}
+        <button type="button" className="btn primary" disabled={!body} onClick={() => onAdd(body)}>
+          {pendingReview ? "Add review comment" : "Start a review"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** GitHub's "Review changes": a summary and Comment / Approve / Request changes. */
+function ReviewPanel({ pending, own, onSubmit }: { pending: number; own: boolean; onSubmit: (state: ReviewState, body: string) => Promise<boolean> }) {
+  const [openPanel, setOpenPanel] = useState(false);
+  const [text, setText] = useState("");
+  const [state, setState] = useState<ReviewState>("commented");
+  const [busy, setBusy] = useState(false);
+  const choices: [ReviewState, string, string][] = [
+    ["commented", "Comment", "Submit general feedback without explicit approval."],
+    ["approved", "Approve", "Submit feedback and approve merging these changes."],
+    ["changes_requested", "Request changes", "Submit feedback that must be addressed before merging."],
+  ];
+  return (
+    <div className="review-panel">
+      <button type="button" className="btn primary" onClick={() => setOpenPanel((o) => !o)} aria-expanded={openPanel}>
+        Review changes{pending > 0 && <span className="pill">{pending}</span>}
+      </button>
+      {openPanel && (
+        <div className="box review-pop">
+          <Editor value={text} onChange={setText} placeholder="Leave a comment" />
+          <div className="review-choices">
+            {choices.map(([v, label, help]) => (
+              <label key={v} className={own && v !== "commented" ? "muted" : ""}>
+                <input type="radio" name="review" value={v} checked={state === v} disabled={own && v !== "commented"} onChange={() => setState(v)} />
+                <span>
+                  <strong>{label}</strong>
+                  <span className="muted small"> {own && v !== "commented" ? "Pull request authors can't approve their own pull request." : help}</span>
+                </span>
+              </label>
+            ))}
+          </div>
+          <div className="composer-actions">
+            <button
+              type="button"
+              className="btn primary"
+              disabled={busy || (state !== "approved" && !text.trim() && pending === 0)}
+              onClick={async () => {
+                setBusy(true);
+                if (await onSubmit(state, text.trim())) {
+                  setText("");
+                  setOpenPanel(false);
+                }
+                setBusy(false);
+              }}
+            >
+              Submit review
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The review part of GitHub's merge box (merging itself arrives with slice 5). */
+function ReviewStatus({ full, n, decision }: { full: string; n: number; decision?: "approved" | "changes_requested" }) {
+  const [cls, title, text] =
+    decision === "approved"
+      ? ["approved", "Changes approved", "At least one reviewer approved these changes."]
+      : decision === "changes_requested"
+        ? ["changes", "Changes requested", "A reviewer requested changes; their next review can clear it."]
+        : ["", "Review requested", "No one has approved or requested changes yet."];
+  return (
+    <div className={`box review-status ${cls}`}>
+      <Icon d={decision === "approved" ? ICON.completed : ICON.comment} />
+      <div>
+        <strong>{title}</strong>
+        <div className="muted small">
+          {text} <Link to={`/${full}/pull/${n}/files`}>Review the changes →</Link>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function IssueHeader({ issue, canEdit, onTitle }: { issue: IssueDetail; canEdit: boolean; onTitle: (t: string) => Promise<boolean> }) {
@@ -466,12 +659,15 @@ const names = (v: string[]) =>
 function TimelineEntry({
   item: t,
   pull,
+  head,
   canEdit,
   onSave,
   onDelete,
 }: {
   item: TimelineItem;
   pull: boolean;
+  /** The PR's shown head: line comments on another commit are outdated. */
+  head?: string;
   canEdit: boolean;
   onSave: (body: string) => Promise<boolean>;
   onDelete: () => Promise<boolean>;
@@ -500,6 +696,41 @@ function TimelineEntry({
       return event(ICON.comment, <>{t.added.length > 0 && <>added {names(t.added)} </>}{t.removed.length > 0 && <>removed {names(t.removed)} </>}</>);
     case "assigned":
       return event(ICON.comment, <>{t.added.length > 0 && <>assigned {t.added.join(", ")} </>}{t.removed.length > 0 && <>unassigned {t.removed.join(", ")} </>}</>);
+    case "review": {
+      const verb = t.state === "approved" ? "approved these changes" : t.state === "changes_requested" ? "requested changes" : "reviewed";
+      const cls = t.state === "approved" ? "review-approved" : t.state === "changes_requested" ? "review-changes" : "";
+      return (
+        <div className="review-entry">
+          <div className={`timeline-event small ${cls}`}>
+            <Icon d={t.state === "approved" ? ICON.completed : ICON.comment} />
+            <strong>{t.actor}</strong> {verb}{" "}
+            <span className="muted" title={t.at}>
+              {relTime(t.at)}
+            </span>
+          </div>
+          {(t.body || t.comments.length > 0) && (
+            <div className="comment-box review-box">
+              {t.body && (
+                <div className="comment-body">
+                  <Markdown source={t.body} />
+                </div>
+              )}
+              {t.comments.map((c, k) => (
+                <div key={k} className="review-line">
+                  <div className="small">
+                    <code>
+                      {c.path}:{c.line}
+                    </code>{" "}
+                    {head && t.commit_oid !== head && <span className="pill">Outdated</span>}
+                  </div>
+                  <Markdown source={c.body} />
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    }
   }
 }
 

@@ -76,6 +76,8 @@ export interface Issue {
   /** Pull requests only: `head_ref` merges into `base_ref`. */
   base_ref?: string;
   head_ref?: string;
+  /** Pull requests: from each reviewer's latest approval or change request; absent = none. */
+  review_decision?: "approved" | "changes_requested";
 }
 /** One entry of an issue's timeline; `id` addresses a comment for edit/delete. */
 export type TimelineItem = { id: number; actor: string; at: string } & (
@@ -85,7 +87,16 @@ export type TimelineItem = { id: number; actor: string; at: string } & (
   | { type: "renamed"; from: string; to: string }
   | { type: "labeled"; added: string[]; removed: string[] }
   | { type: "assigned"; added: string[]; removed: string[] }
+  | { type: "review"; state: ReviewState; body: string; commit_oid: string; comments: LineComment[] }
 );
+export type ReviewState = "approved" | "changes_requested" | "commented";
+/** A review's comment on one line: `RIGHT` = the head's line, `LEFT` = the merge base's. */
+export interface LineComment {
+  path: string;
+  side: "LEFT" | "RIGHT";
+  line: number;
+  body: string;
+}
 export interface IssueDetail extends Issue {
   timeline: TimelineItem[];
 }
@@ -801,6 +812,10 @@ export class RepoClient {
     ...this.items<PullDetail>("pulls"),
     create: (pr: { title: string; body?: string; base: string; head: string }, opts?: CallOptions) =>
       this.client.json<PullDetail>(`${this.p}/pulls`, opts, jsonBody("POST", pr)),
+    /** Review the current head: approve (not your own), request changes or comment; line
+     * comments anchor to that head. */
+    review: (n: number, review: { state: ReviewState; body?: string; comments?: LineComment[] }, opts?: CallOptions) =>
+      this.client.json<PullDetail>(`${this.p}/pulls/${n}/reviews`, opts, jsonBody("POST", review)),
   };
 
   /** GitHub's three-dot compare: what merging `head` into `base` brings (branches, tags or shas). */

@@ -865,6 +865,31 @@ async fn pulls_api() -> TestResult {
         "issues and PRs share numbers"
     );
 
+    // Reviews: the author can't approve their own PR; a comment review anchors its line
+    // comments to the head it saw.
+    let (status, own) = post("/o/r/api/pulls/1/reviews", json!({"state": "approved"})).await?;
+    assert_eq!(status, 400, "{own}");
+    let (status, _) = post("/o/r/api/pulls/1/reviews", json!({"state": "commented"})).await?;
+    assert_eq!(status, 400, "an empty comment review says nothing");
+    let line =
+        json!({"path": "topic.txt", "side": "RIGHT", "line": 1, "body": "trailing newline?"});
+    let (status, pr) = post(
+        "/o/r/api/pulls/1/reviews",
+        json!({"state": "commented", "body": "one nit", "comments": [line]}),
+    )
+    .await?;
+    assert_eq!(status, 201, "{pr}");
+    let review = pr["timeline"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(
+        (review["type"].as_str(), review["commit_oid"].as_str()),
+        (Some("review"), Some(topic.as_str()))
+    );
+    assert_eq!(review["comments"][0]["path"], "topic.txt");
+    assert!(
+        pr.get("review_decision").is_none(),
+        "a comment review decides nothing"
+    );
+
     let pulls = json(&server, "/o/r/api/pulls").await?;
     assert_eq!(
         (

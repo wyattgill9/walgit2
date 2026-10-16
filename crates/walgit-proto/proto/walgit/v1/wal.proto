@@ -215,7 +215,26 @@ message ForgeEvent {
     ForgeStateChange state = 13;
     ForgeSetChange labels = 14;
     ForgeSetChange assignees = 15;
+    ForgeReview review = 16;
   }
+}
+
+// A pull request review; its line comments anchor to `commit_oid`.
+message ForgeReview {
+  // "approved" | "changes_requested" | "commented"
+  string state = 1;
+  string body = 2;
+  // The head the review looked at.
+  string commit_oid = 3;
+  repeated ForgeLineComment comments = 4;
+}
+
+message ForgeLineComment {
+  string path = 1;
+  // "RIGHT" (a line of the head) | "LEFT" (a line of the merge base).
+  string side = 2;
+  uint32 line = 3;
+  string body = 4;
 }
 
 enum ForgeKind {

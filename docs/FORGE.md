@@ -27,7 +27,7 @@ Forge state is a fold of events in the WAL. There is no other store.
 | 1 Issues: API, SDK, list/detail/new pages, labels, assignees; checkpointed `forge.pb` | done |
 | 2 Checkpointed state, recovery, benchmarks | — |
 | 3 Pull requests: compare, open, list, Conversation / Commits / Files changed, close and reopen | done |
-| 4 Reviews | — |
+| 4 Reviews: approve / request changes / comment, line comments from the diff, review decision | done |
 | 5 Merge (merge / squash / rebase) | — |
 
 ## Local rig: Garage
@@ -51,6 +51,10 @@ WALGIT_TEST_S3_EMULATE_CAS=1 WALGIT_TEST_S3_ENDPOINT=http://127.0.0.1:3900 \
   - Anonymous readers can't write.
   - The publisher checks every rule again on each CAS attempt. A refused request publishes
     nothing and answers 400 with the reason.
+- **Reviews** anchor their line comments to the head they saw. A comment on another head shows
+  as outdated in the conversation and is left out of the diff; there is no line remapping yet.
+  A pending review lives in the page until it is submitted, and is lost on reload; GitHub keeps
+  it on the server.
 - **One change, one entry.** "Close with comment" and a multi-field `PATCH` are each one entry.
 - **Direct import** refuses repositories that have issues. Its folded log would drop them.
 - **Deployment order.** A checkpoint written by a binary older than D50 would carry no

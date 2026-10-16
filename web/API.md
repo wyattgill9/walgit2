@@ -534,6 +534,14 @@ Commits and Files changed with `compare/{base_sha}...{head_sha}`.
 - `POST …/api/pulls` (`201`) `{title, body?, base, head}`: both branches must exist and
   differ; one open pull request per `head`→`base` (`400` otherwise). Anyone signed in.
 - Closing (`PATCH {state: "closed"}` or a comment with `close`) freezes the tips.
+- `POST …/api/pulls/{n}/reviews` (`201`) `{state: "approved"|"changes_requested"|"commented",
+  body?, comments?: [{path, side: "RIGHT"|"LEFT", line, body}]}` reviews the current head:
+  open pull requests only; the author may only comment; a comment or change request needs a
+  body or a line comment. Anyone signed in. The timeline gains
+  `{type: "review", state, body, commit_oid, comments}` (a line comment whose `commit_oid` is
+  not the shown head is outdated), and the pull request `review_decision`: each reviewer's
+  latest approval or change request, any change request winning (absent = none).
+  Search: `review:approved|changes_requested|none`.
 
 ### `GET /{owner}/{repo}/api/compare/{base}...{head}`
 

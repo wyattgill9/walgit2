@@ -54,8 +54,24 @@ pub struct Item {
     pub base_oid: String,
     #[serde(skip)]
     pub head_oid: String,
+    /// Pull requests: `approved` | `changes_requested` from each reviewer's latest deciding
+    /// review (any change request wins); empty when nobody decided.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub review_decision: String,
+    /// Reviewer → their latest deciding review state.
+    #[serde(skip)]
+    pub reviews: BTreeMap<String, String>,
     #[serde(skip)]
     pub timeline: Vec<TimelineItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LineComment {
+    pub path: String,
+    /// `RIGHT` (the head) | `LEFT` (the merge base).
+    pub side: String,
+    pub line: u32,
+    pub body: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -90,6 +106,12 @@ pub enum Timeline {
     Assigned {
         added: Vec<String>,
         removed: Vec<String>,
+    },
+    Review {
+        state: String,
+        body: String,
+        commit_oid: String,
+        comments: Vec<LineComment>,
     },
 }
 
@@ -218,6 +240,8 @@ impl ForgeState {
                     head_ref: o.head_ref.clone(),
                     base_oid: o.base_oid.clone(),
                     head_oid: o.head_oid.clone(),
+                    review_decision: String::new(),
+                    reviews: BTreeMap::new(),
                     timeline: Vec::new(),
                 },
             );
@@ -304,6 +328,34 @@ impl ForgeState {
             Body::Assignees(c) => {
                 let (added, removed) = change_set(&mut item.assignees, c);
                 Timeline::Assigned { added, removed }
+            }
+            Body::Review(r) => {
+                if r.state != "commented" {
+                    item.reviews.insert(ev.actor.clone(), r.state.clone());
+                    let states = || item.reviews.values();
+                    item.review_decision = if states().any(|s| s == "changes_requested") {
+                        "changes_requested".into()
+                    } else if states().any(|s| s == "approved") {
+                        "approved".into()
+                    } else {
+                        String::new()
+                    };
+                }
+                Timeline::Review {
+                    state: r.state.clone(),
+                    body: r.body.clone(),
+                    commit_oid: r.commit_oid.clone(),
+                    comments: r
+                        .comments
+                        .iter()
+                        .map(|c| LineComment {
+                            path: c.path.clone(),
+                            side: c.side.clone(),
+                            line: c.line,
+                            body: c.body.clone(),
+                        })
+                        .collect(),
+                }
             }
         };
         item.timeline.push(TimelineItem {
@@ -408,13 +460,14 @@ impl ForgeState {
                         return Err("only collaborators can change labels and assignees".into());
                     }
                 }
+                Body::Review(r) => verify_review(item, actor, r)?,
             }
         }
         Ok(())
     }
 
     /// GitHub-style search: `is:open|closed|issue|pr`, `author:`, `assignee:`, `label:` (repeat =
-    /// all of them), `sort:created-desc|created-asc|updated-desc|comments-desc`, free words matched
+    /// all of them), `review:approved|changes_requested|none`, `sort:created-desc|created-asc|updated-desc|comments-desc`, free words matched
     /// against title and body. `page` is 1-based.
     pub fn search(&self, query: &str, page: usize) -> SearchPage {
         let mut state = None;
@@ -423,6 +476,7 @@ impl ForgeState {
         let mut assignee = None;
         let mut labels = Vec::new();
         let mut sort = "created-desc";
+        let mut review = None;
         let mut words = Vec::new();
         let toks = tokens(query);
         for tok in &toks {
@@ -434,6 +488,7 @@ impl ForgeState {
                 Some(("assignee", v)) => assignee = Some(v),
                 Some(("label", v)) => labels.push(v),
                 Some(("sort", v)) => sort = v,
+                Some(("review", v)) => review = Some(if v == "none" { "" } else { v }),
                 _ => words.push(tok.to_lowercase()),
             }
         }
@@ -444,6 +499,7 @@ impl ForgeState {
             .filter(|i| author.is_none_or(|a| i.author == a))
             .filter(|i| assignee.is_none_or(|a| i.assignees.contains(a)))
             .filter(|i| labels.iter().all(|l| i.labels.contains(*l)))
+            .filter(|i| review.is_none_or(|r| i.review_decision == r))
             .filter(|i| {
                 words.iter().all(|w| {
                     i.title.to_lowercase().contains(w.as_str())
@@ -483,6 +539,44 @@ impl ForgeState {
             per_page: PER_PAGE,
         }
     }
+}
+
+/// GitHub's review rules: open pull requests only; an author may comment on their own but not
+/// approve it or request changes; a comment or change request says something.
+fn verify_review(
+    item: &Item,
+    actor: &Actor,
+    r: &walgit_proto::v1::ForgeReview,
+) -> Result<(), String> {
+    if item.kind != "pull" {
+        return Err("only pull requests are reviewed".into());
+    }
+    if item.state != "open" {
+        return Err(format!("#{} is closed", item.number));
+    }
+    match r.state.as_str() {
+        "approved" | "changes_requested" if item.author == actor.name => {
+            return Err("you can't approve or request changes on your own pull request".into());
+        }
+        "changes_requested" | "commented" if r.body.trim().is_empty() && r.comments.is_empty() => {
+            return Err("a review with no approval needs a comment".into());
+        }
+        "approved" | "changes_requested" | "commented" => {}
+        other => {
+            return Err(format!(
+                "review state {other:?} is not approved, changes_requested or commented"
+            ));
+        }
+    }
+    for c in &r.comments {
+        if c.path.is_empty() || c.line == 0 || !matches!(c.side.as_str(), "LEFT" | "RIGHT") {
+            return Err("a line comment needs a path, a line and a side (LEFT or RIGHT)".into());
+        }
+        if c.body.trim().is_empty() {
+            return Err("comment can't be blank".into());
+        }
+    }
+    Ok(())
 }
 
 /// Whitespace-separated tokens; double quotes group (`label:"good first issue"`).
@@ -730,6 +824,50 @@ mod tests {
             serde_json::to_string(&s.items.values().collect::<Vec<_>>()).ok()
         );
         assert_eq!(again.items[&1].timeline.len(), s.items[&1].timeline.len());
+    }
+
+    /// Each reviewer's latest deciding review counts; a change request wins; a later comment
+    /// review leaves a decision alone; reviews need an open pull request.
+    #[test]
+    fn review_decision() {
+        use walgit_proto::v1::ForgeReview;
+        let review = |who: &str, state: &str| {
+            ev(
+                1,
+                who,
+                forge_event::Body::Review(ForgeReview {
+                    state: state.into(),
+                    body: "b".into(),
+                    ..Default::default()
+                }),
+            )
+        };
+        let pr = forge_event::Body::Opened(ForgeOpened {
+            kind: ForgeKind::Pull as i32,
+            title: "t".into(),
+            base_ref: "main".into(),
+            head_ref: "topic".into(),
+            ..Default::default()
+        });
+        let mut s = ForgeState::default();
+        s.fold_entries(&[entry(1, vec![ev(1, "alice", pr)])]);
+        let bob = Actor {
+            name: "bob".into(),
+            write: false,
+        };
+        assert!(s.verify(&bob, &[review("bob", "approved")]).is_ok());
+        assert!(s.verify(&bob, &[review("bob", "merged")]).is_err());
+        let decision = |s: &ForgeState| s.items[&1].review_decision.clone();
+        s.fold_entries(&[entry(2, vec![review("bob", "approved")])]);
+        assert_eq!(decision(&s), "approved");
+        s.fold_entries(&[entry(3, vec![review("carol", "changes_requested")])]);
+        assert_eq!(decision(&s), "changes_requested");
+        s.fold_entries(&[entry(4, vec![review("carol", "commented")])]);
+        assert_eq!(decision(&s), "changes_requested");
+        s.fold_entries(&[entry(5, vec![review("carol", "approved")])]);
+        assert_eq!(decision(&s), "approved");
+        assert_eq!(s.search("is:pr review:approved", 1).items.len(), 1);
+        assert_eq!(s.search("is:pr review:none", 1).items.len(), 0);
     }
 
     #[test]

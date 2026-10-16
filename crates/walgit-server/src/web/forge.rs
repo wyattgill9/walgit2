@@ -14,8 +14,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use walgit_proto::v1::{
-    ForgeComment, ForgeEdit, ForgeEvent, ForgeKind, ForgeOpened, ForgeSetChange, ForgeStateChange,
-    forge_edit, forge_event::Body,
+    ForgeComment, ForgeEdit, ForgeEvent, ForgeKind, ForgeLineComment, ForgeOpened, ForgeReview,
+    ForgeSetChange, ForgeStateChange, forge_edit, forge_event::Body,
 };
 use walgit_wal::RepoHandle;
 use walgit_wal::forge::{Actor, Item, SearchPage, TimelineItem};
@@ -30,7 +30,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         r = routes::<false>(r, &format!("{base}/issues"))
             .route(&format!("{base}/issues"), post(create_issue));
         r = routes::<true>(r, &format!("{base}/pulls"))
-            .route(&format!("{base}/pulls"), post(create_pull));
+            .route(&format!("{base}/pulls"), post(create_pull))
+            .route(&format!("{base}/pulls/{{number}}/reviews"), post(review));
     }
     r.with_state(state)
 }
@@ -116,6 +117,25 @@ struct NewComment {
 
 #[derive(Deserialize)]
 struct CommentPatch {
+    body: String,
+}
+
+#[derive(Deserialize)]
+struct NewReview {
+    /// `approved` | `changes_requested` | `commented`
+    state: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    comments: Vec<NewLineComment>,
+}
+
+#[derive(Deserialize)]
+struct NewLineComment {
+    path: String,
+    /// `RIGHT` (the head) | `LEFT` (the merge base)
+    side: String,
+    line: u32,
     body: String,
 }
 
@@ -446,4 +466,39 @@ async fn delete_comment<const PULL: bool>(
     );
     let (handle, _) = publish(&st, &headers, &owner, &repo, vec![ev]).await?;
     Ok(Json(detail_of(&handle, number, PULL)?).into_response())
+}
+
+/// A review of the pull request's current head (its line comments anchor there).
+async fn review(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo, number)): Path<(String, String, u64)>,
+    Json(r): Json<NewReview>,
+) -> Result<Response, ApiError> {
+    let handle = synced(&st, &headers, &owner, &repo).await?;
+    let item = handle
+        .forge_read(|s| s.items.get(&number).cloned())
+        .ok_or_else(|| ApiError::NotFound(format!("pull #{number}")))?;
+    let (_, commit_oid) = tips(&handle, &item);
+    let comments = r
+        .comments
+        .into_iter()
+        .map(|c| ForgeLineComment {
+            path: c.path,
+            side: c.side,
+            line: c.line,
+            body: c.body,
+        })
+        .collect();
+    let ev = event(
+        number,
+        Body::Review(ForgeReview {
+            state: r.state,
+            body: r.body,
+            commit_oid,
+            comments,
+        }),
+    );
+    let (handle, _) = publish(&st, &headers, &owner, &repo, vec![ev]).await?;
+    Ok((StatusCode::CREATED, Json(detail_of(&handle, number, true)?)).into_response())
 }
