@@ -897,8 +897,8 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
                     handle.manifest_version.lock().take();
                 }
             }
-            // D50: our entries follow whatever the catch-up above folded.
-            handle.forge_fold(&entries.iter().collect::<Vec<_>>());
+            // D50: our entries are every committed entry after this attempt's basis.
+            handle.forge_fold(head_seq, &entries.iter().collect::<Vec<_>>());
             sweep_burned(&handle.store, &slot)
                 .instrument(span.clone())
                 .await;

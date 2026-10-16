@@ -2567,3 +2567,276 @@ async fn checkpoint_retry_never_regresses_a_newer_checkpoint() -> Result<()> {
     check_truth(&c, std::slice::from_ref(&p)).await?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// D50 forge: issues/PRs as WAL events under faults
+// ---------------------------------------------------------------------------
+
+fn forge_open(title: &str) -> walgit_proto::v1::ForgeEvent {
+    walgit_proto::v1::ForgeEvent {
+        number: 0,
+        actor: String::new(),
+        body: Some(walgit_proto::v1::forge_event::Body::Opened(
+            walgit_proto::v1::ForgeOpened {
+                kind: walgit_proto::v1::ForgeKind::Issue as i32,
+                title: title.into(),
+                ..Default::default()
+            },
+        )),
+    }
+}
+
+fn forge_comment(number: u64, body: &str) -> walgit_proto::v1::ForgeEvent {
+    walgit_proto::v1::ForgeEvent {
+        number,
+        actor: String::new(),
+        body: Some(walgit_proto::v1::forge_event::Body::Comment(
+            walgit_proto::v1::ForgeComment { body: body.into() },
+        )),
+    }
+}
+
+fn forge_actor() -> walgit_wal::forge::Actor {
+    walgit_wal::forge::Actor {
+        name: "sim".into(),
+        write: true,
+    }
+}
+
+/// The folded state as JSON (items + timelines), for equality between two folds.
+fn forge_json(h: &RepoHandle) -> String {
+    h.forge_read(|s| {
+        let items: Vec<_> = s
+            .items
+            .values()
+            .map(|i| (i.clone(), i.timeline.clone()))
+            .collect();
+        serde_json::to_string(&items).unwrap_or_default()
+    })
+}
+
+/// Safety: three instances open issues and comment under chaos on every link, with
+/// checkpoints (which fold the forge history) racing them. Liveness: heal, and demand that
+/// a cold instance sees every acknowledged write exactly once, numbers 1..=N without holes
+/// or repeats, the truth's allocator agreeing, and the checkpoint + tail fold matching the
+/// incremental fold of a long-lived instance byte for byte.
+async fn run_forge_under_faults(seed: u64) -> Result<()> {
+    let c = Cluster::new(seed, 3).await?;
+    let mut rng = Lcg(seed);
+    // Handles first (opening is not what is under test), then chaos on every link.
+    let mut handles = Vec::new();
+    for i in &c.instances {
+        handles.push(i.open(&c.id).await?);
+    }
+    for i in &c.instances {
+        i.link.set(FaultPlan::chaos(0.08));
+    }
+    let mut acked_titles = Vec::new();
+    let mut acked_comments = Vec::new();
+    let mut attempted = 0u32;
+    for round in 0..pushes_per_pusher() {
+        let mut work = Vec::new();
+        for (k, h) in handles.iter().enumerate() {
+            let h = h.clone();
+            let title = format!("i{k}-r{round}");
+            let comment_on = rng.below(4);
+            let body = format!("c{k}-r{round}");
+            work.push(async move {
+                let opened = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    h.publish_forge(forge_actor(), vec![forge_open(&title)]),
+                )
+                .await;
+                // Comment on an early issue (it may not exist yet: then it is refused).
+                let commented = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    h.publish_forge(forge_actor(), vec![forge_comment(comment_on + 1, &body)]),
+                )
+                .await;
+                (title, opened, body, commented)
+            });
+        }
+        for (title, opened, body, commented) in futures::future::join_all(work).await {
+            attempted += 2;
+            if matches!(opened, Ok(Ok(_))) {
+                acked_titles.push(title);
+            }
+            if matches!(commented, Ok(Ok(_))) {
+                acked_comments.push(body);
+            }
+        }
+        if rng.chance(0.4) {
+            let h = handles[rng.below_usize(3)].clone();
+            let _ = tokio::time::timeout(Duration::from_secs(10), h.write_checkpoint()).await;
+        }
+    }
+    for i in &c.instances {
+        i.link.heal();
+    }
+    eprintln!(
+        "seed {seed}: {} issues and {} comments acked of {attempted} attempts",
+        acked_titles.len(),
+        acked_comments.len()
+    );
+    ensure!(!acked_titles.is_empty(), "nothing acked under chaos 0.08");
+
+    // A final healthy write and a checkpoint, so the cold read crosses forge.pb + a tail.
+    let survivor = c.instances[0].open(&c.id).await?;
+    survivor.write_checkpoint().await?;
+    survivor
+        .publish_forge(forge_actor(), vec![forge_open("after the checkpoint")])
+        .await?;
+    acked_titles.push("after the checkpoint".into());
+
+    let obs = c.observer();
+    let cold = obs.open(&c.id).await?;
+    drop(cold.sync_refs().await?);
+    cold.forge_ensure().await?;
+    let (titles, numbers, comments) = cold.forge_read(|s| {
+        let titles: Vec<String> = s.items.values().map(|i| i.title.clone()).collect();
+        let numbers: Vec<u64> = s.items.keys().copied().collect();
+        let comments: Vec<String> = s
+            .items
+            .values()
+            .flat_map(|i| i.timeline.iter())
+            .filter_map(|t| match &t.event {
+                walgit_wal::forge::Timeline::Comment { body, .. } => Some(body.clone()),
+                _ => None,
+            })
+            .collect();
+        (titles, numbers, comments)
+    });
+    let count = |v: &[String], x: &str| v.iter().filter(|t| *t == x).count();
+    for t in &acked_titles {
+        ensure!(
+            count(&titles, t) == 1,
+            "acked issue {t:?} appears {} times",
+            count(&titles, t)
+        );
+    }
+    for b in &acked_comments {
+        ensure!(
+            count(&comments, b) == 1,
+            "acked comment {b:?} appears {} times",
+            count(&comments, b)
+        );
+    }
+    for t in &titles {
+        ensure!(count(&titles, t) == 1, "issue {t:?} landed twice");
+    }
+    let n = numbers.len() as u64;
+    ensure!(
+        numbers == (1..=n).collect::<Vec<_>>(),
+        "numbers have holes or repeats: {numbers:?}"
+    );
+    let truth = c.truth_manifest().await?;
+    ensure!(
+        truth.forge_next_number == n + 1,
+        "truth allocator {} != {}",
+        truth.forge_next_number,
+        n + 1
+    );
+
+    drop(survivor.sync_refs().await?);
+    survivor.forge_ensure().await?;
+    ensure!(
+        forge_json(&cold) == forge_json(&survivor),
+        "checkpoint + tail fold differs from the incremental fold"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sim_forge_under_faults() {
+    for seed in seeds() {
+        if let Err(e) = run_forge_under_faults(seed).await {
+            panic!("seed {seed}: {e:#}");
+        }
+    }
+}
+
+/// A forge write whose manifest CAS response is lost: it lands or it doesn't, never twice,
+/// and the writer and a cold reader agree afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn liveness_forge_after_a_lost_cas_response() -> Result<()> {
+    let c = Cluster::new(15, 1).await?;
+    let h = c.instances[0].open(&c.id).await?;
+    h.publish_forge(forge_actor(), vec![forge_open("before")])
+        .await?;
+    c.instances[0].link.set(
+        FaultPlan {
+            p_err_after: 1.0,
+            ..Default::default()
+        }
+        .with_only(&["manifest.pb"]),
+    );
+    let lost = h
+        .publish_forge(forge_actor(), vec![forge_open("lost reply")])
+        .await;
+    eprintln!("forge write with a lost CAS reply: {lost:?}");
+    c.instances[0].link.heal();
+    h.publish_forge(forge_actor(), vec![forge_open("after")])
+        .await?;
+    let obs = c.observer();
+    let cold = obs.open(&c.id).await?;
+    drop(cold.sync_refs().await?);
+    cold.forge_ensure().await?;
+    let titles: Vec<String> =
+        cold.forge_read(|s| s.items.values().map(|i| i.title.clone()).collect());
+    ensure!(titles.first().map(String::as_str) == Some("before"));
+    ensure!(titles.last().map(String::as_str) == Some("after"));
+    ensure!(
+        titles.iter().filter(|t| *t == "lost reply").count() <= 1,
+        "a lost reply duplicated the write: {titles:?}"
+    );
+    if lost.is_ok() {
+        ensure!(
+            titles.contains(&"lost reply".to_string()),
+            "acked but missing: {titles:?}"
+        );
+    }
+    drop(h.sync_refs().await?);
+    h.forge_ensure().await?;
+    ensure!(
+        forge_json(&cold) == forge_json(&h),
+        "writer and cold reader disagree"
+    );
+    Ok(())
+}
+
+/// docs/ROUNDTRIPS.md "Forge publish / read": a warm forge write is the freshness GET, the log
+/// PUT and the manifest CAS; a warm forge read is the freshness GET (the fold rides on what
+/// the sync fetched); a checkpoint of a forge repository adds one immutable PUT in the same
+/// round as its other PUTs.
+#[tokio::test]
+async fn forge_request_round_trip_budgets() -> Result<()> {
+    let c = Cluster::new(23, 1).await?;
+    let ops = || c.instances[0].link.stats().ops.load(Ordering::Relaxed);
+    let h = c.instances[0].open(&c.id).await?;
+    h.publish_forge(forge_actor(), vec![forge_open("warm-up")])
+        .await?;
+    drop(h.sync_refs().await?);
+    h.forge_ensure().await?;
+
+    let before = ops();
+    h.publish_forge(forge_actor(), vec![forge_comment(1, "budget")])
+        .await?;
+    let write = ops() - before;
+    ensure!(write <= 3, "forge write used {write} requests, budget 3");
+
+    let before = ops();
+    drop(h.sync_refs().await?);
+    h.forge_ensure().await?;
+    let read = ops() - before;
+    ensure!(read <= 1, "warm forge read used {read} requests, budget 1");
+
+    let before = ops();
+    h.write_checkpoint().await?;
+    let cp = ops() - before;
+    ensure!(
+        cp <= 5,
+        "forge checkpoint used {cp} requests, budget 5 (4 + forge.pb)"
+    );
+    eprintln!("forge request counts: write={write}, warm_read={read}, checkpoint={cp}");
+    Ok(())
+}

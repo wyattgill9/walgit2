@@ -25,7 +25,7 @@ Forge state is a fold of events in the WAL. There is no other store.
 |---|---|
 | 0 Groundwork (Garage CAS emulation, S3 checksums, D50) | done |
 | 1 Issues: API, SDK, list/detail/new pages, labels, assignees; checkpointed `forge.pb` | done |
-| 2 Checkpointed state, recovery, benchmarks | — |
+| 2 Checkpointed state, recovery sims, request budgets, benchmarks | done |
 | 3 Pull requests: compare, open, list, Conversation / Commits / Files changed, close and reopen | done |
 | 4 Reviews: approve / request changes / comment, line comments from the diff, review decision | done |
 | 5 Merge (merge / squash / rebase), mergeability, closing keywords, delete branch | done |
@@ -66,11 +66,60 @@ WALGIT_TEST_S3_EMULATE_CAS=1 WALGIT_TEST_S3_ENDPOINT=http://127.0.0.1:3900 \
 - **Deployment order.** A checkpoint written by a binary older than D50 would carry no
   `forge_key`. Stop older writers before using the forge (D43's rule).
 
+## Recovery
+
+`cargo test -p walgit-server --test sim forge` (seeds as for every sim: `WALGIT_SIM_SEED[S]`):
+
+- **`sim_forge_under_faults`.** Three instances open issues and comment while every store link
+  injects faults at 8%: errors before and after, CAS failures, stale reads and truncation.
+  Checkpoints race the writes. After healing, a cold instance has to show:
+  - every acknowledged issue and comment exactly once, and nothing twice;
+  - issue numbers `1..=N` with no hole or repeat;
+  - the bucket's `forge_next_number` equal to N + 1;
+  - a `forge.pb` + tail fold byte-identical to a long-lived instance's incremental fold.
+- **`liveness_forge_after_a_lost_cas_response`.** A write whose CAS reply is lost lands at most
+  once, and the writer and a cold reader agree.
+- **`test_forge_push_is_all_or_nothing`** (WAL). A refused event keeps the ref unchanged, and a
+  refused ref keeps the event out.
+
+Found by the fault sim: committed seqs can skip, because a crash between the log PUT and the CAS
+leaves an orphaned slot that the next writer steps over. The fold used to require
+`seq == state + 1`, and stopped for good at the first hole. It now trusts the caller's range
+(every committed entry in `(after, last]`) instead.
+
 ## Measurements
 
-Benchmarks are not in yet; they come with slice 2. Checked so far on Garage, one instance with
-`emulate_conditional_writes`, and checkpoints every 8 entries:
-- 32 concurrent comments plus a concurrent `git push`: all 32 present exactly once, and the push
-  landed.
-- `kill -9`, then a cold start on an empty cache directory: identical issue list and timeline,
-  read from `forge.pb` plus the log tail.
+**Store requests** (`forge_request_round_trip_budgets`, asserted): a warm write takes 3
+requests (freshness GET, log PUT, manifest CAS); a warm read takes 1; a checkpoint of a forge
+repository takes 5 (4 + `forge.pb`).
+
+**Scale**, in-process: `cargo test -p walgit-wal --release --lib forge::tests::bench_scale --
+--ignored --nocapture`. Each issue has 5 comments, and a third have a label; the log is about
+75 B per event.
+
+| Issues (events) | Fold | `is:open` | Text search | `forge.pb` | Encode | Cold rebuild |
+|---|---|---|---|---|---|---|
+| 1k (6k) | 2 ms | 0.05 ms | 0.1 ms | 0.5 MiB | 2 ms | 3 ms |
+| 10k (63k) | 23 ms | 0.4 ms | 1.5 ms | 4.7 MiB | 18 ms | 35 ms |
+| 100k (633k) | 228 ms | 4.5 ms | 16 ms | 48 MiB | 173 ms | 371 ms |
+
+Linear-scan search holds at 100k, so no index is needed yet. The cost that grows is storage:
+every checkpoint rewrites the whole `forge.pb` (48 MiB at 100k issues, about once per 256
+entries). Sharding `forge.pb` (rewrite only the shards that changed) is the next step if a
+repository gets near that size.
+
+**HTTP** (`tests/forge-bench.sh <repo-url>`): Garage on the same machine, one instance with
+`emulate_conditional_writes`, release build, 2026-10-16:
+
+| Load | Throughput | p50 | p99 |
+|---|---|---|---|
+| Sequential comments | — | 3.2 ms | 5.0 ms |
+| 1 writer | 147 writes/s | 2.8 ms | 3.5 ms |
+| 8 writers | 546 writes/s | 10.9 ms | 13.1 ms |
+| 32 writers | 1,280 writes/s | 14.2 ms | 21.7 ms |
+| List issues | — | 1.2 ms | 1.5 ms |
+
+Group commit is what scales throughput: concurrent writes share one CAS. All 338 comments landed
+exactly once. On real S3, add about 60–80 ms per round trip (a write is 3 rounds). Earlier on
+Garage, 32 concurrent comments plus a `git push`, then `kill -9` and a cold start on an empty
+cache, reproduced the same issues and timelines.

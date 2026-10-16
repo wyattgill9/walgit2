@@ -192,13 +192,20 @@ impl ForgeState {
 
     /// Advances over contiguous entries after `self.seq`; stops at a gap (the next
     /// `forge_ensure` catches up from the log).
-    pub(crate) fn fold_entries<'a>(&mut self, entries: impl IntoIterator<Item = &'a LogEntry>) {
+    /// `entries` are every committed entry in (`after`, last]. Committed seqs can skip (an
+    /// orphaned log slot is never reused), so completeness is the caller's range, not `seq + 1`.
+    /// A state behind `after` missed entries and stays where it is (`forge_ensure` catches up).
+    pub(crate) fn fold_entries<'a>(
+        &mut self,
+        after: u64,
+        entries: impl IntoIterator<Item = &'a LogEntry>,
+    ) {
+        if self.seq < after {
+            return;
+        }
         for e in entries {
             if e.seq <= self.seq {
                 continue;
-            }
-            if e.seq != self.seq + 1 {
-                break;
             }
             if !e.forge.is_empty() {
                 self.apply_record(ForgeRecord {
@@ -684,7 +691,7 @@ impl RepoHandle {
             *guard = Some(state);
         }
         if let Some(state) = guard.as_mut() {
-            state.fold_entries(&entries);
+            state.fold_entries(from, &entries);
         }
         Ok(())
     }
@@ -698,9 +705,9 @@ impl RepoHandle {
     }
 
     /// Folds entries the sync or the publisher just applied (no-op until loaded).
-    pub(crate) fn forge_fold(&self, entries: &[&LogEntry]) {
+    pub(crate) fn forge_fold(&self, after: u64, entries: &[&LogEntry]) {
         if let Some(state) = self.forge.lock().as_mut() {
-            state.fold_entries(entries.iter().copied());
+            state.fold_entries(after, entries.iter().copied());
         }
     }
 
@@ -819,11 +826,14 @@ mod tests {
                 body: "same here".into(),
             }),
         );
-        s.fold_entries(&[
-            entry(1, first),
-            entry(2, Vec::new()),
-            entry(3, vec![comment]),
-        ]);
+        s.fold_entries(
+            0,
+            &[
+                entry(1, first),
+                entry(2, Vec::new()),
+                entry(3, vec![comment]),
+            ],
+        );
         assert_eq!((s.seq, s.items.len()), (3, 2));
         assert_eq!(s.opened_at(1), Some(1));
 
@@ -841,7 +851,7 @@ mod tests {
         };
         assert!(s.verify(&bob, &[close(1)]).is_err());
         assert!(s.verify(&alice, &[close(1)]).is_ok());
-        s.fold_entries(&[entry(4, vec![close(1)])]);
+        s.fold_entries(3, &[entry(4, vec![close(1)])]);
         assert!(s.verify(&alice, &[close(1)]).is_err());
 
         // bob edits his own comment but not alice's title.
@@ -857,10 +867,12 @@ mod tests {
         });
         assert!(s.verify(&bob, &[ev(1, "bob", retitle)]).is_err());
 
-        // A gap stops the fold; nothing after it is applied.
-        s.fold_entries(&[entry(6, vec![ev(1, "bob", edit.clone())])]);
+        // Entries after a later bound than the state's are refused: it missed some.
+        s.fold_entries(5, &[entry(6, vec![ev(1, "bob", edit.clone())])]);
         assert_eq!(s.seq, 4);
-        s.fold_entries(&[entry(5, Vec::new()), entry(6, vec![ev(1, "bob", edit)])]);
+        // Committed seqs skip an orphaned slot (5): a complete range folds across the hole.
+        s.fold_entries(4, &[entry(6, vec![ev(1, "bob", edit)])]);
+        assert_eq!(s.seq, 6);
         assert!(matches!(
             &s.items[&1].timeline[0].event,
             Timeline::Comment { body, edited: true, .. } if body == "+1"
@@ -909,7 +921,7 @@ mod tests {
             ..Default::default()
         });
         let mut s = ForgeState::default();
-        s.fold_entries(&[entry(1, vec![ev(1, "alice", pr)])]);
+        s.fold_entries(0, &[entry(1, vec![ev(1, "alice", pr)])]);
         let bob = Actor {
             name: "bob".into(),
             write: false,
@@ -917,16 +929,94 @@ mod tests {
         assert!(s.verify(&bob, &[review("bob", "approved")]).is_ok());
         assert!(s.verify(&bob, &[review("bob", "merged")]).is_err());
         let decision = |s: &ForgeState| s.items[&1].review_decision.clone();
-        s.fold_entries(&[entry(2, vec![review("bob", "approved")])]);
+        s.fold_entries(1, &[entry(2, vec![review("bob", "approved")])]);
         assert_eq!(decision(&s), "approved");
-        s.fold_entries(&[entry(3, vec![review("carol", "changes_requested")])]);
+        s.fold_entries(2, &[entry(3, vec![review("carol", "changes_requested")])]);
         assert_eq!(decision(&s), "changes_requested");
-        s.fold_entries(&[entry(4, vec![review("carol", "commented")])]);
+        s.fold_entries(3, &[entry(4, vec![review("carol", "commented")])]);
         assert_eq!(decision(&s), "changes_requested");
-        s.fold_entries(&[entry(5, vec![review("carol", "approved")])]);
+        s.fold_entries(4, &[entry(5, vec![review("carol", "approved")])]);
         assert_eq!(decision(&s), "approved");
         assert_eq!(s.search("is:pr review:approved", 1).items.len(), 1);
         assert_eq!(s.search("is:pr review:none", 1).items.len(), 0);
+    }
+
+    /// Scale: fold, query, checkpoint size and cold rebuild at 1k/10k/100k issues with five
+    /// comments each (docs/FORGE.md "Measurements"). `cargo test -p walgit-wal --release --lib
+    /// forge::tests::bench_scale -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_scale() {
+        use std::time::Instant;
+        for n in [1_000u64, 10_000, 100_000] {
+            let mut entries = Vec::new();
+            let mut seq = 0;
+            let mut next = || {
+                seq += 1;
+                seq
+            };
+            for k in 1..=n {
+                let mut open = vec![ev(
+                    0,
+                    &format!("user{}", k % 50),
+                    opened(&format!("Crash {k} on push to main")),
+                )];
+                ForgeState::number(&mut open, k);
+                entries.push(entry(next(), open));
+                for c in 0..5 {
+                    let body = forge_event::Body::Comment(ForgeComment {
+                        body: format!(
+                            "comment {c} on {k}: steps to reproduce, logs, and a stack trace"
+                        ),
+                    });
+                    entries.push(entry(next(), vec![ev(k, "reviewer", body)]));
+                }
+                if k % 3 == 0 {
+                    let labels = forge_event::Body::Labels(walgit_proto::v1::ForgeSetChange {
+                        add: vec!["bug".into()],
+                        remove: Vec::new(),
+                    });
+                    entries.push(entry(next(), vec![ev(k, "maint", labels)]));
+                }
+            }
+            let log_bytes: usize = entries.iter().map(prost::Message::encoded_len).sum();
+            let t = Instant::now();
+            let mut s = ForgeState::default();
+            s.fold_entries(0, &entries);
+            let fold = t.elapsed();
+            let mut q = Vec::new();
+            for query in [
+                "is:open",
+                "is:open label:bug",
+                "crash 4242",
+                "sort:updated-desc author:user7",
+            ] {
+                let t = Instant::now();
+                let page = s.search(query, 1);
+                q.push(format!(
+                    "{query:?} {:.1?} ({} open)",
+                    t.elapsed(),
+                    page.open_count
+                ));
+            }
+            let t = Instant::now();
+            let bytes = s.history_upto(s.seq).encode_to_vec();
+            let encode = t.elapsed();
+            let t = Instant::now();
+            let again = ForgeState::from_history(
+                ForgeHistory::decode(bytes.as_slice()).unwrap_or_default(),
+            );
+            let rebuild = t.elapsed();
+            assert_eq!(again.items.len() as u64, n);
+            println!(
+                "{n} issues, {} events: log {} KiB ({} B/event), fold {fold:.1?}, forge.pb {} KiB encode {encode:.1?} cold rebuild {rebuild:.1?}\n  {}",
+                entries.len(),
+                log_bytes / 1024,
+                log_bytes / entries.len(),
+                bytes.len() / 1024,
+                q.join("\n  ")
+            );
+        }
     }
 
     #[test]
