@@ -3122,3 +3122,69 @@ async fn test_forge_numbers_preconditions_and_checkpoint_cold_start() {
         assert_eq!(s.items[&2].comments, 1);
     });
 }
+
+/// A ref change and forge events in one entry land together or not at all: a refused event
+/// keeps the ref where it was, a refused ref keeps the event out.
+#[tokio::test]
+async fn test_forge_push_is_all_or_nothing() {
+    use walgit_wal::forge::Actor;
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let registry = Registry::new(store.clone(), Arc::new(make_config(cache.path(), 0)));
+    let handle = registry
+        .create(&repo_id("test", "forge-push"), ObjectFormat::Sha1)
+        .await
+        .unwrap();
+    let work = WorkRepo::new();
+    let c1 = work.commit("init", "a");
+    let pack = ingest_pack_data(&handle, work.create_pack()).await;
+    handle
+        .publish_push(
+            pack,
+            make_txn(vec![("refs/heads/main", "", &c1)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let writer = Actor {
+        name: "w".into(),
+        write: true,
+    };
+    handle
+        .publish_forge(writer.clone(), vec![forge_issue("tracked")])
+        .await
+        .unwrap();
+    let c2 = work.commit("next", "b");
+    let pack2 = ingest_pack_data(&handle, work.create_pack()).await;
+
+    // The event is refused (#9 does not exist): main stays at c1.
+    let r = handle
+        .publish_forge_push(
+            writer.clone(),
+            vec![forge_close(9)],
+            pack2,
+            make_txn(vec![("refs/heads/main", &c1, &c2)]),
+        )
+        .await
+        .unwrap();
+    assert!(r.forge_error.is_some() && r.seq == 0);
+    drop(handle.sync_refs().await.unwrap());
+    assert_eq!(
+        handle.local().ref_view().unwrap().get("refs/heads/main"),
+        Some(c1.clone())
+    );
+
+    // The ref is refused (stale old value): issue #1 stays open.
+    let r = handle
+        .publish_forge_push(
+            writer,
+            vec![forge_close(1)],
+            None,
+            make_txn(vec![("refs/heads/main", &c2, &c1)]),
+        )
+        .await
+        .unwrap();
+    assert!(r.seq == 0 && r.per_ref.iter().any(|(_, x)| x.is_err()));
+    handle.forge_ensure().await.unwrap();
+    assert_eq!(handle.forge_read(|s| s.items[&1].state), "open");
+}

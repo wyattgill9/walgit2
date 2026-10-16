@@ -542,6 +542,21 @@ Commits and Files changed with `compare/{base_sha}...{head_sha}`.
   not the shown head is outdated), and the pull request `review_decision`: each reviewer's
   latest approval or change request, any change request winning (absent = none).
   Search: `review:approved|changes_requested|none`.
+- `GET …/api/pulls/{n}/merge` — `{mergeable, up_to_date, conflicts: [path], base_sha, head_sha}`
+  for the branches' current tips (`merge-tree` in a scratch object directory). Needs the packs
+  on the answering host (`503` otherwise).
+- `POST …/api/pulls/{n}/merge` `{method?: "merge"|"squash"|"rebase", sha?, message?}` — write
+  access, and the repository's push policy must allow the principal to move the base branch.
+  `merge` commits with parents (base, head); `squash` one commit on the base; `rebase` replays
+  each commit (author and message kept). `message` defaults to GitHub's (`Merge pull request
+  #n from <head>\n\n<title>`; squash `<title> (#n)\n\n<body>`). One WAL entry moves the base
+  branch, marks the pull request merged (`merged: true`, `merge_commit`, timeline
+  `{type: "merged", method, commit}`, base and head tips frozen) and closes the open issues its
+  body names with GitHub's keywords (`Fixes #n`, `closes`, `resolves`, …). `sha` that is not
+  the head's tip, conflicts, or a base that moved meanwhile: `409`. A merged pull request
+  can't be reopened. Search: `is:merged|unmerged`.
+- `DELETE …/api/pulls/{n}/branch` — "Delete branch" for a closed or merged pull request (write
+  access, push policy).
 
 ### `GET /{owner}/{repo}/api/compare/{base}...{head}`
 

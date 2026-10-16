@@ -1043,17 +1043,20 @@ impl RepoHandle {
         .await
     }
 
-    /// D50: one FORGE entry (see `forge.rs::publish_forge`).
+    /// D50: forge events, alone (a FORGE entry) or with a ref change and its pack (one PUSH
+    /// entry, e.g. a merge). See `forge.rs::publish_forge`.
     pub(crate) async fn enqueue_forge(
         &self,
         actor: crate::forge::Actor,
         forge: Vec<walgit_proto::v1::ForgeEvent>,
+        pack: Option<walgit_git::IngestedPack>,
+        txn: walgit_proto::v1::RefTransaction,
     ) -> Result<PublishResult, WalError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.send_publish(
             PublishRequest {
-                pack: None,
-                txn: walgit_proto::v1::RefTransaction::default(),
+                pack,
+                txn,
                 meta: HashMap::new(),
                 synced: false,
                 created_at: None,

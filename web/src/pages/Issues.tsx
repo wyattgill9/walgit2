@@ -1,6 +1,6 @@
 import { Suspense, useState, useTransition, type ReactNode } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { api, type Issue, type IssueDetail, type LineComment, type PullDetail, type ReviewState, type TimelineItem } from "../api";
+import { api, type Issue, type IssueDetail, type LineComment, type MergeMethod, type PullDetail, type ReviewState, type TimelineItem } from "../api";
 import { useRepo } from "./RepoLayout";
 import { invalidate, reportError, useData } from "../data";
 import { Box } from "../components/Layout";
@@ -11,8 +11,11 @@ import { Pager } from "./BranchesPage";
 import { Diff, type LineNote } from "./CommitPage";
 import { relTime } from "../format";
 
-// Octicons (MIT): issue-opened, issue-closed, circle-slash (not planned), comment, git-pull-request.
+// Octicons (MIT): issue-opened, issue-closed, circle-slash (not planned), comment,
+// git-pull-request, git-merge.
 const ICON = {
+  merged:
+    "M5.45 5.154A4.25 4.25 0 0 0 9.25 7.5h1.378a2.251 2.251 0 1 1 0 1.5H9.25A5.734 5.734 0 0 1 5 7.123v3.505a2.25 2.25 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.95-.218ZM4.25 13.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Zm8.5-4.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5ZM5 3.25a.75.75 0 1 0 0 .005V3.25Z",
   pull: "M1.5 3.25a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 1.5 3.25Zm5.677-.177L9.573.677A.25.25 0 0 1 10 .854V2.5h1A2.5 2.5 0 0 1 13.5 5v5.628a2.251 2.251 0 1 1-1.5 0V5a1 1 0 0 0-1-1h-1v1.646a.25.25 0 0 1-.427.177L7.177 3.427a.25.25 0 0 1 0-.354ZM3.75 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm0 9.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm8.25.75a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0Z",
   open: "M8 9.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3ZM8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0ZM1.5 8a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Z",
   completed:
@@ -31,13 +34,15 @@ function Icon({ d, className = "" }: { d: string; className?: string }) {
   );
 }
 
-type StateKey = "open" | "completed" | "not_planned";
-const stateOf = (i: Issue): StateKey => (i.state === "open" ? "open" : i.state_reason === "not_planned" ? "not_planned" : "completed");
-const STATE_LABEL: Record<StateKey, string> = { open: "Open", completed: "Closed", not_planned: "Closed as not planned" };
+type StateKey = "open" | "completed" | "not_planned" | "merged";
+const stateOf = (i: Issue): StateKey =>
+  i.merged ? "merged" : i.state === "open" ? "open" : i.state_reason === "not_planned" ? "not_planned" : "completed";
+const STATE_LABEL: Record<StateKey, string> = { open: "Open", completed: "Closed", not_planned: "Closed as not planned", merged: "Merged" };
+/** The icon of an item's state: pull requests use the PR / merge glyphs. */
+const stateIcon = (i: Issue) => (i.kind === "pull" ? (i.merged ? ICON.merged : ICON.pull) : ICON[stateOf(i)]);
 
 function StateIcon({ issue }: { issue: Issue }) {
-  const s = stateOf(issue);
-  return <Icon d={issue.kind === "pull" ? ICON.pull : ICON[s]} className={`issue-state ${s}`} />;
+  return <Icon d={stateIcon(issue)} className={`issue-state ${stateOf(issue)}`} />;
 }
 
 /** URL segment of one item: GitHub's `/issues/{n}` and `/pull/{n}`. */
@@ -264,7 +269,15 @@ export function IssuePage({ pull = false }: { pull?: boolean }) {
               onDelete={() => act("delete comment", () => issues.deleteComment(n, t.id))}
             />
           ))}
-          {pull && issue.state === "open" && <ReviewStatus full={full} n={n} decision={issue.review_decision} />}
+          {pull && (
+            <MergeBox
+              full={full}
+              pr={issue as PullDetail}
+              canMerge={me.write}
+              onMerge={(m) => act("merge", () => api.pulls(full).merge(n, m))}
+              onDeleteBranch={() => act("delete branch", () => api.pulls(full).deleteBranch(n))}
+            />
+          )}
           {signedIn ? (
             <Composer
               issue={issue}
@@ -509,7 +522,136 @@ function ReviewPanel({ pending, own, onSubmit }: { pending: number; own: boolean
   );
 }
 
-/** The review part of GitHub's merge box (merging itself arrives with slice 5). */
+const MERGE_METHODS: [MergeMethod, string][] = [
+  ["merge", "Create a merge commit"],
+  ["squash", "Squash and merge"],
+  ["rebase", "Rebase and merge"],
+];
+
+/** GitHub's merge box: review status, whether it merges cleanly, the merge button with its
+ * method and a confirm step for the message; afterwards, "Delete branch". */
+function MergeBox({
+  full,
+  pr,
+  canMerge,
+  onMerge,
+  onDeleteBranch,
+}: {
+  full: string;
+  pr: PullDetail;
+  canMerge: boolean;
+  onMerge: (m: { method: MergeMethod; sha: string; message?: string }) => Promise<boolean>;
+  onDeleteBranch: () => Promise<boolean>;
+}) {
+  if (pr.state !== "open") {
+    return (
+      <div className={`box review-status ${pr.merged ? "merged" : ""}`}>
+        <Icon d={pr.merged ? ICON.merged : ICON.pull} />
+        <div className="grow">
+          <strong>{pr.merged ? "Pull request successfully merged and closed" : "Closed with unmerged commits"}</strong>
+          <div className="muted small">
+            {pr.merged && pr.merge_commit && (
+              <>
+                <Link to={`/${full}/commit/${pr.merge_commit}`} className="sha">
+                  {pr.merge_commit.slice(0, 7)}
+                </Link>{" "}
+                is on <code className="branch-tag">{pr.base_ref}</code>.{" "}
+              </>
+            )}
+            The <code className="branch-tag">{pr.head_ref}</code> branch can be deleted.
+          </div>
+        </div>
+        {canMerge && (
+          <button type="button" className="btn" onClick={() => void onDeleteBranch()}>
+            Delete branch
+          </button>
+        )}
+      </div>
+    );
+  }
+  return (
+    <>
+      <ReviewStatus full={full} n={pr.number} decision={pr.review_decision} />
+      <Suspense
+        fallback={
+          <div className="box review-status">
+            <span className="muted small">Checking for the ability to merge automatically…</span>
+          </div>
+        }
+      >
+        <MergeSection full={full} pr={pr} canMerge={canMerge} onMerge={onMerge} />
+      </Suspense>
+    </>
+  );
+}
+
+function MergeSection({
+  full,
+  pr,
+  canMerge,
+  onMerge,
+}: {
+  full: string;
+  pr: PullDetail;
+  canMerge: boolean;
+  onMerge: (m: { method: MergeMethod; sha: string; message?: string }) => Promise<boolean>;
+}) {
+  // Keyed by both tips: a push to either branch asks again.
+  const m = useData(`mergeable:${full}:${pr.number}:${pr.base_sha}:${pr.head_sha}`, () => api.pulls(full).mergeability(pr.number), 10_000);
+  const [method, setMethod] = useState<MergeMethod>("merge");
+  const [message, setMessage] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const defaultMessage = method === "squash" ? `${pr.title} (#${pr.number})\n\n${pr.body}`.trim() : `Merge pull request #${pr.number} from ${pr.head_ref}\n\n${pr.title}`;
+  const [cls, title, text] = m.up_to_date
+    ? ["", "This branch is up to date", `${pr.base_ref} already contains every commit of ${pr.head_ref}.`]
+    : m.mergeable
+      ? ["approved", "This branch has no conflicts with the base branch", "Merging can be performed automatically."]
+      : ["changes", "This branch has conflicts that must be resolved", m.conflicts.join(", ")];
+  const confirm = async () => {
+    setBusy(true);
+    if (await onMerge({ method, sha: m.head_sha, message: method === "rebase" ? undefined : (message ?? defaultMessage) })) setMessage(null);
+    setBusy(false);
+  };
+  return (
+    <div className={`box review-status ${cls}`}>
+      <Icon d={m.mergeable ? ICON.completed : ICON.not_planned} />
+      <div className="grow">
+        <strong>{title}</strong>
+        <div className="muted small">{text}</div>
+        {canMerge && m.mergeable && message === null && (
+          <div className="merge-actions">
+            <select aria-label="Merge method" value={method} onChange={(e) => setMethod(e.target.value as MergeMethod)}>
+              {MERGE_METHODS.map(([v, label]) => (
+                <option key={v} value={v}>
+                  {label}
+                </option>
+              ))}
+            </select>
+            <button type="button" className="btn primary" onClick={() => (method === "rebase" ? void confirm() : setMessage(defaultMessage))} disabled={busy}>
+              {MERGE_METHODS.find(([v]) => v === method)?.[1]}
+            </button>
+          </div>
+        )}
+        {message !== null && (
+          <div className="merge-confirm">
+            <textarea value={message} onChange={(e) => setMessage(e.target.value)} rows={4} aria-label="Commit message" />
+            <div className="composer-actions">
+              <button type="button" className="btn" onClick={() => setMessage(null)}>
+                Cancel
+              </button>
+              <button type="button" className="btn primary" disabled={busy || !message.trim()} onClick={() => void confirm()}>
+                Confirm {method === "squash" ? "squash and merge" : "merge"}
+              </button>
+            </div>
+          </div>
+        )}
+        {!canMerge && m.mergeable && <div className="muted small">Only collaborators with write access can merge.</div>}
+      </div>
+    </div>
+  );
+}
+
+/** The review part of GitHub's merge box. */
 function ReviewStatus({ full, n, decision }: { full: string; n: number; decision?: "approved" | "changes_requested" }) {
   const [cls, title, text] =
     decision === "approved"
@@ -563,12 +705,13 @@ function IssueHeader({ issue, canEdit, onTitle }: { issue: IssueDetail; canEdit:
       )}
       <div className="row wrap gap small muted">
         <span className={`state-badge ${s}`}>
-          <Icon d={issue.kind === "pull" ? ICON.pull : ICON[s]} /> {issue.kind === "pull" && s !== "open" ? "Closed" : STATE_LABEL[s]}
+          <Icon d={stateIcon(issue)} /> {issue.kind === "pull" && s !== "open" && s !== "merged" ? "Closed" : STATE_LABEL[s]}
         </span>
         {issue.kind === "pull" ? (
           <span>
-            <strong>{issue.author}</strong> wants to merge into <code className="branch-tag">{issue.base_ref}</code> from{" "}
-            <code className="branch-tag">{issue.head_ref}</code> · opened {relTime(issue.created_at)}
+            <strong>{issue.merged ? (issue.timeline.find((t) => t.type === "merged")?.actor ?? issue.author) : issue.author}</strong>{" "}
+            {issue.merged ? "merged" : "wants to merge"} into <code className="branch-tag">{issue.base_ref}</code> from <code className="branch-tag">{issue.head_ref}</code> ·{" "}
+            {issue.merged ? `merged ${relTime(issue.closed_at ?? issue.updated_at)}` : `opened ${relTime(issue.created_at)}`}
           </span>
         ) : (
           <span>
@@ -696,6 +839,13 @@ function TimelineEntry({
       return event(ICON.comment, <>{t.added.length > 0 && <>added {names(t.added)} </>}{t.removed.length > 0 && <>removed {names(t.removed)} </>}</>);
     case "assigned":
       return event(ICON.comment, <>{t.added.length > 0 && <>assigned {t.added.join(", ")} </>}{t.removed.length > 0 && <>unassigned {t.removed.join(", ")} </>}</>);
+    case "merged":
+      return event(
+        ICON.merged,
+        <>
+          {t.method === "squash" ? "squashed and merged" : t.method === "rebase" ? "rebased and merged" : "merged"} commit <span className="sha">{t.commit.slice(0, 7)}</span>
+        </>,
+      );
     case "review": {
       const verb = t.state === "approved" ? "approved these changes" : t.state === "changes_requested" ? "requested changes" : "reviewed";
       const cls = t.state === "approved" ? "review-approved" : t.state === "changes_requested" ? "review-changes" : "";
@@ -787,6 +937,7 @@ function Composer({
         <Editor value={text} onChange={setText} placeholder="Leave a comment" />
         <div className="composer-actions">
           {canClose &&
+            !issue.merged &&
             (issue.state === "open" ? (
               <>
                 <button type="button" className="btn" disabled={busy} onClick={() => run(() => onClose("completed", body))}>

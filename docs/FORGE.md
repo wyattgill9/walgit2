@@ -28,7 +28,7 @@ Forge state is a fold of events in the WAL. There is no other store.
 | 2 Checkpointed state, recovery, benchmarks | — |
 | 3 Pull requests: compare, open, list, Conversation / Commits / Files changed, close and reopen | done |
 | 4 Reviews: approve / request changes / comment, line comments from the diff, review decision | done |
-| 5 Merge (merge / squash / rebase) | — |
+| 5 Merge (merge / squash / rebase), mergeability, closing keywords, delete branch | done |
 
 ## Local rig: Garage
 
@@ -55,6 +55,12 @@ WALGIT_TEST_S3_EMULATE_CAS=1 WALGIT_TEST_S3_ENDPOINT=http://127.0.0.1:3900 \
   as outdated in the conversation and is left out of the diff; there is no line remapping yet.
   A pending review lives in the page until it is submitted, and is lost on reload; GitHub keeps
   it on the server.
+- **Merging** builds objects in a scratch object directory over the serving copy (ported from
+  rgodha24/walgithub): `merge-tree --write-tree`, `commit-tree`, `pack-objects`, then
+  `ingest_pack` and a connectivity check. A refused merge leaves nothing behind. The publish is
+  one PUSH entry carrying the pack, the base ref move, `ForgeMerged`, and the closes of fixed
+  issues. If the push policy, a forge rule or the base's old value refuses any part, nothing
+  lands. Mergeability is computed on each request; it needs the packs on the host.
 - **One change, one entry.** "Close with comment" and a multi-field `PATCH` are each one entry.
 - **Direct import** refuses repositories that have issues. Its folded log would drop them.
 - **Deployment order.** A checkpoint written by a binary older than D50 would carry no

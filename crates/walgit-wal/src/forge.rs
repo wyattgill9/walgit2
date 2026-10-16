@@ -58,6 +58,10 @@ pub struct Item {
     /// review (any change request wins); empty when nobody decided.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub review_decision: String,
+    /// Pull requests: merged (then also `closed`), and the commit the base moved to.
+    pub merged: bool,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub merge_commit: String,
     /// Reviewer → their latest deciding review state.
     #[serde(skip)]
     pub reviews: BTreeMap<String, String>,
@@ -106,6 +110,10 @@ pub enum Timeline {
     Assigned {
         added: Vec<String>,
         removed: Vec<String>,
+    },
+    Merged {
+        method: String,
+        commit: String,
     },
     Review {
         state: String,
@@ -241,6 +249,8 @@ impl ForgeState {
                     base_oid: o.base_oid.clone(),
                     head_oid: o.head_oid.clone(),
                     review_decision: String::new(),
+                    merged: false,
+                    merge_commit: String::new(),
                     reviews: BTreeMap::new(),
                     timeline: Vec::new(),
                 },
@@ -328,6 +338,18 @@ impl ForgeState {
             Body::Assignees(c) => {
                 let (added, removed) = change_set(&mut item.assignees, c);
                 Timeline::Assigned { added, removed }
+            }
+            Body::Merged(m) => {
+                item.state = "closed";
+                item.merged = true;
+                item.merge_commit.clone_from(&m.merge_commit_oid);
+                item.closed_at = Some(at.to_owned());
+                item.base_oid.clone_from(&m.base_oid);
+                item.head_oid.clone_from(&m.head_oid);
+                Timeline::Merged {
+                    method: m.method.clone(),
+                    commit: m.merge_commit_oid.clone(),
+                }
             }
             Body::Review(r) => {
                 if r.state != "commented" {
@@ -443,6 +465,9 @@ impl ForgeState {
                     }
                 }
                 Body::State(s) => {
+                    if !s.closed && item.merged {
+                        return Err(format!("#{} was merged; it can't be reopened", item.number));
+                    }
                     if !own_or_write {
                         return Err(
                             "only the author or a collaborator can close or reopen this".into()
@@ -461,12 +486,23 @@ impl ForgeState {
                     }
                 }
                 Body::Review(r) => verify_review(item, actor, r)?,
+                Body::Merged(m) => {
+                    if item.kind != "pull" || item.state != "open" {
+                        return Err(format!("#{} is not an open pull request", item.number));
+                    }
+                    if !actor.write {
+                        return Err("only collaborators can merge".into());
+                    }
+                    if !matches!(m.method.as_str(), "merge" | "squash" | "rebase") {
+                        return Err(format!("{:?} is not merge, squash or rebase", m.method));
+                    }
+                }
             }
         }
         Ok(())
     }
 
-    /// GitHub-style search: `is:open|closed|issue|pr`, `author:`, `assignee:`, `label:` (repeat =
+    /// GitHub-style search: `is:open|closed|merged|unmerged|issue|pr`, `author:`, `assignee:`, `label:` (repeat =
     /// all of them), `review:approved|changes_requested|none`, `sort:created-desc|created-asc|updated-desc|comments-desc`, free words matched
     /// against title and body. `page` is 1-based.
     pub fn search(&self, query: &str, page: usize) -> SearchPage {
@@ -477,11 +513,14 @@ impl ForgeState {
         let mut labels = Vec::new();
         let mut sort = "created-desc";
         let mut review = None;
+        let mut merged = None;
         let mut words = Vec::new();
         let toks = tokens(query);
         for tok in &toks {
             match tok.split_once(':') {
                 Some(("is", "open" | "closed")) => state = tok.strip_prefix("is:"),
+                Some(("is", "merged")) => merged = Some(true),
+                Some(("is", "unmerged")) => merged = Some(false),
                 Some(("is", "issue")) => kind = Some("issue"),
                 Some(("is", "pr")) => kind = Some("pull"),
                 Some(("author", v)) => author = Some(v),
@@ -500,6 +539,7 @@ impl ForgeState {
             .filter(|i| assignee.is_none_or(|a| i.assignees.contains(a)))
             .filter(|i| labels.iter().all(|l| i.labels.contains(*l)))
             .filter(|i| review.is_none_or(|r| i.review_decision == r))
+            .filter(|i| merged.is_none_or(|m| i.merged == m))
             .filter(|i| {
                 words.iter().all(|w| {
                     i.title.to_lowercase().contains(w.as_str())
@@ -669,16 +709,35 @@ impl RepoHandle {
     pub async fn publish_forge(
         &self,
         actor: Actor,
-        mut events: Vec<ForgeEvent>,
+        events: Vec<ForgeEvent>,
     ) -> Result<u64, WalError> {
-        for ev in &mut events {
-            ev.actor.clone_from(&actor.name);
-        }
-        let result = self.enqueue_forge(actor, events).await?;
+        let result = self
+            .publish_forge_push(
+                actor,
+                events,
+                None,
+                walgit_proto::v1::RefTransaction::default(),
+            )
+            .await?;
         if let Some(msg) = result.forge_error {
             return Err(WalError::Invalid(msg));
         }
         Ok(result.seq)
+    }
+
+    /// Forge events committed with a ref transaction (and its pack) as one PUSH entry: both
+    /// land or neither does. Refused refs are in `per_ref`, refused events in `forge_error`.
+    pub async fn publish_forge_push(
+        &self,
+        actor: Actor,
+        mut events: Vec<ForgeEvent>,
+        pack: Option<walgit_git::IngestedPack>,
+        txn: walgit_proto::v1::RefTransaction,
+    ) -> Result<crate::PublishResult, WalError> {
+        for ev in &mut events {
+            ev.actor.clone_from(&actor.name);
+        }
+        self.enqueue_forge(actor, events, pack, txn).await
     }
 }
 

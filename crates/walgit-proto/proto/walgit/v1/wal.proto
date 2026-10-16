@@ -216,7 +216,18 @@ message ForgeEvent {
     ForgeSetChange labels = 14;
     ForgeSetChange assignees = 15;
     ForgeReview review = 16;
+    ForgeMerged merged = 17;
   }
+}
+
+// A pull request merged: rides on the PUSH entry that moves `base_ref` to `merge_commit_oid`.
+message ForgeMerged {
+  // "merge" | "squash" | "rebase"
+  string method = 1;
+  string merge_commit_oid = 2;
+  // The tips merged: the base before the merge and the head.
+  string base_oid = 3;
+  string head_oid = 4;
 }
 
 // A pull request review; its line comments anchor to `commit_oid`.

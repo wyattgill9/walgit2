@@ -31,7 +31,15 @@ pub fn router(state: Arc<AppState>) -> Router {
             .route(&format!("{base}/issues"), post(create_issue));
         r = routes::<true>(r, &format!("{base}/pulls"))
             .route(&format!("{base}/pulls"), post(create_pull))
-            .route(&format!("{base}/pulls/{{number}}/reviews"), post(review));
+            .route(&format!("{base}/pulls/{{number}}/reviews"), post(review))
+            .route(
+                &format!("{base}/pulls/{{number}}/merge"),
+                get(super::forge_merge::mergeability).post(super::forge_merge::merge),
+            )
+            .route(
+                &format!("{base}/pulls/{{number}}/branch"),
+                axum::routing::delete(super::forge_merge::delete_branch),
+            );
     }
     r.with_state(state)
 }
@@ -56,7 +64,7 @@ struct ListQuery {
 }
 
 #[derive(Serialize)]
-struct Detail {
+pub(super) struct Detail {
     #[serde(flatten)]
     item: Item,
     timeline: Vec<TimelineItem>,
@@ -143,7 +151,7 @@ const fn kind_name(pull: bool) -> &'static str {
     if pull { "pull" } else { "issue" }
 }
 
-async fn open(
+pub(super) async fn open(
     st: &AppState,
     headers: &HeaderMap,
     owner: &str,
@@ -159,7 +167,7 @@ async fn open(
 }
 
 /// Refs-level sync + the forge fold: every read sees every acknowledged write (principle IV).
-async fn synced(
+pub(super) async fn synced(
     st: &AppState,
     headers: &HeaderMap,
     owner: &str,
@@ -172,14 +180,14 @@ async fn synced(
 }
 
 /// A branch's tip from the synced ref state.
-fn branch_tip(handle: &RepoHandle, branch: &str) -> Option<String> {
+pub(super) fn branch_tip(handle: &RepoHandle, branch: &str) -> Option<String> {
     let refs = handle.local().ref_view().ok()?;
     refs.get(&format!("refs/heads/{branch}"))
         .filter(|oid| !oid.is_empty())
 }
 
 /// (base, head) a pull request shows: live while open (the recorded tip once a branch is gone).
-fn tips(handle: &RepoHandle, i: &Item) -> (String, String) {
+pub(super) fn tips(handle: &RepoHandle, i: &Item) -> (String, String) {
     if i.state == "open" {
         (
             branch_tip(handle, &i.base_ref).unwrap_or_else(|| i.base_oid.clone()),
@@ -190,7 +198,7 @@ fn tips(handle: &RepoHandle, i: &Item) -> (String, String) {
     }
 }
 
-fn detail_of(handle: &RepoHandle, number: u64, pull: bool) -> Result<Detail, ApiError> {
+pub(super) fn detail_of(handle: &RepoHandle, number: u64, pull: bool) -> Result<Detail, ApiError> {
     let item = handle
         .forge_read(|s| {
             s.items
@@ -263,12 +271,24 @@ async fn publish(
     Ok((handle, seq))
 }
 
-fn event(number: u64, body: Body) -> ForgeEvent {
+pub(super) fn event(number: u64, body: Body) -> ForgeEvent {
     ForgeEvent {
         number,
         actor: String::new(),
         body: Some(body),
     }
+}
+
+/// Closing an issue (no tips to freeze).
+pub(super) fn closing_event(number: u64, reason: &str) -> ForgeEvent {
+    event(
+        number,
+        Body::State(ForgeStateChange {
+            closed: true,
+            reason: reason.into(),
+            ..Default::default()
+        }),
+    )
 }
 
 fn set_change(add: Vec<String>, remove: Vec<String>) -> Option<ForgeSetChange> {

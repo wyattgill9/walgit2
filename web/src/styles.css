@@ -1222,3 +1222,13 @@ input.text.small { font-size: 11px; padding: 2px 6px; margin-left: 8px; }
 .line-form { padding: 4px 12px 0; }
 .line-form .editor textarea, .line-form .editor-preview { width: 100%; margin-left: 0; margin-right: 0; }
 .line-form .editor-tabs, .line-form .composer-actions { padding-left: 0; padding-right: 0; }
+/* merging */
+.issue-state.merged, .state-badge.merged, .review-status.merged svg { color: var(--la); }
+.state-badge.merged { border-color: var(--l8); background: var(--l2); }
+.review-status.merged { border-color: var(--l7); }
+.review-status .grow { flex: 1; min-width: 0; }
+.merge-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.merge-actions select { font-size: 12px; padding: 3px 6px; }
+.merge-confirm { margin-top: 10px; }
+.merge-confirm textarea { width: 100%; padding: 8px; resize: vertical; }
+.merge-confirm .composer-actions { padding: 8px 0 0; }

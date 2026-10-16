@@ -1,5 +1,6 @@
 pub mod api;
 pub mod forge;
+mod forge_merge;
 pub mod login;
 pub mod objects;
 pub mod trailers;

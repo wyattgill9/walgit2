@@ -78,7 +78,20 @@ export interface Issue {
   head_ref?: string;
   /** Pull requests: from each reviewer's latest approval or change request; absent = none. */
   review_decision?: "approved" | "changes_requested";
+  /** Pull requests: merged (then also `state: "closed"`), and the commit the base moved to. */
+  merged: boolean;
+  merge_commit?: string;
 }
+/** `GET api/pulls/{n}/merge`: can the head merge cleanly into the base right now. */
+export interface Mergeability {
+  mergeable: boolean;
+  /** The base already contains the head: nothing to merge. */
+  up_to_date: boolean;
+  conflicts: string[];
+  base_sha: string;
+  head_sha: string;
+}
+export type MergeMethod = "merge" | "squash" | "rebase";
 /** One entry of an issue's timeline; `id` addresses a comment for edit/delete. */
 export type TimelineItem = { id: number; actor: string; at: string } & (
   | { type: "comment"; body: string; edited: boolean; deleted: boolean }
@@ -88,6 +101,7 @@ export type TimelineItem = { id: number; actor: string; at: string } & (
   | { type: "labeled"; added: string[]; removed: string[] }
   | { type: "assigned"; added: string[]; removed: string[] }
   | { type: "review"; state: ReviewState; body: string; commit_oid: string; comments: LineComment[] }
+  | { type: "merged"; method: MergeMethod; commit: string }
 );
 export type ReviewState = "approved" | "changes_requested" | "commented";
 /** A review's comment on one line: `RIGHT` = the head's line, `LEFT` = the merge base's. */
@@ -816,6 +830,14 @@ export class RepoClient {
      * comments anchor to that head. */
     review: (n: number, review: { state: ReviewState; body?: string; comments?: LineComment[] }, opts?: CallOptions) =>
       this.client.json<PullDetail>(`${this.p}/pulls/${n}/reviews`, opts, jsonBody("POST", review)),
+    mergeability: (n: number, opts?: CallOptions) => this.client.json<Mergeability>(`${this.p}/pulls/${n}/merge`, opts, { cache: "no-store" }),
+    /** Needs write and the push policy's consent for the base. `sha` = the head you looked at
+     * (409 if it moved); `message` replaces the merge or squash commit message. One change moves
+     * the base, marks the PR merged and closes the issues its body fixes (`Fixes #n`). */
+    merge: (n: number, merge: { method?: MergeMethod; sha?: string; message?: string } = {}, opts?: CallOptions) =>
+      this.client.json<PullDetail>(`${this.p}/pulls/${n}/merge`, opts, jsonBody("POST", merge)),
+    /** GitHub's "Delete branch" once the pull request is closed or merged. */
+    deleteBranch: (n: number, opts?: CallOptions) => this.client.json<PullDetail>(`${this.p}/pulls/${n}/branch`, opts, { method: "DELETE" }),
   };
 
   /** GitHub's three-dot compare: what merging `head` into `base` brings (branches, tags or shas). */

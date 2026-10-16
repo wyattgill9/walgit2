@@ -917,3 +917,187 @@ async fn pulls_api() -> TestResult {
     assert_eq!(pr["head_sha"], topic);
     Ok(())
 }
+
+/// D50 merges: merge / squash / rebase move main as git would, one entry closes the PR and
+/// the issues it fixes, conflicts are reported and refused, and what landed fsck-checks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_api() -> TestResult {
+    use reqwest::Method as M;
+    use serde_json::json;
+    let server = Server::start().await?;
+    server.put_repo("o", "r").await?;
+    let src = fixture(&server)?;
+    let url = server.repo_url("o", "r");
+    let branch = |name: &str, files: &[(&str, &str)]| -> anyhow::Result<()> {
+        git_in(&src, &["checkout", "-q", "-B", name, "main"])?;
+        for (i, (path, text)) in files.iter().enumerate() {
+            std::fs::write(src.join(path), text)?;
+            git_in(&src, &["add", path])?;
+            git_in(&src, &["commit", "-q", "-m", &format!("{name} {i}")])?;
+        }
+        git_in(&src, &["push", "-q", &url, name])?;
+        Ok(())
+    };
+    let call = |method: reqwest::Method, path: &str, body: Option<Value>| {
+        let mut req = reqwest::Client::new().request(method, format!("{}{path}", server.base_url));
+        if let Some(body) = body {
+            req = req.json(&body);
+        }
+        async move {
+            let resp = req.send().await?;
+            let status = resp.status().as_u16();
+            let text = resp.text().await?;
+            anyhow::Ok((
+                status,
+                serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text)),
+            ))
+        }
+    };
+    let open = |head: &str, body: &str| {
+        call(
+            M::POST,
+            "/o/r/api/pulls",
+            Some(json!({"title": head, "body": body, "base": "main", "head": head})),
+        )
+    };
+    let main = || {
+        git_in(&src, &["ls-remote", &url, "refs/heads/main"])
+            .map(|s| s.split_whitespace().next().unwrap_or("").to_string())
+    };
+
+    let (_, issue) = call(
+        M::POST,
+        "/o/r/api/issues",
+        Some(json!({"title": "a.txt is missing"})),
+    )
+    .await?;
+    let issue = issue["number"].as_u64().unwrap();
+    branch("m", &[("a.txt", "a\n")])?;
+    branch("s", &[("b.txt", "b\n"), ("b.txt", "b2\n")])?;
+    branch("r", &[("c.txt", "c\n"), ("d.txt", "d\n")])?;
+    let (_, pm) = open("m", &format!("Fixes #{issue}")).await?;
+    let (_, ps) = open("s", "").await?;
+    let (_, pr) = open("r", "").await?;
+    let [pm, ps, pr] = [pm, ps, pr].map(|p| p["number"].as_u64().unwrap());
+
+    let m = json(&server, &format!("/o/r/api/pulls/{pm}/merge")).await?;
+    assert_eq!(
+        (m["mergeable"].as_bool(), m["up_to_date"].as_bool()),
+        (Some(true), Some(false))
+    );
+    let before = main()?;
+    let (status, merged) = call(
+        M::POST,
+        &format!("/o/r/api/pulls/{pm}/merge"),
+        Some(json!({})),
+    )
+    .await?;
+    assert_eq!(status, 200, "{merged}");
+    assert_eq!(
+        (merged["state"].as_str(), merged["merged"].as_bool()),
+        (Some("closed"), Some(true))
+    );
+    let tip = main()?;
+    assert_eq!(merged["merge_commit"], tip);
+    git_in(&src, &["fetch", "-q", &url, "main"])?;
+    let parents = git_in(&src, &["log", "-1", "--format=%P", "FETCH_HEAD"])?;
+    assert_eq!(
+        parents.split_whitespace().next(),
+        Some(before.as_str()),
+        "a merge commit's first parent is the old main"
+    );
+    assert_eq!(parents.split_whitespace().count(), 2);
+    let closed = json(&server, &format!("/o/r/api/issues/{issue}")).await?;
+    assert_eq!(
+        closed["state"], "closed",
+        "Fixes #n closes the issue with the merge"
+    );
+
+    let (status, _) = call(
+        M::POST,
+        &format!("/o/r/api/pulls/{ps}/merge"),
+        Some(json!({"method": "squash", "sha": "0000"})),
+    )
+    .await?;
+    assert_eq!(
+        status, 409,
+        "a head that moved since the client looked is refused"
+    );
+    let (status, _) = call(
+        M::POST,
+        &format!("/o/r/api/pulls/{ps}/merge"),
+        Some(json!({"method": "squash"})),
+    )
+    .await?;
+    assert_eq!(status, 200);
+    git_in(&src, &["fetch", "-q", &url, "main"])?;
+    assert_eq!(
+        git_in(&src, &["log", "-1", "--format=%P", "FETCH_HEAD"])?
+            .split_whitespace()
+            .count(),
+        1,
+        "squash: one parent"
+    );
+    assert_eq!(git_in(&src, &["show", "FETCH_HEAD:b.txt"])?, "b2\n");
+
+    let (status, _) = call(
+        M::POST,
+        &format!("/o/r/api/pulls/{pr}/merge"),
+        Some(json!({"method": "rebase"})),
+    )
+    .await?;
+    assert_eq!(status, 200);
+    git_in(&src, &["fetch", "-q", &url, "main"])?;
+    assert_eq!(
+        git_in(&src, &["log", "-2", "--format=%s", "FETCH_HEAD"])?,
+        "r 1\nr 0\n",
+        "rebase replays each commit"
+    );
+    git_in(&src, &["fsck", "--no-progress"])?;
+
+    // Two branches editing one line: the second conflicts after the first lands.
+    git_in(&src, &["branch", "-f", "main", "FETCH_HEAD"])?;
+    branch("x", &[("a.txt", "x\n")])?;
+    branch("y", &[("a.txt", "y\n")])?;
+    let (_, px) = open("x", "").await?;
+    let (_, py) = open("y", "").await?;
+    assert_eq!(
+        call(
+            M::POST,
+            &format!("/o/r/api/pulls/{}/merge", px["number"]),
+            Some(json!({}))
+        )
+        .await?
+        .0,
+        200
+    );
+    let m = json(&server, &format!("/o/r/api/pulls/{}/merge", py["number"])).await?;
+    assert_eq!(
+        (m["mergeable"].as_bool(), m["conflicts"].clone()),
+        (Some(false), json!(["a.txt"]))
+    );
+    let (status, why) = call(
+        M::POST,
+        &format!("/o/r/api/pulls/{}/merge", py["number"]),
+        Some(json!({})),
+    )
+    .await?;
+    assert_eq!(status, 409, "{why}");
+
+    let (status, _) = call(
+        M::PATCH,
+        &format!("/o/r/api/pulls/{pm}"),
+        Some(json!({"state": "open"})),
+    )
+    .await?;
+    assert_eq!(status, 400, "a merged pull request stays merged");
+    let (status, _) = call(M::DELETE, &format!("/o/r/api/pulls/{pm}/branch"), None).await?;
+    assert_eq!(status, 200);
+    assert!(
+        git_in(&src, &["ls-remote", &url, "refs/heads/m"])?.is_empty(),
+        "the head branch is gone"
+    );
+    let merged_list = json(&server, "/o/r/api/pulls?q=is:merged").await?;
+    assert_eq!(merged_list["items"].as_array().unwrap().len(), 4);
+    Ok(())
+}
