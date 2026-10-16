@@ -285,6 +285,10 @@ pub struct S3Config {
     pub access_key_env: String,
     pub secret_key_env: String,
     pub force_path_style: bool,
+    /// For S3-compatibles that accept but ignore `If-Match`/`If-None-Match` (Garage):
+    /// serialize conditional PUTs per key in-process and check the version with a HEAD
+    /// first. Correct for ONE instance only; costs one HEAD per conditional PUT.
+    pub emulate_conditional_writes: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -867,6 +871,7 @@ impl Default for S3Config {
             access_key_env: "AWS_ACCESS_KEY_ID".into(),
             secret_key_env: "AWS_SECRET_ACCESS_KEY".into(),
             force_path_style: true,
+            emulate_conditional_writes: false,
         }
     }
 }

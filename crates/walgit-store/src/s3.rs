@@ -64,6 +64,8 @@ pub struct S3Store {
     http: reqwest::Client,
     multipart_threshold: u64,
     multipart_part_size: u64,
+    /// `s3.emulate_conditional_writes`: per-key-stripe locks making HEAD + PUT atomic in-process.
+    cas_stripes: Option<Box<[tokio::sync::Mutex<()>]>>,
 }
 
 impl S3Store {
@@ -92,6 +94,11 @@ impl S3Store {
             .region(region)
             .credentials_provider(creds)
             .force_path_style(cfg.s3.force_path_style)
+            // ponytail: the default (WhenSupported) streams file bodies as aws-chunked with a
+            // trailing CRC32, which garage rejects ("Invalid payload signature").
+            .request_checksum_calculation(
+                aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+            )
             .behavior_version_latest();
 
         if !cfg.s3.endpoint.is_empty() {
@@ -107,6 +114,10 @@ impl S3Store {
             http,
             multipart_threshold: cfg.multipart_threshold.as_u64(),
             multipart_part_size: cfg.multipart_part_size.as_u64(),
+            cas_stripes: cfg
+                .s3
+                .emulate_conditional_writes
+                .then(|| (0..64).map(|_| tokio::sync::Mutex::new(())).collect()),
         })
     }
 
@@ -367,6 +378,35 @@ impl ObjectStore for S3Store {
     }
 
     async fn put(&self, key: &str, body: PutBody, opts: PutOptions) -> Result<ObjectMeta> {
+        // Held until the PUT returns: no other conditional PUT on this stripe can run
+        // between our HEAD check and our write.
+        let _cas = match (&self.cas_stripes, &opts.mode) {
+            (Some(stripes), PutMode::Create | PutMode::Update(_)) => {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                key.hash(&mut h);
+                let stripe = usize::try_from(h.finish()).unwrap_or(0) % stripes.len();
+                let guard = stripes
+                    .get(stripe)
+                    .ok_or_else(|| StoreError::other(anyhow::anyhow!("cas stripe {stripe}")))?
+                    .lock()
+                    .await;
+                let current = self.head(key).await?.map(|m| m.version);
+                let holds = match (&opts.mode, &current) {
+                    (PutMode::Create, None) => true,
+                    (PutMode::Update(want), Some(have)) => want == have,
+                    _ => false,
+                };
+                if !holds {
+                    return Err(StoreError::PreconditionFailed {
+                        key: key.into(),
+                        current,
+                    });
+                }
+                Some(guard)
+            }
+            _ => None,
+        };
         let (s3_body, len) = body_to_s3(body).await?;
 
         // Multipart only for Overwrite (CreateMultipartUpload has no

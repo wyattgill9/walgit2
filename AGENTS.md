@@ -31,6 +31,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `docs/POLICY.md` | Anyone touching receive-pack authorization or writing a repo policy. Normative rule language. |
 | `docs/LFS.md` | Anyone touching LFS (`lfs.rs`, `lfs_upstream.rs`) or importing a repository whose LFS history lives elsewhere. |
 | `docs/INTEGRITY.md` | Anyone touching import, the maintainer's `fsck`/`repair` units, or seeing `connectivity: missing object` on a push. |
+| `docs/FORGE.md` | Anyone touching issues/pull requests: event schema, fold, checkpointed state, merge, measurements. |
 | `docs/EVENTS.md` | Anyone changing WAL-derived ref events, the webhook bridge, consumer semantics or event cursors. |
 | `docs/CONTRACT.md` | When you touch a crate boundary. The cross-crate contract; *extend, don't rename*; code wins where they differ. |
 | `docs/reference/cursor-git-at-any-scale.md` | The source design, verbatim. Read once before touching WAL/publish/sync/placement. |
@@ -486,6 +487,16 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
   current tip must appear in the resulting live inventory before the log claim/CAS. Raw producer admission
   and candidate external-boundary proof remain separate obligations; local loose objects and retired
   download membership cannot justify retirement. See the cost and remaining-evidence rows in the linked docs.
+
+- **D50 (2026-10-16): Issues and pull requests are forge events on the WAL.** GOAL §4 now includes them.
+  A forge write is a log entry (`ENTRY_KIND_FORGE`, or `forge` events on a PUSH so a merge moves the base
+  ref and closes the PR in one entry) committed by the same manifest CAS as a push; issue/PR numbers are
+  allocated from `Manifest.forge_next_number` under that CAS. Refs-level sync skips forge events; forge
+  state is folded lazily and written with each checkpoint (`checkpoints/<seq>/forge.pb`). No second commit
+  point, no JSON documents beside the manifest, no webhook from a handler — forge events reach the events
+  bridge like ref events. Lean first: richer search, roles and snapshots wait for measurements
+  ([FORGE.md](docs/FORGE.md)). S3 stores that ignore conditional PUTs (Garage) run one instance with
+  `store.s3.emulate_conditional_writes = true`.
 
 ## 5. Working rules
 
