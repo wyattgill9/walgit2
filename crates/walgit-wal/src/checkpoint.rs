@@ -188,16 +188,39 @@ async fn write_checkpoint_inner(handle: &RepoHandle) -> Result<CheckpointRef, Wa
         immutable: true,
         ..Default::default()
     };
-    let (r_refs, r_cp) = tokio::join!(
+    // D50: the forge history folded to `seq` rides in the same round; repositories that never
+    // used the forge pay nothing (log segments below `seq` leave the manifest, so this is the
+    // only place earlier forge events stay reachable).
+    let forge = if manifest.forge_next_number > 0 {
+        handle.forge_ensure().await?;
+        let history = handle
+            .forge_read(|s| (s.seq >= seq).then(|| s.history_upto(seq)))
+            .ok_or_else(|| WalError::Corrupt("forge state behind the checkpoint".into()))?;
+        let bytes = history.encode_to_vec();
+        Some((walgit_proto::snapshot::forge_key(&bytes), bytes))
+    } else {
+        None
+    };
+    let forge_put = async {
+        match &forge {
+            Some((key, bytes)) => {
+                crate::snapshots::put_snapshot(&handle.store, key, bytes.clone()).await
+            }
+            None => Ok(()),
+        }
+    };
+    let (r_refs, r_cp, r_forge) = tokio::join!(
         crate::snapshots::put_snapshot(&handle.store, &refs_key, snap_bytes),
         handle.store.put(
             &cp_key,
             PutBody::Bytes(bytes::Bytes::from(cp_bytes)),
             immutable
         ),
+        forge_put,
     );
     r_refs?;
     r_cp?;
+    r_forge?;
 
     let cp_ref = CheckpointRef {
         seq,
@@ -206,6 +229,7 @@ async fn write_checkpoint_inner(handle: &RepoHandle) -> Result<CheckpointRef, Wa
         first_state_at,
         as_of,
         refs_key,
+        forge_key: forge.map(|(key, _)| key).unwrap_or_default(),
     };
 
     // Round 2: CAS manifest: set checkpoint, min_seq = seq+1, trim log_segments

@@ -771,6 +771,12 @@ pub async fn run_with_store(
         .as_ref()
         .and_then(|cp| cp.first_state_at)
         .or(Some(created_at));
+    // D50: the folded log would take the repository's issues/PRs with it.
+    anyhow::ensure!(
+        manifest.forge_next_number == 0,
+        "{} has issues or pull requests; a direct import would drop them",
+        manifest.repo
+    );
     manifest.head_seq = seq;
     manifest.min_seq = seq + 1;
     manifest.checkpoint = Some(CheckpointRef {
@@ -780,6 +786,7 @@ pub async fn run_with_store(
         created_at: Some(created_at),
         first_state_at,
         as_of: Some(created_at),
+        forge_key: String::new(),
     });
     manifest.log_segments.clear();
     manifest.packs = pack_refs;

@@ -154,7 +154,7 @@ function AheadBehind({ ahead, behind, max }: { ahead: number | null; behind: num
   );
 }
 
-function Pager({ page, more, onPage }: { page: number; more: boolean; onPage: (p: number) => void }) {
+export function Pager({ page, more, onPage }: { page: number; more: boolean; onPage: (p: number) => void }) {
   return (
     <div className="pager">
       <button type="button" className="btn" disabled={page <= 1} onClick={() => onPage(page - 1)}>

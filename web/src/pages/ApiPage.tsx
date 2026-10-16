@@ -109,6 +109,11 @@ export function ApiPage() {
               cache="SWR"
             />
             <Row
+              path={`/${r}/api/issues?q=&page=`}
+              desc={<>Issues, GitHub search syntax (<code>is:open</code>, <code>author:</code>, <code>label:</code>, <code>sort:</code>, words): <code>{`{items,open_count,closed_count,page,per_page}`}</code>, 25 per page. <code>issues/{"{n}"}</code> adds the <code>timeline</code>; writes are JSON <code>POST</code>/<code>PATCH</code>/<code>DELETE</code> (API.md).</>}
+              cache="SWR"
+            />
+            <Row
               path={`/${r}/api/resolve/{ref/path…}`}
               desc={<>Splits a GitHub-shaped <code>ref/path</code> into <code>{`{ref,sha,path,kind}`}</code>; longest existing branch/tag wins, then a revision. Do this once, then address by sha.</>}
               cache="SWR + ETag"

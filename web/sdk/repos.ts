@@ -55,6 +55,56 @@ export interface BranchRow {
   ahead: number | null;
   behind: number | null;
 }
+/** An issue (D50; `api/issues`). Times are ISO 8601 UTC. */
+export interface Issue {
+  number: number;
+  kind: "issue" | "pull";
+  title: string;
+  body: string;
+  /** The body changed after opening. */
+  edited: boolean;
+  author: string;
+  state: "open" | "closed";
+  /** "completed" | "not_planned" when closed. */
+  state_reason: string;
+  labels: string[];
+  assignees: string[];
+  created_at: string;
+  updated_at: string;
+  closed_at: string | null;
+  comments: number;
+}
+/** One entry of an issue's timeline; `id` addresses a comment for edit/delete. */
+export type TimelineItem = { id: number; actor: string; at: string } & (
+  | { type: "comment"; body: string; edited: boolean; deleted: boolean }
+  | { type: "closed"; reason: string }
+  | { type: "reopened" }
+  | { type: "renamed"; from: string; to: string }
+  | { type: "labeled"; added: string[]; removed: string[] }
+  | { type: "assigned"; added: string[]; removed: string[] }
+);
+export interface IssueDetail extends Issue {
+  timeline: TimelineItem[];
+}
+/** `api/issues?q=&page=`: one page of 25 plus GitHub's open/closed counts for the query. */
+export interface IssuePage {
+  items: Issue[];
+  open_count: number;
+  closed_count: number;
+  page: number;
+  per_page: number;
+}
+/** Fields of `PATCH api/issues/{n}`; the present ones commit together. */
+export interface IssuePatch {
+  title?: string;
+  body?: string;
+  state?: "open" | "closed";
+  state_reason?: "completed" | "not_planned";
+  add_labels?: string[];
+  remove_labels?: string[];
+  add_assignees?: string[];
+  remove_assignees?: string[];
+}
 /** `api/branches`: the default branch on its own, then one page newest-first. */
 export interface BranchPage {
   default: BranchRow | null;
@@ -300,6 +350,11 @@ const qs = (q: object) => {
   const s = p.toString();
   return s ? `?${s}` : "";
 };
+const jsonBody = (method: string, body: unknown): RequestInit => ({
+  method,
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify(body),
+});
 
 function scriptOrigin(): string | undefined {
   try {
@@ -708,6 +763,26 @@ export class RepoClient {
     await this.client.sse(`${this.p}/tasks/${enc(id)}`, {}, onEvent, opts);
     return undefined;
   }
+
+  /** Issues (D50). Writes need a signed-in principal; closing others' issues, labels and
+   * assignees need write. A refused change is a 400 with the reason. */
+  readonly issues = {
+    /** GitHub search syntax: `is:open|closed`, `author:`, `assignee:`, `label:`, `sort:`, words. */
+    list: (q = "is:open", page = 1, opts?: CallOptions) =>
+      this.client.json<IssuePage>(`${this.p}/issues${qs({ q, page: page > 1 ? String(page) : undefined })}`, opts),
+    get: (n: number, opts?: CallOptions) => this.client.json<IssueDetail>(`${this.p}/issues/${n}`, opts),
+    create: (issue: { title: string; body?: string; labels?: string[]; assignees?: string[] }, opts?: CallOptions) =>
+      this.client.json<IssueDetail>(`${this.p}/issues`, opts, jsonBody("POST", issue)),
+    update: (n: number, patch: IssuePatch, opts?: CallOptions) =>
+      this.client.json<IssueDetail>(`${this.p}/issues/${n}`, opts, jsonBody("PATCH", patch)),
+    /** `close` = GitHub's "Close with comment" (one change). */
+    comment: (n: number, body: string, close?: "completed" | "not_planned", opts?: CallOptions) =>
+      this.client.json<IssueDetail>(`${this.p}/issues/${n}/comments`, opts, jsonBody("POST", { body, close })),
+    editComment: (n: number, id: number, body: string, opts?: CallOptions) =>
+      this.client.json<IssueDetail>(`${this.p}/issues/${n}/comments/${id}`, opts, jsonBody("PATCH", { body })),
+    deleteComment: (n: number, id: number, opts?: CallOptions) =>
+      this.client.json<IssueDetail>(`${this.p}/issues/${n}/comments/${id}`, opts, { method: "DELETE" }),
+  };
 
   readonly ops = {
     /** Available maintenance operations + recent runs. */

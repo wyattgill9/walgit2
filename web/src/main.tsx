@@ -19,6 +19,9 @@ const CommitPage = lazy(() => track(import("./pages/CommitPage")).then((m) => ({
 const OverviewPage = lazy(() => track(import("./pages/OverviewPage")).then((m) => ({ default: m.OverviewPage })));
 const SettingsPage = lazy(() => track(import("./pages/SettingsPage")).then((m) => ({ default: m.SettingsPage })));
 const BranchesPage = lazy(() => track(import("./pages/BranchesPage")).then((m) => ({ default: m.BranchesPage })));
+const IssuesPage = lazy(() => track(import("./pages/Issues")).then((m) => ({ default: m.IssuesPage })));
+const IssuePage = lazy(() => track(import("./pages/Issues")).then((m) => ({ default: m.IssuePage })));
+const NewIssuePage = lazy(() => track(import("./pages/Issues")).then((m) => ({ default: m.NewIssuePage })));
 const ApiPage = lazy(() => track(import("./pages/ApiPage")).then((m) => ({ default: m.ApiPage })));
 
 createRoot(document.getElementById("root")!).render(
@@ -40,6 +43,9 @@ createRoot(document.getElementById("root")!).render(
             <Route path="commit/:sha" element={<CommitPage />} />
             <Route path="branches" element={<BranchesPage />} />
             <Route path="branches/:view" element={<BranchesPage />} />
+            <Route path="issues" element={<IssuesPage />} />
+            <Route path="issues/new" element={<NewIssuePage />} />
+            <Route path="issues/:number" element={<IssuePage />} />
           </Route>
         </Route>
       </Routes>

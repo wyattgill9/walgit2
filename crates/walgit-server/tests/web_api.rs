@@ -630,3 +630,169 @@ async fn browser_localhost_redirects_to_walgit_localhost() -> TestResult {
     assert_ne!(git.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
     Ok(())
 }
+
+/// D50 issues: who may do what, JSON-only writes, search counts and the timeline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issues_api() -> TestResult {
+    use reqwest::Method as M;
+    use serde_json::json;
+    let token = |principal: &str, write: bool| walgit_config::StaticToken {
+        principal: principal.into(),
+        token: format!("{principal}-token"),
+        token_env: None,
+        write,
+        admin: false,
+    };
+    let server = Server::start_with_tweak(|c| {
+        c.server.auth.mode = walgit_config::AuthMode::Token;
+        c.server.auth.anonymous_read = true;
+        c.server.auth.tokens = vec![
+            token("alice", false),
+            token("bob", false),
+            token("maint", true),
+        ];
+    })
+    .await?;
+    let call = |method: reqwest::Method, path: &str, who: Option<&str>, body: Option<Value>| {
+        let mut req = reqwest::Client::new().request(method, format!("{}{path}", server.base_url));
+        if let Some(who) = who {
+            req = req.bearer_auth(format!("{who}-token"));
+        }
+        if let Some(body) = body {
+            req = req.json(&body);
+        }
+        async move {
+            let resp = req.send().await?;
+            let status = resp.status().as_u16();
+            let text = resp.text().await?;
+            anyhow::Ok((
+                status,
+                serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text)),
+            ))
+        }
+    };
+    assert_eq!(call(M::PUT, "/o/r/api", Some("maint"), None).await?.0, 201);
+
+    let (status, _) = call(
+        M::POST,
+        "/o/r/api/issues",
+        None,
+        Some(json!({"title": "x"})),
+    )
+    .await?;
+    assert_eq!(status, 401, "anonymous readers can't open issues");
+    let form = reqwest::Client::new()
+        .post(format!("{}/o/r/api/issues", server.base_url))
+        .bearer_auth("alice-token")
+        .header("content-type", "text/plain")
+        .body(r#"{"title":"x"}"#)
+        .send()
+        .await?;
+    assert_eq!(form.status().as_u16(), 415, "writes are JSON only");
+
+    let (status, issue) = call(
+        M::POST,
+        "/o/r/api/issues",
+        Some("alice"),
+        Some(json!({"title": "Crash on push", "body": "steps"})),
+    )
+    .await?;
+    assert_eq!(
+        (status, issue["number"].as_u64(), issue["state"].as_str()),
+        (201, Some(1), Some("open"))
+    );
+    let (status, issue) = call(
+        M::POST,
+        "/o/r/api/issues/1/comments",
+        Some("bob"),
+        Some(json!({"body": "same here"})),
+    )
+    .await?;
+    assert_eq!((status, issue["comments"].as_u64()), (201, Some(1)));
+
+    let (status, refused) = call(
+        M::PATCH,
+        "/o/r/api/issues/1",
+        Some("bob"),
+        Some(json!({"state": "closed"})),
+    )
+    .await?;
+    assert_eq!(status, 400, "{refused}");
+    let (status, _) = call(
+        M::PATCH,
+        "/o/r/api/issues/1",
+        Some("alice"),
+        Some(json!({"add_labels": ["bug"]})),
+    )
+    .await?;
+    assert_eq!(status, 400, "labels need write");
+    let (status, _) = call(
+        M::PATCH,
+        "/o/r/api/issues/1",
+        Some("maint"),
+        Some(json!({"add_labels": ["bug"]})),
+    )
+    .await?;
+    assert_eq!(status, 200);
+    let (status, issue) = call(
+        M::POST,
+        "/o/r/api/issues/1/comments",
+        Some("alice"),
+        Some(json!({"body": "fixed in main", "close": "completed"})),
+    )
+    .await?;
+    assert_eq!(
+        (
+            status,
+            issue["state"].as_str(),
+            issue["state_reason"].as_str()
+        ),
+        (201, Some("closed"), Some("completed"))
+    );
+    call(
+        M::POST,
+        "/o/r/api/issues",
+        Some("bob"),
+        Some(json!({"title": "Docs typo"})),
+    )
+    .await?;
+
+    let open = json(&server, "/o/r/api/issues").await?;
+    assert_eq!(
+        (open["open_count"].as_u64(), open["closed_count"].as_u64()),
+        (Some(1), Some(1))
+    );
+    assert_eq!(open["items"][0]["number"], 2);
+    let closed = json(&server, "/o/r/api/issues?q=is:closed%20label:bug").await?;
+    assert_eq!(closed["items"][0]["labels"], json!(["bug"]));
+
+    let detail = json(&server, "/o/r/api/issues/1").await?;
+    let kinds: Vec<&str> = detail["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["comment", "labeled", "comment", "closed"]);
+    let bobs = detail["timeline"][0]["id"].as_u64().unwrap();
+    let (status, _) = call(
+        M::PATCH,
+        &format!("/o/r/api/issues/1/comments/{bobs}"),
+        Some("alice"),
+        Some(json!({"body": "edited"})),
+    )
+    .await?;
+    assert_eq!(
+        status, 400,
+        "only the author or a collaborator edits a comment"
+    );
+    let (status, issue) = call(
+        M::DELETE,
+        &format!("/o/r/api/issues/1/comments/{bobs}"),
+        Some("bob"),
+        None,
+    )
+    .await?;
+    assert_eq!((status, issue["comments"].as_u64()), (200, Some(1)));
+    Ok(())
+}

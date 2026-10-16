@@ -177,6 +177,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(
             web::v1::router(state.clone())
                 .with_state(())
+                .layer(web_compression.clone()),
+        )
+        .merge(
+            web::forge::router(state.clone())
+                .with_state(())
                 .layer(web_compression),
         )
         .merge(gated)

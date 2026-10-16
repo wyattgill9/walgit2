@@ -22,7 +22,7 @@ Forge state is a fold of events in the WAL. There is no other store.
 | Slice | State |
 |---|---|
 | 0 Groundwork (Garage CAS emulation, S3 checksums, D50) | done |
-| 1 Issues | — |
+| 1 Issues: API, SDK, list/detail/new pages, labels, assignees; checkpointed `forge.pb` | done |
 | 2 Checkpointed state, recovery, benchmarks | — |
 | 3 Pull requests | — |
 | 4 Reviews | — |
@@ -41,6 +41,24 @@ WALGIT_TEST_S3_EMULATE_CAS=1 WALGIT_TEST_S3_ENDPOINT=http://127.0.0.1:3900 \
   cargo test -p walgit-store --features s3 --test contract s3_contract
 ```
 
+## Behavior worth knowing
+
+- **Permissions** come from the existing principal.
+  - Anyone signed in may open issues, comment, and edit or close what they authored.
+  - `write` may do everything, including labels and assignees.
+  - Anonymous readers can't write.
+  - The publisher checks every rule again on each CAS attempt. A refused request publishes
+    nothing and answers 400 with the reason.
+- **One change, one entry.** "Close with comment" and a multi-field `PATCH` are each one entry.
+- **Direct import** refuses repositories that have issues. Its folded log would drop them.
+- **Deployment order.** A checkpoint written by a binary older than D50 would carry no
+  `forge_key`. Stop older writers before using the forge (D43's rule).
+
 ## Measurements
 
-None yet. They arrive with slice 2: write latency, contention, list/search latency, and storage growth.
+Benchmarks are not in yet; they come with slice 2. Checked so far on Garage, one instance with
+`emulate_conditional_writes`, and checkpoints every 8 entries:
+- 32 concurrent comments plus a concurrent `git push`: all 32 present exactly once, and the push
+  landed.
+- `kill -9`, then a cold start on an empty cache directory: identical issue list and timeline,
+  read from `forge.pb` plus the log tail.

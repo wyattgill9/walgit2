@@ -490,6 +490,38 @@ list by `commit_date` day and shows `subject` + `author`.
   walgit passes `--diff-merges=first-parent`). Do not return a combined
   (`diff --cc`) patch or an empty patch with non-empty `stats`.
 
+### Issues (D50, `docs/FORGE.md`)
+
+Issues are WAL forge events; every answer folds them at refs level (no objects), so a
+read after an acknowledged write sees it on any instance. Cache: SWR.
+
+- `GET /{owner}/{repo}/api/issues?q=&page=` — one page of 25 plus GitHub's
+  counts for the same query without its state filter:
+  `{ "items": [Issue], "open_count": 3, "closed_count": 9, "page": 1, "per_page": 25 }`.
+  `q` defaults to `is:open`; it understands `is:open|closed`, `author:`,
+  `assignee:`, `label:` (repeat = all of them; quote spaces),
+  `sort:created-desc|created-asc|updated-desc|comments-desc`, and words
+  (case-insensitive, title and body).
+- `Issue` = `{ number, kind: "issue", title, body, edited, author, state: "open"|"closed",
+  state_reason: ""|"completed"|"not_planned", labels, assignees, created_at, updated_at,
+  closed_at, comments }`; times are ISO 8601 UTC.
+- `GET /{owner}/{repo}/api/issues/{n}` — `Issue` + `timeline`: comments
+  `{ type: "comment", id, actor, at, body, edited, deleted }` and events
+  (`closed {reason}`, `reopened`, `renamed {from,to}`, `labeled {added,removed}`,
+  `assigned {added,removed}`).
+
+Writes take `Content-Type: application/json` only (anything else is `415`), need a
+signed-in principal (`401` for anonymous readers), and answer the issue as above.
+A refused change is a `400` with the reason; nothing is published.
+
+| Write | Body | Who |
+|---|---|---|
+| `POST …/issues` (`201`) | `{title, body?, labels?, assignees?}` | anyone signed in; labels/assignees need write |
+| `PATCH …/issues/{n}` | any of `title, body, state: "open"|"closed", state_reason, add_labels, remove_labels, add_assignees, remove_assignees` — one change | title/body/state: the author or write; labels/assignees: write |
+| `POST …/issues/{n}/comments` (`201`) | `{body, close?: "completed"|"not_planned"}` ("Close with comment" is one change) | anyone signed in; `close` as above |
+| `PATCH …/issues/{n}/comments/{id}` | `{body}` | the comment's author or write |
+| `DELETE …/issues/{n}/comments/{id}` | — | the comment's author or write |
+
 ### `GET /{owner}/{repo}/api/overview` — optional, walgit-specific
 
 Backs the "WAL" tab. Not needed by Code/Commits pages; a host without a

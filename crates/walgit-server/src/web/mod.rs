@@ -1,4 +1,5 @@
 pub mod api;
+pub mod forge;
 pub mod login;
 pub mod objects;
 pub mod trailers;

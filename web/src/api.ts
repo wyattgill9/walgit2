@@ -31,6 +31,11 @@ export type {
   OpEvent,
   RepoSummary,
   Me,
+  Issue,
+  IssueDetail,
+  IssuePage,
+  IssuePatch,
+  TimelineItem,
 } from "../sdk/repos";
 import type { RefInfo, OpEvent, OpSpec, OpRecord, Tasks, BranchQuery } from "../sdk/repos";
 export type { SettingsDescribe, SettingsValidation, SettingsHistory, SettingsField, Policy, PolicyValidation, PolicyDryRun, RepoSettings } from "../sdk/repos";
@@ -104,6 +109,12 @@ export const api = {
   overview: (repo: string) => authRedirect(client.repo(repo).overview() as unknown as Promise<Overview>),
   /** What is happening to this repo on the instance that answers (API.md §2c). Never cached. */
   tasks: (repo: string): Promise<Tasks> => client.repo(repo).tasks(),
+  /** Who this browser is signed in as (decides which write controls show). */
+  me: () => authRedirect(client.me()),
+  issuePage: (repo: string, q: string, page: number) => authRedirect(client.repo(repo).issues.list(q, page)),
+  issue: (repo: string, n: number) => authRedirect(client.repo(repo).issues.get(n)),
+  /** D50 issue writes (the SDK namespace; callers `invalidate("issue")` after). */
+  issues: (repo: string) => client.repo(repo).issues,
   /** D24 settings + policy (Settings tab). Writes are never cached. */
   settings: (repo: string) => client.repo(repo).settings,
   policy: (repo: string) => client.repo(repo).policy,

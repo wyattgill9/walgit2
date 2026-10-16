@@ -860,6 +860,7 @@ async fn test_orphan_log_invisible_and_cleaned() {
         writer: "orphan_test".to_string(),
         meta: HashMap::new(),
         settings: None,
+        forge: Vec::new(),
     };
     let orphan_bytes = walgit_proto::frame::encode_entries(std::iter::once(&orphan_entry));
     let orphan_key = walgit_proto::keys::log_segment_key(99);
@@ -2987,4 +2988,136 @@ async fn readiness_carries_only_proven_inventory_and_rechecks_revision_only_rest
         reopened.packs_ready(),
         "reconciliation must settle at the held revision"
     );
+}
+
+// ---- D50 forge ----
+
+fn forge_ev(
+    number: u64,
+    body: walgit_proto::v1::forge_event::Body,
+) -> walgit_proto::v1::ForgeEvent {
+    walgit_proto::v1::ForgeEvent {
+        number,
+        actor: String::new(),
+        body: Some(body),
+    }
+}
+
+fn forge_issue(title: &str) -> walgit_proto::v1::ForgeEvent {
+    forge_ev(
+        0,
+        walgit_proto::v1::forge_event::Body::Opened(walgit_proto::v1::ForgeOpened {
+            kind: walgit_proto::v1::ForgeKind::Issue as i32,
+            title: title.into(),
+            ..Default::default()
+        }),
+    )
+}
+
+fn forge_comment(number: u64, body: &str) -> walgit_proto::v1::ForgeEvent {
+    forge_ev(
+        number,
+        walgit_proto::v1::forge_event::Body::Comment(walgit_proto::v1::ForgeComment {
+            body: body.into(),
+        }),
+    )
+}
+
+fn forge_close(number: u64) -> walgit_proto::v1::ForgeEvent {
+    forge_ev(
+        number,
+        walgit_proto::v1::forge_event::Body::State(walgit_proto::v1::ForgeStateChange {
+            closed: true,
+            reason: "completed".into(),
+        }),
+    )
+}
+
+/// Two instances race for issue numbers (each assigned once), a refused precondition publishes
+/// nothing, and a third instance cold-starts from the checkpoint's forge history + the log tail.
+#[tokio::test]
+async fn test_forge_numbers_preconditions_and_checkpoint_cold_start() {
+    use walgit_wal::forge::Actor;
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let registry_a = Registry::new(
+        store.clone(),
+        Arc::new(make_config(&cache.path().join("a"), 0)),
+    );
+    let registry_b = Registry::new(
+        store.clone(),
+        Arc::new(make_config(&cache.path().join("b"), 0)),
+    );
+    let id = repo_id("test", "forge");
+    let a = registry_a.create(&id, ObjectFormat::Sha1).await.unwrap();
+    let b = registry_b.open(&id).await.unwrap();
+    let alice = Actor {
+        name: "alice".into(),
+        write: false,
+    };
+    let bob = Actor {
+        name: "bob".into(),
+        write: false,
+    };
+
+    let opens = |h: Arc<walgit_wal::RepoHandle>| {
+        let alice = alice.clone();
+        futures::future::join_all((0..10).map(move |i| {
+            let (h, alice) = (h.clone(), alice.clone());
+            async move {
+                h.publish_forge(alice, vec![forge_issue(&format!("issue {i}"))])
+                    .await
+            }
+        }))
+    };
+    let (ra, rb) = tokio::join!(opens(a.clone()), opens(b.clone()));
+    assert!(ra.iter().chain(&rb).all(Result::is_ok), "{ra:?} {rb:?}");
+    drop(b.sync_refs().await.unwrap());
+    b.forge_ensure().await.unwrap();
+    let numbers: Vec<u64> = b.forge_read(|s| s.items.keys().copied().collect());
+    assert_eq!(numbers, (1..=20).collect::<Vec<_>>());
+
+    drop(a.sync_refs().await.unwrap());
+    let head = a.manifest().head_seq;
+    let refused = a.publish_forge(bob, vec![forge_close(1)]).await;
+    assert!(
+        matches!(refused, Err(walgit_wal::WalError::Invalid(_))),
+        "{refused:?}"
+    );
+    drop(a.sync_refs().await.unwrap());
+    assert_eq!(
+        a.manifest().head_seq,
+        head,
+        "a refused request publishes nothing"
+    );
+
+    a.publish_forge(
+        alice.clone(),
+        vec![forge_comment(1, "repro attached"), forge_close(1)],
+    )
+    .await
+    .unwrap();
+    a.write_checkpoint().await.unwrap();
+    a.publish_forge(alice, vec![forge_comment(2, "after the checkpoint")])
+        .await
+        .unwrap();
+
+    let registry_c = Registry::new(
+        store.clone(),
+        Arc::new(make_config(&cache.path().join("c"), 0)),
+    );
+    let c = registry_c.open(&id).await.unwrap();
+    drop(c.sync_refs().await.unwrap());
+    assert!(
+        c.manifest()
+            .checkpoint
+            .as_ref()
+            .is_some_and(|cp| !cp.forge_key.is_empty())
+    );
+    c.forge_ensure().await.unwrap();
+    c.forge_read(|s| {
+        assert_eq!(s.items.len(), 20);
+        assert_eq!((s.items[&1].state, s.items[&1].comments), ("closed", 1));
+        assert_eq!(s.items[&2].comments, 1);
+    });
 }

@@ -16,6 +16,7 @@ import "google/protobuf/timestamp.proto";
 //                          (+ .rev, .bitmap for compacted packs)
 //   checkpoints/<seq:016x>/checkpoint.pb   Checkpoint: pack set + ref snapshot ref
 //   checkpoints/refs/<sha256>.pb          canonical RefSnapshot
+//   checkpoints/forge/<sha256>.pb         ForgeHistory (D50)
 //   checkpoints/<seq:016x>/attempts/<id>/checkpoint.pb  unique metadata candidate
 //   Older checkpoints/<seq:016x>/refs.pb and bundle objects remain decodable;
 //   bundle wrappers/lists are historical data, not active runtime delivery.
@@ -59,6 +60,9 @@ message Manifest {
   RepoSettings settings = 12;
   // Exact committed download history; no time or count expiry.
   repeated RetiredPack retired_packs = 13;
+  // D50: the next issue/PR number (0 = the forge was never used). Allocated by the publisher
+  // under this CAS, one per `ForgeOpened`.
+  uint64 forge_next_number = 14;
 }
 
 // D24: per-repository settings — a TOML document restricted to the sections a
@@ -171,6 +175,8 @@ enum EntryKind {
   ENTRY_KIND_CHECKPOINT = 4;
   // D24: `settings` changed (the manifest carries the latest; this is history).
   ENTRY_KIND_SETTINGS = 5;
+  // D50: forge events only (`forge`); refs and packs unchanged.
+  ENTRY_KIND_FORGE = 6;
 }
 
 message LogEntry {
@@ -190,6 +196,78 @@ message LogEntry {
   map<string, string> meta = 9;
   // `ENTRY_KIND_SETTINGS`: the settings as published at this seq.
   RepoSettings settings = 10;
+  // D50: issue/PR changes. On FORGE entries, and on PUSH when a ref change and a forge change
+  // must commit together (a merge).
+  repeated ForgeEvent forge = 11;
+}
+
+// D50: one issue/PR change. Its time is the entry's `created_at`; a comment's id is
+// `seq << 10 | index of the event in the entry`.
+message ForgeEvent {
+  // The item. Requests send 0 with `opened`; the publisher assigns the number.
+  uint64 number = 1;
+  // Principal that made the change.
+  string actor = 2;
+  oneof body {
+    ForgeOpened opened = 10;
+    ForgeComment comment = 11;
+    ForgeEdit edit = 12;
+    ForgeStateChange state = 13;
+    ForgeSetChange labels = 14;
+    ForgeSetChange assignees = 15;
+  }
+}
+
+enum ForgeKind {
+  FORGE_KIND_UNSPECIFIED = 0;
+  FORGE_KIND_ISSUE = 1;
+  FORGE_KIND_PULL = 2;
+}
+
+message ForgeOpened {
+  ForgeKind kind = 1;
+  string title = 2;
+  string body = 3;
+  repeated string labels = 4;
+  repeated string assignees = 5;
+}
+
+message ForgeComment {
+  string body = 1;
+}
+
+// Edits the item (comment_id = 0) or one comment.
+message ForgeEdit {
+  uint64 comment_id = 1;
+  oneof change {
+    string title = 2;
+    string body = 3;
+    bool deleted = 4;
+  }
+}
+
+message ForgeStateChange {
+  bool closed = 1;
+  // Closing: "completed" | "not_planned".
+  string reason = 2;
+}
+
+message ForgeSetChange {
+  repeated string add = 1;
+  repeated string remove = 2;
+}
+
+// checkpoints/forge/<sha256>.pb: every forge event up to `seq`, in WAL order. The fold of
+// these records is the forge state at `seq`.
+message ForgeHistory {
+  uint64 seq = 1;
+  repeated ForgeRecord records = 2;
+}
+
+message ForgeRecord {
+  uint64 seq = 1;
+  google.protobuf.Timestamp at = 2;
+  repeated ForgeEvent events = 3;
 }
 
 message RefUpdate {
@@ -244,6 +322,8 @@ message CheckpointRef {
   google.protobuf.Timestamp as_of = 5;
   // Exact committed snapshot pointer, empty on old checkpoints.
   string refs_key = 6;
+  // D50: the `ForgeHistory` at `seq`; empty when the forge was never used.
+  string forge_key = 7;
 }
 
 message RefSnapshot {
