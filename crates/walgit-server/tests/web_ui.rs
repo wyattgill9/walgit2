@@ -27,6 +27,7 @@ async fn page_routes_serve_index_without_cache() -> Result<()> {
         "/owner/repo/issues",
         "/owner/repo/issues/new",
         "/owner/repo/issues/3",
+        "/owner/repo/labels",
         "/owner/repo/pulls",
         "/owner/repo/pull/3",
         "/owner/repo/pull/3/files",

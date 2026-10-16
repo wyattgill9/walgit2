@@ -786,6 +786,35 @@ async fn issues_api() -> TestResult {
         status, 400,
         "only the author or a collaborator edits a comment"
     );
+
+    // The label catalog: writers define colors; deleting a label takes it off every issue.
+    let label = |who: &'static str, color: &str| {
+        call(
+            M::PUT,
+            "/o/r/api/labels/bug",
+            Some(who),
+            Some(json!({"color": color, "description": "Something isn't working"})),
+        )
+    };
+    assert_eq!(label("alice", "#d73a4a").await?.0, 400, "labels need write");
+    assert_eq!(label("maint", "red").await?.0, 400, "colors are #rrggbb");
+    let (status, catalog) = label("maint", "#d73a4a").await?;
+    assert_eq!(status, 200, "{catalog}");
+    assert_eq!(
+        (
+            catalog[0]["name"].as_str(),
+            catalog[0]["color"].as_str(),
+            catalog[0]["open"].as_u64()
+        ),
+        (Some("bug"), Some("#d73a4a"), Some(0))
+    );
+    let (status, _) = call(M::DELETE, "/o/r/api/labels/bug", Some("maint"), None).await?;
+    assert_eq!(status, 200);
+    assert_eq!(
+        json(&server, "/o/r/api/issues/1").await?["labels"],
+        json!([]),
+        "deleted from the issue too"
+    );
     let (status, issue) = call(
         M::DELETE,
         &format!("/o/r/api/issues/1/comments/{bobs}"),
@@ -902,6 +931,40 @@ async fn pulls_api() -> TestResult {
     assert_eq!(
         issues["items"][0]["number"], 2,
         "the issue list holds issues only"
+    );
+    assert_eq!(
+        issues["authors"],
+        json!(["anon"]),
+        "the filter menus' values"
+    );
+    let counts = json(&server, "/o/r/api/forge/summary").await?;
+    assert_eq!(
+        (
+            counts["open_issues"].as_u64(),
+            counts["open_pulls"].as_u64()
+        ),
+        (Some(1), Some(1))
+    );
+    let via_issues = json(&server, "/o/r/api/issues/1").await?;
+    assert_eq!(
+        via_issues["kind"], "pull",
+        "an #1 link resolves through the issues route"
+    );
+    let (status, _) = post(
+        "/o/r/api/issues/2/comments",
+        json!({"body": "blocked by #1"}),
+    )
+    .await?;
+    assert_eq!(status, 201);
+    let pr1 = json(&server, "/o/r/api/pulls/1").await?;
+    let mentioned = pr1["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["type"] == "referenced" && t["source"] == 2);
+    assert!(
+        mentioned,
+        "#1 in issue 2 shows on the pull request's timeline: {pr1}"
     );
 
     // Close, then move the branch: the closed PR keeps showing what it had.
@@ -1099,5 +1162,44 @@ async fn merge_api() -> TestResult {
     );
     let merged_list = json(&server, "/o/r/api/pulls?q=is:merged").await?;
     assert_eq!(merged_list["items"].as_array().unwrap().len(), 4);
+
+    // A draft can't merge until it is ready for review.
+    git_in(&src, &["branch", "-f", "main", "FETCH_HEAD"])?;
+    branch("d", &[("e.txt", "e\n")])?;
+    let (_, pd) = call(
+        M::POST,
+        "/o/r/api/pulls",
+        Some(json!({"title": "wip", "base": "main", "head": "d", "draft": true})),
+    )
+    .await?;
+    let pd = pd["number"].as_u64().unwrap();
+    assert_eq!(
+        json(&server, "/o/r/api/pulls?q=is:draft").await?["items"][0]["number"],
+        pd
+    );
+    let (status, why) = call(
+        M::POST,
+        &format!("/o/r/api/pulls/{pd}/merge"),
+        Some(json!({})),
+    )
+    .await?;
+    assert_eq!(status, 400, "{why}");
+    let (status, ready) = call(
+        M::PATCH,
+        &format!("/o/r/api/pulls/{pd}"),
+        Some(json!({"draft": false})),
+    )
+    .await?;
+    assert_eq!((status, ready["draft"].as_bool()), (200, Some(false)));
+    assert_eq!(
+        call(
+            M::POST,
+            &format!("/o/r/api/pulls/{pd}/merge"),
+            Some(json!({}))
+        )
+        .await?
+        .0,
+        200
+    );
     Ok(())
 }

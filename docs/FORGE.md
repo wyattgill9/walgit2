@@ -29,6 +29,8 @@ Forge state is a fold of events in the WAL. There is no other store.
 | 3 Pull requests: compare, open, list, Conversation / Commits / Files changed, close and reopen | done |
 | 4 Reviews: approve / request changes / comment, line comments from the diff, review decision | done |
 | 5 Merge (merge / squash / rebase), mergeability, closing keywords, delete branch | done |
+| Deferred, batch A: tab and PR tab counts, Author/Label/Assignee menus, `#n` links and "mentioned in" entries | done |
+| Deferred, batch B1: draft pull requests, the label catalog (colors, Labels page) | done |
 
 ## Local rig: Garage
 
@@ -123,3 +125,44 @@ Group commit is what scales throughput: concurrent writes share one CAS. All 338
 exactly once. On real S3, add about 60–80 ms per round trip (a write is 3 rounds). Earlier on
 Garage, 32 concurrent comments plus a `git push`, then `kill -9` and a cold start on an empty
 cache, reproduced the same issues and timelines.
+
+## Fuzz
+
+`tests/forge-fuzz.mjs` plays users doing everything people do with a repository, starting from an
+empty one:
+- **Git:** the maintainer commits on main; developers branch, commit and push, update their PR
+  branches, merge main into a conflicting branch, and delete branches.
+- **Pull requests:** open, sometimes as drafts and with `Fixes #n` and `#n` references; review
+  (approve, request changes, line comments); merge by every method; close and reopen.
+- **Issues:** open, comment, close with a comment, close as completed or not planned, reopen,
+  label, assign, edit, and edit or delete comments.
+- **Label catalog:** churn on colors and deletions.
+- **Permission probes:** what a read-only user, an author or an anonymous visitor must be refused.
+
+It keeps a model of every item. Every 25 steps and at the end, the server must equal it:
+- state, merged, draft, title, comment count, labels, assignees, close reason, review decision;
+- the list and tab counts;
+- every `#n` mention.
+
+At the end, a fresh clone must pass `git fsck`, every merge commit must be on main with the right
+parent count, and deleted branches must be gone. `MODE=snapshot` dumps every item, to compare
+across a cold restart.
+
+It needs token users `alice`/`bob` (write), `carol` (read only) and `maint` (write, admin);
+see the header of the script. Use a fresh repository or `store.prefix`.
+
+Results on Garage, 2026-10-16:
+- Eight seeds, 2,150 steps, four of them running in parallel on separate repositories. The
+  model matched every time.
+- Seed 7 at 400 steps: 72 items, 9 merges, 11 branches deleted, 78 cross-references, and 111
+  correctly refused actions.
+- `kill -9`, then a cold start on an empty cache: every item byte-identical, rebuilt from 11
+  forge checkpoints plus the tail.
+- All 84 UI pages of the result render without an error in headless Chrome.
+
+Found and fixed along the way:
+- A clean merge is not always a clean rebase. A branch that merged main to resolve a conflict
+  can't be replayed commit by commit. Mergeability now reports `rebaseable`, and the UI offers
+  "Rebase and merge" only then.
+- A draft with conflicts answered 409 (conflict) instead of 400 (draft). The draft check now
+  comes first.

@@ -522,6 +522,21 @@ A refused change is a `400` with the reason; nothing is published.
 | `PATCH …/issues/{n}/comments/{id}` | `{body}` | the comment's author or write |
 | `DELETE …/issues/{n}/comments/{id}` | — | the comment's author or write |
 
+More issue surface:
+
+- The list answer also carries `authors`, `labels` and `assignees`: every value among items
+  of that kind (plus every catalog label), for the filter menus.
+- `GET …/issues/{n}` also answers for a pull request (`kind: "pull"`), as GitHub's API does.
+  An `#n` link needs no kind; the UI forwards `/issues/{n}` to `/pull/{n}`.
+- `#n` anywhere in a title, body, comment or review adds
+  `{type: "referenced", source}` to item `n`'s timeline, once per source item. It is derived
+  in the fold, with no event of its own.
+- `GET …/api/forge/summary` — `{open_issues, open_pulls}` (the repository tabs).
+- `GET …/api/labels` — `[{name, color: "#rrggbb", description, open}]`: the catalog, plus
+  labels items carry without a definition (gray), and how many open items carry each.
+  `PUT …/labels/{name}` `{color, description?}` creates or updates one. `DELETE
+  …/labels/{name}` removes it from the catalog and from every item. Both need write.
+
 ### Pull requests (D50)
 
 `…/api/pulls`, `…/pulls/{n}`, `…/pulls/{n}/comments[/{id}]` behave exactly like the issue
@@ -531,8 +546,11 @@ list holds its own kind). A pull request adds `base_ref`/`head_ref` (branch name
 at closing once closed (a deleted branch falls back to its tip when opened). Show its
 Commits and Files changed with `compare/{base_sha}...{head_sha}`.
 
-- `POST …/api/pulls` (`201`) `{title, body?, base, head}`: both branches must exist and
+- `POST …/api/pulls` (`201`) `{title, body?, base, head, draft?}`: both branches must exist and
   differ; one open pull request per `head`→`base` (`400` otherwise). Anyone signed in.
+- Drafts: `draft: true` items can't be merged (`400`). `PATCH …/pulls/{n}` `{draft: false}`
+  marks one ready for review; `{draft: true}` converts it back. Either needs the author or
+  write. Both appear in the timeline as `{type: "draft", draft}`. Search: `is:draft`.
 - Closing (`PATCH {state: "closed"}` or a comment with `close`) freezes the tips.
 - `POST …/api/pulls/{n}/reviews` (`201`) `{state: "approved"|"changes_requested"|"commented",
   body?, comments?: [{path, side: "RIGHT"|"LEFT", line, body}]}` reviews the current head:

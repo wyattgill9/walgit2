@@ -14,8 +14,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use walgit_proto::v1::{
-    ForgeComment, ForgeEdit, ForgeEvent, ForgeKind, ForgeLineComment, ForgeOpened, ForgeReview,
-    ForgeSetChange, ForgeStateChange, forge_edit, forge_event::Body,
+    ForgeComment, ForgeDraft, ForgeEdit, ForgeEvent, ForgeKind, ForgeLabel, ForgeLineComment,
+    ForgeOpened, ForgeReview, ForgeSetChange, ForgeStateChange, forge_edit, forge_event::Body,
 };
 use walgit_wal::RepoHandle;
 use walgit_wal::forge::{Actor, Item, SearchPage, TimelineItem};
@@ -28,7 +28,13 @@ pub fn router(state: Arc<AppState>) -> Router {
     let mut r = Router::new();
     for base in REPO_API_BASES {
         r = routes::<false>(r, &format!("{base}/issues"))
-            .route(&format!("{base}/issues"), post(create_issue));
+            .route(&format!("{base}/issues"), post(create_issue))
+            .route(&format!("{base}/forge/summary"), get(summary))
+            .route(&format!("{base}/labels"), get(labels))
+            .route(
+                &format!("{base}/labels/{{name}}"),
+                axum::routing::put(put_label).delete(delete_label),
+            );
         r = routes::<true>(r, &format!("{base}/pulls"))
             .route(&format!("{base}/pulls"), post(create_pull))
             .route(&format!("{base}/pulls/{{number}}/reviews"), post(review))
@@ -95,6 +101,9 @@ struct NewPull {
     /// Branch names: merge `head` into `base`.
     base: String,
     head: String,
+    /// Open as a draft (not mergeable until ready for review).
+    #[serde(default)]
+    draft: bool,
 }
 
 /// Every field optional; the present ones commit together as one entry.
@@ -114,6 +123,8 @@ struct ItemPatch {
     add_assignees: Vec<String>,
     #[serde(default)]
     remove_assignees: Vec<String>,
+    /// Pull requests: `true` = convert to draft, `false` = ready for review.
+    draft: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -203,7 +214,9 @@ pub(super) fn detail_of(handle: &RepoHandle, number: u64, pull: bool) -> Result<
         .forge_read(|s| {
             s.items
                 .get(&number)
-                .filter(|i| i.kind == kind_name(pull))
+                // The issues routes answer for pull requests too (GitHub's API does): an `#n` link
+                // needs no kind.
+                .filter(|i| !pull || i.kind == "pull")
                 .cloned()
         })
         .ok_or_else(|| ApiError::NotFound(format!("{} #{number}", kind_name(pull))))?;
@@ -366,6 +379,7 @@ async fn create_pull(
         head_ref: new.head,
         base_oid,
         head_oid,
+        draft: new.draft,
         ..Default::default()
     };
     created(&st, &headers, &owner, &repo, opened, true).await
@@ -417,6 +431,9 @@ async fn update<const PULL: bool>(
     }
     if let Some(c) = set_change(p.add_labels, p.remove_labels) {
         events.push(event(number, Body::Labels(c)));
+    }
+    if let Some(draft) = p.draft {
+        events.push(event(number, Body::Draft(ForgeDraft { draft })));
     }
     if let Some(c) = set_change(p.add_assignees, p.remove_assignees) {
         events.push(event(number, Body::Assignees(c)));
@@ -521,4 +538,120 @@ async fn review(
     );
     let (handle, _) = publish(&st, &headers, &owner, &repo, vec![ev]).await?;
     Ok((StatusCode::CREATED, Json(detail_of(&handle, number, true)?)).into_response())
+}
+
+#[derive(Serialize)]
+struct Summary {
+    open_issues: usize,
+    open_pulls: usize,
+}
+
+/// `GET …/forge/summary`: the open counts the repository tabs show.
+async fn summary(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let handle = synced(&st, &headers, &owner, &repo).await?;
+    let s = handle.forge_read(|s| {
+        let open = |kind: &str| {
+            s.items
+                .values()
+                .filter(|i| i.kind == kind && i.state == "open")
+                .count()
+        };
+        Summary {
+            open_issues: open("issue"),
+            open_pulls: open("pull"),
+        }
+    });
+    Ok(json_swr(&s, None).into_response(&headers))
+}
+
+#[derive(Serialize)]
+struct LabelRow {
+    #[serde(flatten)]
+    def: walgit_wal::forge::LabelDef,
+    /// Open issues and pull requests carrying it.
+    open: usize,
+}
+
+/// `GET …/labels`: the catalog (plus labels items carry without a definition, gray), with how
+/// many open items carry each.
+async fn labels(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let handle = synced(&st, &headers, &owner, &repo).await?;
+    let rows: Vec<LabelRow> = handle.forge_read(|s| {
+        let mut defs = s.labels.clone();
+        for i in s.items.values() {
+            for l in &i.labels {
+                defs.entry(l.clone())
+                    .or_insert_with(|| walgit_wal::forge::LabelDef {
+                        name: l.clone(),
+                        color: "#777777".into(),
+                        description: String::new(),
+                    });
+            }
+        }
+        defs.into_values()
+            .map(|def| LabelRow {
+                open: s
+                    .items
+                    .values()
+                    .filter(|i| i.state == "open" && i.labels.contains(&def.name))
+                    .count(),
+                def,
+            })
+            .collect()
+    });
+    Ok(json_swr(&rows, None).into_response(&headers))
+}
+
+#[derive(Deserialize)]
+struct LabelBody {
+    /// `#rrggbb`
+    color: String,
+    #[serde(default)]
+    description: String,
+}
+
+/// `PUT …/labels/{name}`: create or update a label (write).
+async fn put_label(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo, name)): Path<(String, String, String)>,
+    Json(b): Json<LabelBody>,
+) -> Result<Response, ApiError> {
+    let ev = event(
+        0,
+        Body::Label(ForgeLabel {
+            name,
+            color: b.color,
+            description: b.description,
+            deleted: false,
+        }),
+    );
+    publish(&st, &headers, &owner, &repo, vec![ev]).await?;
+    labels(State(st), headers, Path((owner, repo))).await
+}
+
+/// `DELETE …/labels/{name}`: drop it from the catalog and from every item (write).
+async fn delete_label(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo, name)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    let ev = event(
+        0,
+        Body::Label(ForgeLabel {
+            name,
+            deleted: true,
+            ..Default::default()
+        }),
+    );
+    publish(&st, &headers, &owner, &repo, vec![ev]).await?;
+    labels(State(st), headers, Path((owner, repo))).await
 }

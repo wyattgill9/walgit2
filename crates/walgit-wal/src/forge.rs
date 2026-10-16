@@ -60,6 +60,8 @@ pub struct Item {
     pub review_decision: String,
     /// Pull requests: merged (then also `closed`), and the commit the base moved to.
     pub merged: bool,
+    /// Pull requests: a draft is not mergeable until it is marked ready for review.
+    pub draft: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub merge_commit: String,
     /// Reviewer → their latest deciding review state.
@@ -115,6 +117,14 @@ pub enum Timeline {
         method: String,
         commit: String,
     },
+    /// Marked as draft (`true`) or ready for review.
+    Draft {
+        draft: bool,
+    },
+    /// `#n` in another item's text (once per source item): "mentioned this in #source".
+    Referenced {
+        source: u64,
+    },
     Review {
         state: String,
         body: String,
@@ -123,11 +133,21 @@ pub enum Timeline {
     },
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct LabelDef {
+    pub name: String,
+    /// `#rrggbb`
+    pub color: String,
+    pub description: String,
+}
+
 /// The folded forge state at WAL `seq`.
 #[derive(Debug, Clone, Default)]
 pub struct ForgeState {
     pub seq: u64,
     pub items: BTreeMap<u64, Item>,
+    /// The repository's label catalog: name → definition.
+    pub labels: BTreeMap<String, LabelDef>,
     // ponytail: every record is kept and rewritten whole at each checkpoint; shard when
     // docs/FORGE.md measurements show forge.pb growing too large.
     records: Vec<ForgeRecord>,
@@ -141,6 +161,10 @@ pub struct SearchPage {
     pub closed_count: usize,
     pub page: usize,
     pub per_page: usize,
+    /// Every author, label and assignee among items of the searched kind (the filter menus).
+    pub authors: BTreeSet<String>,
+    pub labels: BTreeSet<String>,
+    pub assignees: BTreeSet<String>,
 }
 
 pub const PER_PAGE: usize = 25;
@@ -221,14 +245,71 @@ impl ForgeState {
     fn apply_record(&mut self, r: ForgeRecord) {
         let at = rfc3339(r.at.as_ref());
         for (i, ev) in r.events.iter().enumerate() {
-            self.apply(r.seq << 10 | i as u64, &at, ev);
+            let id = r.seq << 10 | i as u64;
+            self.apply(id, &at, ev);
+            self.cross_reference(id, &at, ev);
         }
         self.records.push(r);
+    }
+
+    /// Every `#n` an event's text names gets one "mentioned this in #source" entry (derived, so
+    /// a replay or a checkpoint reproduces it without an event of its own).
+    fn cross_reference(&mut self, id: u64, at: &str, ev: &ForgeEvent) {
+        use forge_event::Body;
+        let text = match &ev.body {
+            Some(Body::Opened(o)) => format!("{} {}", o.title, o.body),
+            Some(Body::Comment(c)) => c.body.clone(),
+            Some(Body::Edit(e)) => match &e.change {
+                Some(forge_edit::Change::Title(t) | forge_edit::Change::Body(t)) => t.clone(),
+                _ => return,
+            },
+            Some(Body::Review(r)) => r
+                .comments
+                .iter()
+                .fold(r.body.clone(), |s, c| s + " " + &c.body),
+            _ => return,
+        };
+        let source = ev.number;
+        for target in mentions(&text) {
+            let Some(item) = self.items.get_mut(&target).filter(|_| target != source) else {
+                continue;
+            };
+            let seen = item
+                .timeline
+                .iter()
+                .any(|t| matches!(t.event, Timeline::Referenced { source: s } if s == source));
+            if !seen {
+                item.timeline.push(TimelineItem {
+                    id,
+                    actor: ev.actor.clone(),
+                    at: at.to_owned(),
+                    event: Timeline::Referenced { source },
+                });
+            }
+        }
     }
 
     fn apply(&mut self, id: u64, at: &str, ev: &ForgeEvent) {
         use forge_event::Body;
         let Some(body) = &ev.body else { return };
+        if let Body::Label(l) = body {
+            if l.deleted {
+                self.labels.remove(&l.name);
+                for item in self.items.values_mut() {
+                    item.labels.remove(&l.name);
+                }
+            } else {
+                self.labels.insert(
+                    l.name.clone(),
+                    LabelDef {
+                        name: l.name.clone(),
+                        color: l.color.clone(),
+                        description: l.description.clone(),
+                    },
+                );
+            }
+            return;
+        }
         if let Body::Opened(o) = body {
             self.items.insert(
                 ev.number,
@@ -257,6 +338,7 @@ impl ForgeState {
                     head_oid: o.head_oid.clone(),
                     review_decision: String::new(),
                     merged: false,
+                    draft: o.draft,
                     merge_commit: String::new(),
                     reviews: BTreeMap::new(),
                     timeline: Vec::new(),
@@ -269,7 +351,11 @@ impl ForgeState {
         };
         at.clone_into(&mut item.updated_at);
         let event = match body {
-            Body::Opened(_) => return,
+            Body::Opened(_) | Body::Label(_) => return,
+            Body::Draft(d) => {
+                item.draft = d.draft;
+                Timeline::Draft { draft: d.draft }
+            }
             Body::Comment(c) => {
                 item.comments += 1;
                 Timeline::Comment {
@@ -406,6 +492,22 @@ impl ForgeState {
             let Some(body) = &ev.body else {
                 return Err("empty forge event".into());
             };
+            if let Body::Label(l) = body {
+                if !actor.write {
+                    return Err("only collaborators can manage labels".into());
+                }
+                if l.name.trim().is_empty() || l.name.len() > 50 {
+                    return Err("a label name is 1 to 50 characters".into());
+                }
+                let hex = l.color.strip_prefix('#').unwrap_or("");
+                if !l.deleted && (hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit())) {
+                    return Err(format!("label color {:?} is not #rrggbb", l.color));
+                }
+                if l.deleted && !self.labels.contains_key(&l.name) {
+                    return Err(format!("no label {:?}", l.name));
+                }
+                continue;
+            }
             if let Body::Opened(o) = body {
                 if o.kind() == ForgeKind::Unspecified {
                     return Err("an item must be an issue or a pull request".into());
@@ -438,7 +540,7 @@ impl ForgeState {
                 .ok_or_else(|| format!("#{} does not exist", ev.number))?;
             let own_or_write = actor.write || item.author == actor.name;
             match body {
-                Body::Opened(_) => {}
+                Body::Opened(_) | Body::Label(_) => {}
                 Body::Comment(c) => {
                     if c.body.trim().is_empty() {
                         return Err("comment can't be blank".into());
@@ -493,9 +595,33 @@ impl ForgeState {
                     }
                 }
                 Body::Review(r) => verify_review(item, actor, r)?,
+                Body::Draft(d) => {
+                    if item.kind != "pull" || item.state != "open" {
+                        return Err(format!("#{} is not an open pull request", item.number));
+                    }
+                    if !own_or_write {
+                        return Err("only the author or a collaborator can change this".into());
+                    }
+                    if d.draft == item.draft {
+                        return Err(format!(
+                            "#{} is already {}",
+                            item.number,
+                            if d.draft {
+                                "a draft"
+                            } else {
+                                "ready for review"
+                            }
+                        ));
+                    }
+                }
                 Body::Merged(m) => {
                     if item.kind != "pull" || item.state != "open" {
                         return Err(format!("#{} is not an open pull request", item.number));
+                    }
+                    if item.draft {
+                        return Err(
+                            "a draft pull request can't be merged; mark it ready for review".into(),
+                        );
                     }
                     if !actor.write {
                         return Err("only collaborators can merge".into());
@@ -509,7 +635,7 @@ impl ForgeState {
         Ok(())
     }
 
-    /// GitHub-style search: `is:open|closed|merged|unmerged|issue|pr`, `author:`, `assignee:`, `label:` (repeat =
+    /// GitHub-style search: `is:open|closed|merged|unmerged|draft|issue|pr`, `author:`, `assignee:`, `label:` (repeat =
     /// all of them), `review:approved|changes_requested|none`, `sort:created-desc|created-asc|updated-desc|comments-desc`, free words matched
     /// against title and body. `page` is 1-based.
     pub fn search(&self, query: &str, page: usize) -> SearchPage {
@@ -521,12 +647,14 @@ impl ForgeState {
         let mut sort = "created-desc";
         let mut review = None;
         let mut merged = None;
+        let mut draft = None;
         let mut words = Vec::new();
         let toks = tokens(query);
         for tok in &toks {
             match tok.split_once(':') {
                 Some(("is", "open" | "closed")) => state = tok.strip_prefix("is:"),
                 Some(("is", "merged")) => merged = Some(true),
+                Some(("is", "draft")) => draft = Some(true),
                 Some(("is", "unmerged")) => merged = Some(false),
                 Some(("is", "issue")) => kind = Some("issue"),
                 Some(("is", "pr")) => kind = Some("pull"),
@@ -547,6 +675,7 @@ impl ForgeState {
             .filter(|i| labels.iter().all(|l| i.labels.contains(*l)))
             .filter(|i| review.is_none_or(|r| i.review_decision == r))
             .filter(|i| merged.is_none_or(|m| i.merged == m))
+            .filter(|i| draft.is_none_or(|d| i.draft == d))
             .filter(|i| {
                 words.iter().all(|w| {
                     i.title.to_lowercase().contains(w.as_str())
@@ -573,6 +702,11 @@ impl ForgeState {
             _ => rows.sort_by_key(|i| std::cmp::Reverse(i.number)),
         }
         let page = page.max(1);
+        let of_kind = || {
+            self.items
+                .values()
+                .filter(|i| kind.is_none_or(|k| i.kind == k))
+        };
         SearchPage {
             items: rows
                 .into_iter()
@@ -584,6 +718,14 @@ impl ForgeState {
             closed_count,
             page,
             per_page: PER_PAGE,
+            authors: of_kind().map(|i| i.author.clone()).collect(),
+            labels: of_kind()
+                .flat_map(|i| i.labels.iter().cloned())
+                .chain(self.labels.keys().cloned())
+                .collect(),
+            assignees: of_kind()
+                .flat_map(|i| i.assignees.iter().cloned())
+                .collect(),
         }
     }
 }
@@ -624,6 +766,30 @@ fn verify_review(
         }
     }
     Ok(())
+}
+
+/// `#n` references in text: `#` after a non-word character (or at the start) and before
+/// digits. `page#12` and `&#12;` are not references.
+fn mentions(text: &str) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut prev = ' ';
+    for (i, c) in text.char_indices() {
+        if c == '#' && !(prev.is_alphanumeric() || matches!(prev, '&' | '/' | '#')) {
+            let digits: String = text
+                .get(i + 1..)
+                .unwrap_or_default()
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            if let Ok(n) = digits.parse() {
+                out.push(n);
+            }
+        }
+        prev = c;
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// Whitespace-separated tokens; double quotes group (`label:"good first issue"`).
@@ -1017,6 +1183,47 @@ mod tests {
                 q.join("\n  ")
             );
         }
+    }
+
+    /// `#n` in a comment adds one "mentioned in" entry to #n (not to itself, not twice), and
+    /// the facets list what the filter menus offer.
+    #[test]
+    fn cross_references_and_facets() {
+        assert_eq!(mentions("see #2, #10 and page#3 or &#4; #2 again"), [2, 10]);
+        let mut s = ForgeState::default();
+        let mut open = vec![
+            ev(0, "alice", opened("first")),
+            ev(0, "bob", opened("second")),
+        ];
+        ForgeState::number(&mut open, 1);
+        s.fold_entries(0, &[entry(1, open)]);
+        let say = |n, text: &str| {
+            ev(
+                n,
+                "carol",
+                forge_event::Body::Comment(ForgeComment { body: text.into() }),
+            )
+        };
+        s.fold_entries(
+            1,
+            &[
+                entry(2, vec![say(1, "dup of #2, and #1 itself, and #99")]),
+                entry(3, vec![say(1, "#2 again")]),
+            ],
+        );
+        let refs: Vec<_> = s.items[&2].timeline.iter().map(|t| &t.event).collect();
+        assert!(
+            matches!(refs.as_slice(), [Timeline::Referenced { source: 1 }]),
+            "{refs:?}"
+        );
+        assert!(
+            s.items[&1]
+                .timeline
+                .iter()
+                .all(|t| !matches!(t.event, Timeline::Referenced { .. }))
+        );
+        let page = s.search("is:issue", 1);
+        assert_eq!(page.authors.iter().collect::<Vec<_>>(), ["alice", "bob"]);
     }
 
     #[test]

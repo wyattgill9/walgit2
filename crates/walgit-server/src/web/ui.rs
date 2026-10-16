@@ -72,6 +72,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/{owner}/{repo}/branches/{*rest}", get(index_route))
         .route("/{owner}/{repo}/issues", get(index_route))
         .route("/{owner}/{repo}/issues/{*rest}", get(index_route))
+        .route("/{owner}/{repo}/labels", get(index_route))
         .route("/{owner}/{repo}/pulls", get(index_route))
         .route("/{owner}/{repo}/pull/{*rest}", get(index_route))
         .route("/{owner}/{repo}/compare", get(index_route))

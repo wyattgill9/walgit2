@@ -42,6 +42,7 @@ export type {
   ReviewState,
   Mergeability,
   MergeMethod,
+  Label,
 } from "../sdk/repos";
 import type { RefInfo, OpEvent, OpSpec, OpRecord, Tasks, BranchQuery } from "../sdk/repos";
 export type { SettingsDescribe, SettingsValidation, SettingsHistory, SettingsField, Policy, PolicyValidation, PolicyDryRun, RepoSettings } from "../sdk/repos";
@@ -117,6 +118,9 @@ export const api = {
   tasks: (repo: string): Promise<Tasks> => client.repo(repo).tasks(),
   /** Who this browser is signed in as (decides which write controls show). */
   me: () => authRedirect(client.me()),
+  forgeSummary: (repo: string) => authRedirect(client.repo(repo).forgeSummary()),
+  labelList: (repo: string) => authRedirect(client.repo(repo).labels.list()),
+  labels: (repo: string) => client.repo(repo).labels,
   issuePage: (repo: string, q: string, page: number) => authRedirect(client.repo(repo).issues.list(q, page)),
   issue: (repo: string, n: number) => authRedirect(client.repo(repo).issues.get(n)),
   /** D50 issue writes (the SDK namespace; callers `invalidate("issue")` after). */

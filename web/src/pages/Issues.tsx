@@ -1,6 +1,6 @@
-import { Suspense, useState, useTransition, type ReactNode } from "react";
-import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { api, type Issue, type IssueDetail, type LineComment, type MergeMethod, type PullDetail, type ReviewState, type TimelineItem } from "../api";
+import { Suspense, useEffect, useMemo, useState, useTransition, type CSSProperties, type ReactNode } from "react";
+import { Link, Navigate, useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { api, client, type Issue, type IssueDetail, type LineComment, type MergeMethod, type PullDetail, type ReviewState, type TimelineItem } from "../api";
 import { useRepo } from "./RepoLayout";
 import { invalidate, reportError, useData } from "../data";
 import { Box } from "../components/Layout";
@@ -34,12 +34,16 @@ function Icon({ d, className = "" }: { d: string; className?: string }) {
   );
 }
 
-type StateKey = "open" | "completed" | "not_planned" | "merged";
+type StateKey = "open" | "completed" | "not_planned" | "merged" | "draft";
 const stateOf = (i: Issue): StateKey =>
-  i.merged ? "merged" : i.state === "open" ? "open" : i.state_reason === "not_planned" ? "not_planned" : "completed";
-const STATE_LABEL: Record<StateKey, string> = { open: "Open", completed: "Closed", not_planned: "Closed as not planned", merged: "Merged" };
+  i.merged ? "merged" : i.state === "open" ? (i.draft ? "draft" : "open") : i.state_reason === "not_planned" ? "not_planned" : "completed";
+const STATE_LABEL: Record<StateKey, string> = { open: "Open", completed: "Closed", not_planned: "Closed as not planned", merged: "Merged", draft: "Draft" };
 /** The icon of an item's state: pull requests use the PR / merge glyphs. */
-const stateIcon = (i: Issue) => (i.kind === "pull" ? (i.merged ? ICON.merged : ICON.pull) : ICON[stateOf(i)]);
+const stateIcon = (i: Issue) => {
+  if (i.kind === "pull") return i.merged ? ICON.merged : ICON.pull;
+  const s = stateOf(i);
+  return ICON[s === "draft" ? "open" : s];
+};
 
 function StateIcon({ issue }: { issue: Issue }) {
   return <Icon d={stateIcon(issue)} className={`issue-state ${stateOf(issue)}`} />;
@@ -47,6 +51,14 @@ function StateIcon({ issue }: { issue: Issue }) {
 
 /** URL segment of one item: GitHub's `/issues/{n}` and `/pull/{n}`. */
 const itemPath = (full: string, i: { kind: Issue["kind"]; number: number }) => `/${full}/${i.kind === "pull" ? "pull" : "issues"}/${i.number}`;
+
+/** Label name → `#rrggbb` from the repository's catalog. */
+function useLabelColors(full: string): Map<string, string> {
+  const labels = useData(`labels:${full}`, () => api.labelList(full), 30_000);
+  return useMemo(() => new Map(labels.map((l) => [l.name, l.color])), [labels]);
+}
+/** A chip's color dot (CSS `--label`); hue is the label's meaning, the chip stays greyscale. */
+const chipStyle = (color?: string) => (color ? ({ "--label": color } as CSSProperties) : undefined);
 
 /** Signed-in principal (`/api/v1/me`); anonymous readers get no write controls. */
 function useMe() {
@@ -89,6 +101,9 @@ export function IssuesPage({ pull = false }: { pull?: boolean }) {
     <>
       <div className="issues-bar">
         <SearchBox key={q} q={q} onSearch={(nq) => go({ q: nq, page: 1 })} />
+        <Link to={`/${full}/labels`} className="btn">
+          Labels
+        </Link>
         <Link to={pull ? `/${full}/compare` : `/${full}/issues/new`} className="btn primary">
           {pull ? "New pull request" : "New issue"}
         </Link>
@@ -114,6 +129,7 @@ function SearchBox({ q, onSearch }: { q: string; onSearch: (q: string) => void }
 }
 
 function IssueList({ full, q, page, go, pull }: { full: string; q: string; page: number; go: (n: { q?: string; page?: number }) => void; pull: boolean }) {
+  const colors = useLabelColors(full);
   const data = useData(`${pull ? "pulls" : "issues"}:${full}:${q}:${page}`, () => (pull ? api.pullPage(full, q, page) : api.issuePage(full, q, page)));
   const state = words(q).find((t) => STATE_RE.test(t))?.slice(3);
   const total = state === "open" ? data.open_count : state === "closed" ? data.closed_count : data.open_count + data.closed_count;
@@ -131,6 +147,9 @@ function IssueList({ full, q, page, go, pull }: { full: string; q: string; page:
               <Icon d={ICON.completed} /> {data.closed_count} Closed
             </button>
             <span className="spacer" />
+            <FilterMenu label="Author" qualifier="author" values={data.authors} q={q} go={go} />
+            <FilterMenu label="Label" qualifier="label" values={data.labels} q={q} go={go} />
+            <FilterMenu label="Assignee" qualifier="assignee" values={data.assignees} q={q} go={go} />
             <select aria-label="Sort" value={sort} onChange={(e) => go({ q: setQ(q, SORT_RE, `sort:${e.target.value}`), page: 1 })}>
               {SORTS.map(([v, label]) => (
                 <option key={v} value={v}>
@@ -142,7 +161,7 @@ function IssueList({ full, q, page, go, pull }: { full: string; q: string; page:
         }
       >
         {data.items.length > 0 ? (
-          data.items.map((i) => <IssueRow key={i.number} full={full} issue={i} onFilter={filter} />)
+          data.items.map((i) => <IssueRow key={i.number} full={full} issue={i} onFilter={filter} colors={colors} />)
         ) : (
           <div className="pad muted small">No results matched your search.</div>
         )}
@@ -152,7 +171,46 @@ function IssueList({ full, q, page, go, pull }: { full: string; q: string; page:
   );
 }
 
-function IssueRow({ full, issue: i, onFilter }: { full: string; issue: Issue; onFilter: (token: string) => void }) {
+/** GitHub's Author / Label / Assignee menus: picking a value puts `qualifier:value` in the
+ * query (labels add up, the others replace); the title entry clears it. */
+function FilterMenu({
+  label,
+  qualifier,
+  values,
+  q,
+  go,
+}: {
+  label: string;
+  qualifier: string;
+  values: string[];
+  q: string;
+  go: (n: { q?: string; page?: number }) => void;
+}) {
+  const re = new RegExp(`^${qualifier}:`);
+  const current = qualifier === "label" ? "" : (words(q).find((t) => re.test(t))?.slice(qualifier.length + 1).replace(/"/g, "") ?? "");
+  if (values.length === 0) return null;
+  return (
+    <select
+      aria-label={label}
+      value={current}
+      onChange={(e) => {
+        const v = e.target.value;
+        const token = `${qualifier}:${quote(v)}`;
+        const next = !v ? words(q).filter((t) => !re.test(t)).join(" ") : qualifier === "label" ? addQ(q, token) : setQ(q, re, token);
+        go({ q: next, page: 1 });
+      }}
+    >
+      <option value="">{label}</option>
+      {values.map((v) => (
+        <option key={v} value={v}>
+          {v}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+function IssueRow({ full, issue: i, onFilter, colors }: { full: string; issue: Issue; onFilter: (token: string) => void; colors: Map<string, string> }) {
   return (
     <div className="issue-row">
       <StateIcon issue={i} />
@@ -162,7 +220,7 @@ function IssueRow({ full, issue: i, onFilter }: { full: string; issue: Issue; on
             {i.title}
           </Link>
           {i.labels.map((l) => (
-            <button key={l} type="button" className="label-chip" onClick={() => onFilter(`label:${quote(l)}`)}>
+            <button key={l} type="button" className="label-chip" style={chipStyle(colors.get(l))} onClick={() => onFilter(`label:${quote(l)}`)}>
               {l}
             </button>
           ))}
@@ -217,6 +275,7 @@ export function IssuePage({ pull = false }: { pull?: boolean }) {
   const key = `${pull ? "pull" : "issue"}:${full}:${n}`;
   const issue: IssueDetail & Partial<PullDetail> = useData(key, () => (pull ? api.pull(full, n) : api.issue(full, n)));
   const me = useMe();
+  const colors = useLabelColors(full);
   const signedIn = !me.anonymous || me.write;
   const canEdit = (author: string) => me.write || (signedIn && me.principal === author);
   const issues = pull ? api.pulls(full) : api.issues(full);
@@ -232,11 +291,13 @@ export function IssuePage({ pull = false }: { pull?: boolean }) {
       return false;
     }
   };
+  // `#n` links go to /issues/{n}; a pull request lives at /pull/{n}.
+  if (!pull && issue.kind === "pull") return <Navigate to={`/${full}/pull/${n}`} replace />;
   const participants = [...new Set([issue.author, ...issue.timeline.map((t) => t.actor)])];
   return (
     <>
       <IssueHeader issue={issue} canEdit={canEdit(issue.author)} onTitle={(title) => act("rename", () => issues.update(n, { title }))} />
-      {pull && <PullTabs full={full} n={n} tab={tab} />}
+      {pull && <PullTabs full={full} pr={issue as PullDetail} tab={tab} />}
       {pull && tab ? (
         <Suspense fallback={<Skeleton title={false} rows={6} />}>
           <PullChanges
@@ -262,6 +323,7 @@ export function IssuePage({ pull = false }: { pull?: boolean }) {
             <TimelineEntry
               key={t.id}
               item={t}
+              full={full}
               pull={pull}
               head={issue.head_sha}
               canEdit={canEdit(t.actor)}
@@ -276,6 +338,8 @@ export function IssuePage({ pull = false }: { pull?: boolean }) {
               canMerge={me.write}
               onMerge={(m) => act("merge", () => api.pulls(full).merge(n, m))}
               onDeleteBranch={() => act("delete branch", () => api.pulls(full).deleteBranch(n))}
+              canReady={canEdit(issue.author)}
+              onDraft={(draft) => act(draft ? "convert to draft" : "ready for review", () => issues.update(n, { draft }))}
             />
           )}
           {signedIn ? (
@@ -313,7 +377,16 @@ export function IssuePage({ pull = false }: { pull?: boolean }) {
             editable={me.write}
             onAdd={(v) => act("label", () => issues.update(n, { add_labels: [v] }))}
             onRemove={(v) => act("unlabel", () => issues.update(n, { remove_labels: [v] }))}
+            colors={colors}
           />
+          {pull && issue.state === "open" && !issue.draft && canEdit(issue.author) && (
+            <div className="side-section small">
+              <span className="muted">Still in progress? </span>
+              <button type="button" className="btn link small" onClick={() => void act("convert to draft", () => issues.update(n, { draft: true }))}>
+                Convert to draft
+              </button>
+            </div>
+          )}
           <div className="side-section">
             <div className="side-title">{participants.length === 1 ? "1 participant" : `${participants.length} participants`}</div>
             <div className="row wrap">
@@ -329,18 +402,36 @@ export function IssuePage({ pull = false }: { pull?: boolean }) {
   );
 }
 
-function PullTabs({ full, n, tab }: { full: string; n: number; tab?: string }) {
-  const base = `/${full}/pull/${n}`;
-  const tabs: [string | undefined, string, string][] = [
-    [undefined, base, "Conversation"],
-    ["commits", `${base}/commits`, "Commits"],
-    ["files", `${base}/files`, "Files changed"],
+/** Conversation / Commits / Files changed, with GitHub's counts. The compare behind the counts is
+ * fetched quietly (no count when it fails, e.g. a remote-served repository). */
+function PullTabs({ full, pr, tab }: { full: string; pr: PullDetail; tab?: string }) {
+  const [counts, setCounts] = useState<{ commits: number; files: number } | null>(null);
+  useEffect(() => {
+    let live = true;
+    client
+      .repo(full)
+      .compare(pr.base_sha, pr.head_sha)
+      .then(
+        (c) => live && setCounts({ commits: c.commits.length, files: c.stats.length }),
+        () => {},
+      );
+    return () => {
+      live = false;
+    };
+  }, [full, pr.base_sha, pr.head_sha]);
+  const talk = pr.timeline.filter((t) => (t.type === "comment" && !t.deleted) || t.type === "review").length;
+  const base = `/${full}/pull/${pr.number}`;
+  const tabs: [string | undefined, string, string, number | undefined][] = [
+    [undefined, base, "Conversation", talk],
+    ["commits", `${base}/commits`, "Commits", counts?.commits],
+    ["files", `${base}/files`, "Files changed", counts?.files],
   ];
   return (
     <nav className="subtabs pull-tabs" aria-label="Pull request views">
-      {tabs.map(([t, to, label]) => (
+      {tabs.map(([t, to, label, count]) => (
         <Link key={label} to={to} className={t === tab ? "subtab active" : "subtab"}>
           {label}
+          {count !== undefined && <span className="tab-count">{count}</span>}
         </Link>
       ))}
     </nav>
@@ -536,12 +627,17 @@ function MergeBox({
   canMerge,
   onMerge,
   onDeleteBranch,
+  canReady,
+  onDraft,
 }: {
   full: string;
   pr: PullDetail;
   canMerge: boolean;
   onMerge: (m: { method: MergeMethod; sha: string; message?: string }) => Promise<boolean>;
   onDeleteBranch: () => Promise<boolean>;
+  /** The author or a collaborator: may mark a draft ready for review. */
+  canReady: boolean;
+  onDraft: (draft: boolean) => Promise<boolean>;
 }) {
   if (pr.state !== "open") {
     return (
@@ -564,6 +660,22 @@ function MergeBox({
         {canMerge && (
           <button type="button" className="btn" onClick={() => void onDeleteBranch()}>
             Delete branch
+          </button>
+        )}
+      </div>
+    );
+  }
+  if (pr.draft) {
+    return (
+      <div className="box review-status">
+        <Icon d={ICON.pull} />
+        <div className="grow">
+          <strong>This pull request is still a work in progress</strong>
+          <div className="muted small">Draft pull requests can't be merged.</div>
+        </div>
+        {canReady && (
+          <button type="button" className="btn" onClick={() => void onDraft(false)}>
+            Ready for review
           </button>
         )}
       </div>
@@ -621,7 +733,7 @@ function MergeSection({
         {canMerge && m.mergeable && message === null && (
           <div className="merge-actions">
             <select aria-label="Merge method" value={method} onChange={(e) => setMethod(e.target.value as MergeMethod)}>
-              {MERGE_METHODS.map(([v, label]) => (
+              {MERGE_METHODS.filter(([v]) => v !== "rebase" || m.rebaseable).map(([v, label]) => (
                 <option key={v} value={v}>
                   {label}
                 </option>
@@ -705,7 +817,7 @@ function IssueHeader({ issue, canEdit, onTitle }: { issue: IssueDetail; canEdit:
       )}
       <div className="row wrap gap small muted">
         <span className={`state-badge ${s}`}>
-          <Icon d={stateIcon(issue)} /> {issue.kind === "pull" && s !== "open" && s !== "merged" ? "Closed" : STATE_LABEL[s]}
+          <Icon d={stateIcon(issue)} /> {issue.kind === "pull" && (s === "completed" || s === "not_planned") ? "Closed" : STATE_LABEL[s]}
         </span>
         {issue.kind === "pull" ? (
           <span>
@@ -801,6 +913,7 @@ const names = (v: string[]) =>
 
 function TimelineEntry({
   item: t,
+  full,
   pull,
   head,
   canEdit,
@@ -808,6 +921,7 @@ function TimelineEntry({
   onDelete,
 }: {
   item: TimelineItem;
+  full: string;
   pull: boolean;
   /** The PR's shown head: line comments on another commit are outdated. */
   head?: string;
@@ -839,6 +953,15 @@ function TimelineEntry({
       return event(ICON.comment, <>{t.added.length > 0 && <>added {names(t.added)} </>}{t.removed.length > 0 && <>removed {names(t.removed)} </>}</>);
     case "assigned":
       return event(ICON.comment, <>{t.added.length > 0 && <>assigned {t.added.join(", ")} </>}{t.removed.length > 0 && <>unassigned {t.removed.join(", ")} </>}</>);
+    case "draft":
+      return event(ICON.pull, <>{t.draft ? "marked this pull request as draft" : "marked this pull request as ready for review"}</>);
+    case "referenced":
+      return event(
+        ICON.comment,
+        <>
+          mentioned this in <Link to={`/${full}/issues/${t.source}`}>#{t.source}</Link>
+        </>,
+      );
     case "merged":
       return event(
         ICON.merged,
@@ -971,6 +1094,7 @@ function SideList({
   editable,
   onAdd,
   onRemove,
+  colors,
 }: {
   title: string;
   values: string[];
@@ -979,15 +1103,18 @@ function SideList({
   editable: boolean;
   onAdd: (v: string) => Promise<boolean>;
   onRemove: (v: string) => Promise<boolean>;
+  /** Chip colors and the input's suggestions (the label catalog). */
+  colors?: Map<string, string>;
 }) {
   const [text, setText] = useState("");
+  const listId = `side-${title}`;
   return (
     <div className="side-section">
       <div className="side-title">{title}</div>
       {values.length === 0 && <div className="muted small">{empty}</div>}
       <div className={chips ? "row wrap gap" : "side-values"}>
         {values.map((v) => (
-          <span key={v} className={chips ? "label-chip static" : "side-value small"}>
+          <span key={v} className={chips ? "label-chip static" : "side-value small"} style={chipStyle(colors?.get(v))}>
             {!chips && <Avatar name={v} />}
             {v}
             {editable && (
@@ -1005,7 +1132,23 @@ function SideList({
             if (text.trim() && (await onAdd(text.trim()))) setText("");
           }}
         >
-          <input className="side-input" value={text} onChange={(e) => setText(e.target.value)} placeholder={`Add ${title.toLowerCase().replace(/s$/, "")}…`} aria-label={`Add ${title}`} />
+          <input
+            className="side-input"
+            value={text}
+            list={colors ? listId : undefined}
+            onChange={(e) => setText(e.target.value)}
+            placeholder={`Add ${title.toLowerCase().replace(/s$/, "")}…`}
+            aria-label={`Add ${title}`}
+          />
+          {colors && (
+            <datalist id={listId}>
+              {[...colors.keys()]
+                .filter((k) => !values.includes(k))
+                .map((k) => (
+                  <option key={k} value={k} />
+                ))}
+            </datalist>
+          )}
         </form>
       )}
     </div>
@@ -1124,10 +1267,10 @@ function CompareBody({ full, base, head }: { full: string; base: string; head: s
       </Box>
     );
   }
-  const create = async () => {
+  const create = async (draft: boolean) => {
     setBusy(true);
     try {
-      const pr = await api.pulls(full).create({ title: title.trim(), body, base, head });
+      const pr = await api.pulls(full).create({ title: title.trim(), body, base, head, draft });
       invalidate(`pulls:${full}`);
       navigate(`/${full}/pull/${pr.number}`);
     } catch (e) {
@@ -1148,7 +1291,10 @@ function CompareBody({ full, base, head }: { full: string; base: string; head: s
                 <button type="button" className="btn" onClick={() => setForm(false)}>
                   Cancel
                 </button>
-                <button type="button" className="btn primary" disabled={busy || !title.trim()} onClick={create}>
+                <button type="button" className="btn" disabled={busy || !title.trim()} onClick={() => void create(true)}>
+                  Create draft pull request
+                </button>
+                <button type="button" className="btn primary" disabled={busy || !title.trim()} onClick={() => void create(false)}>
                   Create pull request
                 </button>
               </div>
@@ -1178,5 +1324,107 @@ function CompareBody({ full, base, head }: { full: string; base: string; head: s
       </Box>
       <Diff patch={cmp.patch} stats={cmp.stats} cacheKey={`${cmp.base}...${cmp.head}`} />
     </>
+  );
+}
+
+// ---- labels ----
+
+type LabelDraft = { name: string; color: string; description: string; isNew: boolean };
+const randomColor = () => `#${Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, "0")}`;
+
+/** GitHub's `/labels`: the catalog with colors, descriptions and open counts; writers edit it.
+ * Deleting a label also takes it off every issue and pull request. */
+export function LabelsPage() {
+  const { full } = useRepo();
+  const labels = useData(`labels:${full}`, () => api.labelList(full), 30_000);
+  const me = useMe();
+  const [draft, setDraft] = useState<LabelDraft | null>(null);
+  const refresh = () => {
+    invalidate(`labels:${full}`);
+    invalidate(`issues:${full}`);
+    invalidate(`pulls:${full}`);
+  };
+  const save = async (d: LabelDraft) => {
+    try {
+      await api.labels(full).put(d.name.trim(), { color: d.color, description: d.description });
+      refresh();
+      setDraft(null);
+    } catch (e) {
+      reportError(e, "save label");
+    }
+  };
+  const remove = async (name: string) => {
+    if (!window.confirm(`Delete the label "${name}"? It is removed from every issue and pull request.`)) return;
+    try {
+      await api.labels(full).delete(name);
+      refresh();
+    } catch (e) {
+      reportError(e, "delete label");
+    }
+  };
+  return (
+    <>
+      <div className="issues-bar">
+        <h2 className="page-title">Labels</h2>
+        <span className="spacer" />
+        {me.write && (
+          <button type="button" className="btn primary" onClick={() => setDraft({ name: "", color: randomColor(), description: "", isNew: true })}>
+            New label
+          </button>
+        )}
+      </div>
+      {draft?.isNew && <LabelForm draft={draft} onChange={setDraft} onSave={save} onCancel={() => setDraft(null)} />}
+      <Box title={`${labels.length} label${labels.length === 1 ? "" : "s"}`}>
+        {labels.length === 0 && <div className="pad muted small">No labels yet.</div>}
+        {labels.map((l) =>
+          draft && !draft.isNew && draft.name === l.name ? (
+            <LabelForm key={l.name} draft={draft} onChange={setDraft} onSave={save} onCancel={() => setDraft(null)} />
+          ) : (
+            <div key={l.name} className="label-row">
+              <Link to={`/${full}/issues?q=${encodeURIComponent(`is:open label:${quote(l.name)}`)}`} className="label-chip static" style={chipStyle(l.color)}>
+                {l.name}
+              </Link>
+              <span className="muted small grow">{l.description}</span>
+              <span className="muted small">{l.open} open</span>
+              {me.write && (
+                <span className="row gap">
+                  <button type="button" className="btn link small" onClick={() => setDraft({ name: l.name, color: l.color, description: l.description, isNew: false })}>
+                    Edit
+                  </button>
+                  <button type="button" className="btn link small danger-text" onClick={() => void remove(l.name)}>
+                    Delete
+                  </button>
+                </span>
+              )}
+            </div>
+          ),
+        )}
+      </Box>
+    </>
+  );
+}
+
+function LabelForm({ draft, onChange, onSave, onCancel }: { draft: LabelDraft; onChange: (d: LabelDraft) => void; onSave: (d: LabelDraft) => Promise<void>; onCancel: () => void }) {
+  return (
+    <form
+      className="label-row label-form"
+      onSubmit={(e) => {
+        e.preventDefault();
+        void onSave(draft);
+      }}
+    >
+      <span className="label-chip static" style={chipStyle(draft.color)}>
+        {draft.name || "preview"}
+      </span>
+      <input aria-label="Label name" placeholder="Label name" value={draft.name} disabled={!draft.isNew} onChange={(e) => onChange({ ...draft, name: e.target.value })} />
+      <input aria-label="Description" placeholder="Description (optional)" className="grow" value={draft.description} onChange={(e) => onChange({ ...draft, description: e.target.value })} />
+      <input aria-label="Color" type="color" value={draft.color} onChange={(e) => onChange({ ...draft, color: e.target.value })} />
+      <button type="button" className="btn" onClick={onCancel}>
+        Cancel
+      </button>
+      <button type="submit" className="btn primary" disabled={!draft.name.trim()}>
+        {draft.isNew ? "Create label" : "Save changes"}
+      </button>
+    </form>
   );
 }

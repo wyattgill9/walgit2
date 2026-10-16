@@ -80,11 +80,24 @@ export interface Issue {
   review_decision?: "approved" | "changes_requested";
   /** Pull requests: merged (then also `state: "closed"`), and the commit the base moved to. */
   merged: boolean;
+  /** Pull requests: a draft is not mergeable until marked ready for review. */
+  draft: boolean;
   merge_commit?: string;
+}
+/** A label of the catalog (`api/labels`); `open` = open items carrying it. Labels items carry
+ * without a definition are listed gray. */
+export interface Label {
+  name: string;
+  /** `#rrggbb` */
+  color: string;
+  description: string;
+  open: number;
 }
 /** `GET api/pulls/{n}/merge`: can the head merge cleanly into the base right now. */
 export interface Mergeability {
   mergeable: boolean;
+  /** Its commits also replay onto the base one by one ("Rebase and merge" is offered). */
+  rebaseable: boolean;
   /** The base already contains the head: nothing to merge. */
   up_to_date: boolean;
   conflicts: string[];
@@ -102,6 +115,10 @@ export type TimelineItem = { id: number; actor: string; at: string } & (
   | { type: "assigned"; added: string[]; removed: string[] }
   | { type: "review"; state: ReviewState; body: string; commit_oid: string; comments: LineComment[] }
   | { type: "merged"; method: MergeMethod; commit: string }
+  /** Marked as draft (`draft: true`) or ready for review. */
+  | { type: "draft"; draft: boolean }
+  /** `#n` of this item in another one's text: "mentioned this in #source". */
+  | { type: "referenced"; source: number }
 );
 export type ReviewState = "approved" | "changes_requested" | "commented";
 /** A review's comment on one line: `RIGHT` = the head's line, `LEFT` = the merge base's. */
@@ -141,6 +158,10 @@ export interface IssuePage {
   closed_count: number;
   page: number;
   per_page: number;
+  /** Every author, label and assignee among items of this kind (the filter menus). */
+  authors: string[];
+  labels: string[];
+  assignees: string[];
 }
 /** Fields of `PATCH api/issues/{n}`; the present ones commit together. */
 export interface IssuePatch {
@@ -152,6 +173,8 @@ export interface IssuePatch {
   remove_labels?: string[];
   add_assignees?: string[];
   remove_assignees?: string[];
+  /** Pull requests: `true` = convert to draft, `false` = ready for review. */
+  draft?: boolean;
 }
 /** `api/branches`: the default branch on its own, then one page newest-first. */
 export interface BranchPage {
@@ -814,6 +837,20 @@ export class RepoClient {
 
   /** Issues (D50). Writes need a signed-in principal; closing others' issues, labels and
    * assignees need write. A refused change is a 400 with the reason. */
+  /** The label catalog (D50): colors and descriptions; writes need write access. Deleting a
+   * label also takes it off every issue and pull request. */
+  readonly labels = {
+    list: (opts?: CallOptions) => this.client.json<Label[]>(`${this.p}/labels`, opts),
+    put: (name: string, label: { color: string; description?: string }, opts?: CallOptions) =>
+      this.client.json<Label[]>(`${this.p}/labels/${encodeURIComponent(name)}`, opts, jsonBody("PUT", label)),
+    delete: (name: string, opts?: CallOptions) => this.client.json<Label[]>(`${this.p}/labels/${encodeURIComponent(name)}`, opts, { method: "DELETE" }),
+  };
+
+  /** Open issue and pull request counts (the repository tabs). */
+  forgeSummary(opts?: CallOptions) {
+    return this.client.json<{ open_issues: number; open_pulls: number }>(`${this.p}/forge/summary`, opts);
+  }
+
   readonly issues = {
     ...this.items<IssueDetail>("issues"),
     create: (issue: { title: string; body?: string; labels?: string[]; assignees?: string[] }, opts?: CallOptions) =>
@@ -824,7 +861,7 @@ export class RepoClient {
    * open, `head_sha`/`base_sha` are the branches' tips; closing freezes them. */
   readonly pulls = {
     ...this.items<PullDetail>("pulls"),
-    create: (pr: { title: string; body?: string; base: string; head: string }, opts?: CallOptions) =>
+    create: (pr: { title: string; body?: string; base: string; head: string; draft?: boolean }, opts?: CallOptions) =>
       this.client.json<PullDetail>(`${this.p}/pulls`, opts, jsonBody("POST", pr)),
     /** Review the current head: approve (not your own), request changes or comment; line
      * comments anchor to that head. */

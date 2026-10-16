@@ -217,7 +217,24 @@ message ForgeEvent {
     ForgeSetChange assignees = 15;
     ForgeReview review = 16;
     ForgeMerged merged = 17;
+    ForgeDraft draft = 18;
+    // Repository-scoped (number 0): define, update or delete a label of the catalog.
+    ForgeLabel label = 19;
   }
+}
+
+// A pull request becomes a draft, or ready for review.
+message ForgeDraft {
+  bool draft = 1;
+}
+
+// The label catalog. Deleting a label also takes it off every item.
+message ForgeLabel {
+  string name = 1;
+  // "#rrggbb"
+  string color = 2;
+  string description = 3;
+  bool deleted = 4;
 }
 
 // A pull request merged: rides on the PUSH entry that moves `base_ref` to `merge_commit_oid`.
@@ -266,6 +283,8 @@ message ForgeOpened {
   string head_ref = 7;
   string base_oid = 8;
   string head_oid = 9;
+  // Pull requests: opened as a draft (not mergeable until ready for review).
+  bool draft = 10;
 }
 
 message ForgeComment {

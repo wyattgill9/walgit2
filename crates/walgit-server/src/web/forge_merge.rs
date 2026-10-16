@@ -259,6 +259,8 @@ fn open_pull(
 struct Mergeability {
     /// `head` merges into `base` without conflicts.
     mergeable: bool,
+    /// Its commits also replay onto `base` one by one ("Rebase and merge").
+    rebaseable: bool,
     /// The base already contains the head: nothing to merge.
     up_to_date: bool,
     conflicts: Vec<String>,
@@ -283,19 +285,28 @@ pub(super) async fn mergeability(
     let (_, base, head) = open_pull(&handle, number)?;
     let local = handle.local().clone();
     let up_to_date = local.is_ancestor(&head, &base).await.map_err(internal)?;
-    let conflicts = if up_to_date {
-        Vec::new()
+    let (conflicts, rebaseable) = if up_to_date {
+        (Vec::new(), false)
     } else {
-        Scratch::new(local.path())
-            .await?
+        let scratch = Scratch::new(local.path()).await?;
+        let conflicts = scratch
             .merge_tree(&base, &head, None)
             .await?
             .err()
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // A clean merge can still fail to rebase: replayed one by one, a commit may conflict
+        // that the branch's own merge of the base resolved (GitHub's `rebaseable`).
+        let rebaseable = conflicts.is_empty()
+            && scratch
+                .rebase(&base, &head, ("walgit", "walgit@users.walgit.invalid"))
+                .await?
+                .is_ok();
+        (conflicts, rebaseable)
     };
     drop(guard);
     let m = Mergeability {
         mergeable: !up_to_date && conflicts.is_empty(),
+        rebaseable,
         up_to_date,
         conflicts,
         base_sha: base,
@@ -339,6 +350,12 @@ pub(super) async fn merge(
     }
     handle.forge_ensure().await.map_err(crate::smart::wal_err)?;
     let (item, base, head) = open_pull(&handle, number)?;
+    // The publisher refuses a draft too; saying so first spares building the merge.
+    if item.draft {
+        return Err(ApiError::BadRequest(format!(
+            "#{number} is a draft; mark it ready for review first"
+        )));
+    }
     if req.sha.as_ref().is_some_and(|sha| *sha != head) {
         return Err(ApiError::Conflict(
             "Head branch was modified. Review and try the merge again.".into(),
