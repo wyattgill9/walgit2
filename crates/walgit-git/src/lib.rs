@@ -777,11 +777,6 @@ impl LocalRepo {
         );
         // Instrument each awaited operation rather than carrying a thread-local
         // span guard across await points.
-        // Pack installation and repository refresh are not safe concurrently
-        // with gix's pack/index readers. Serialize ingestion per repository;
-        // callers may still run ingests for different repositories in parallel.
-        let _ingest_guard = self.inner.ingest_lock.lock().instrument(span.clone()).await;
-
         let pack_dir = self.objects_pack_dir();
         std::fs::create_dir_all(&pack_dir).map_err(GitError::Io)?;
 
@@ -857,6 +852,14 @@ impl LocalRepo {
         // (a second object walk for fsck, no `.rev`, and a parser hole that
         // already fell back here). A large repository: 64,317 objects / 75 MB in 49.1 s
         // on that path (2026-08-21).
+        // Pack installation and repository refresh are not safe concurrently
+        // with gix's pack/index readers. Serialize them per repository (callers
+        // may still ingest different repositories in parallel), but only once the
+        // pack is spooled: the temp file is ours alone, and holding the lock while
+        // a client uploads put every push to the repository behind the slowest
+        // upload (push bench, 2026-10-16: p50 941 ms of waiting at 32 pushers).
+        let _ingest_guard = self.inner.ingest_lock.lock().instrument(span.clone()).await;
+
         let repo_path = self.inner.path.clone();
         let tmp_for_index = tmp_path.clone();
         let fix_thin = opts.thin;
