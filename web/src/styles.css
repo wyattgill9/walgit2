@@ -1191,3 +1191,9 @@ input.text.small { font-size: 11px; padding: 2px 6px; margin-left: 8px; }
   .issue-layout { grid-template-columns: minmax(0, 1fr); }
   .issue-side .avatar { display: none; }
 }
+/* pull requests */
+.pull-tabs { margin-bottom: 16px; }
+.pull-tabs .subtab:hover { text-decoration: none; }
+.branch-tag { padding: 0 6px; border: 1px solid var(--l4); background: var(--l2); color: var(--l9); font-size: 11px; }
+.compare-bar, .compare-cta { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 10px 16px; }
+.compare-bar select { font-size: 12px; padding: 3px 6px; max-width: 280px; }

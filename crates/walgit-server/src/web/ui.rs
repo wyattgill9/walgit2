@@ -70,6 +70,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/{owner}/{repo}/commit/{*rest}", get(index_route))
         .route("/{owner}/{repo}/branches", get(index_route))
         .route("/{owner}/{repo}/branches/{*rest}", get(index_route))
+        .route("/{owner}/{repo}/issues", get(index_route))
+        .route("/{owner}/{repo}/issues/{*rest}", get(index_route))
+        .route("/{owner}/{repo}/pulls", get(index_route))
+        .route("/{owner}/{repo}/pull/{*rest}", get(index_route))
+        .route("/{owner}/{repo}/compare", get(index_route))
+        .route("/{owner}/{repo}/compare/{*rest}", get(index_route))
         .route("/{owner}/{repo}/wal", get(index_route))
         .route("/{owner}/{repo}/settings", get(index_route));
     let mut r = r;

@@ -36,6 +36,8 @@ export type {
   IssuePage,
   IssuePatch,
   TimelineItem,
+  PullDetail,
+  Compare,
 } from "../sdk/repos";
 import type { RefInfo, OpEvent, OpSpec, OpRecord, Tasks, BranchQuery } from "../sdk/repos";
 export type { SettingsDescribe, SettingsValidation, SettingsHistory, SettingsField, Policy, PolicyValidation, PolicyDryRun, RepoSettings } from "../sdk/repos";
@@ -115,6 +117,10 @@ export const api = {
   issue: (repo: string, n: number) => authRedirect(client.repo(repo).issues.get(n)),
   /** D50 issue writes (the SDK namespace; callers `invalidate("issue")` after). */
   issues: (repo: string) => client.repo(repo).issues,
+  pullPage: (repo: string, q: string, page: number) => authRedirect(client.repo(repo).pulls.list(q, page)),
+  pull: (repo: string, n: number) => authRedirect(client.repo(repo).pulls.get(n)),
+  pulls: (repo: string) => client.repo(repo).pulls,
+  compare: (repo: string, base: string, head: string) => authRedirect(client.repo(repo).compare(base, head)),
   /** D24 settings + policy (Settings tab). Writes are never cached. */
   settings: (repo: string) => client.repo(repo).settings,
   policy: (repo: string) => client.repo(repo).policy,

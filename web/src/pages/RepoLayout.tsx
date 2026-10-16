@@ -66,8 +66,9 @@ export function RepoLayout() {
   const walActive = pathname.endsWith("/wal");
   const settingsActive = pathname.endsWith("/settings");
   const issuesActive = /\/issues(\/|$)/.test(pathname);
+  const pullsActive = /\/(pulls|pull|compare)(\/|$)/.test(pathname);
   const commitsActive = /\/commits?(\/|$)/.test(pathname);
-  const codeActive = !walActive && !settingsActive && !issuesActive && !commitsActive;
+  const codeActive = !walActive && !settingsActive && !issuesActive && !pullsActive && !commitsActive;
   return (
     <>
       <div className="repo-head">
@@ -91,6 +92,9 @@ export function RepoLayout() {
           </NavLink>
           <NavLink to={`/${full}/issues`} className={() => (issuesActive ? "tab active" : "tab")}>
             Issues
+          </NavLink>
+          <NavLink to={`/${full}/pulls`} className={() => (pullsActive ? "tab active" : "tab")}>
+            Pull requests
           </NavLink>
           <NavLink to={`/${full}/commits`} className={() => (commitsActive ? "tab active" : "tab")}>
             Commits

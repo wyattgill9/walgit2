@@ -796,3 +796,99 @@ async fn issues_api() -> TestResult {
     assert_eq!((status, issue["comments"].as_u64()), (200, Some(1)));
     Ok(())
 }
+
+/// D50 pull requests: open from a pushed branch, compare (commits + diff), refusals, close
+/// freezes the tips it shows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pulls_api() -> TestResult {
+    use serde_json::json;
+    let server = Server::start().await?;
+    server.put_repo("o", "r").await?;
+    let src = fixture(&server)?;
+    git_in(&src, &["checkout", "-q", "-b", "topic", "main"])?;
+    std::fs::write(src.join("topic.txt"), "new file\n")?;
+    git_in(&src, &["add", "topic.txt"])?;
+    git_in(&src, &["commit", "-q", "-m", "add topic"])?;
+    git_in(&src, &["push", "-q", &server.repo_url("o", "r"), "topic"])?;
+    let topic = git_in(&src, &["rev-parse", "topic"])?.trim().to_string();
+    let post = |path: &str, body: Value| {
+        let req = reqwest::Client::new()
+            .post(format!("{}{path}", server.base_url))
+            .json(&body);
+        async move {
+            let resp = req.send().await?;
+            let status = resp.status().as_u16();
+            anyhow::Ok((status, resp.json::<Value>().await.unwrap_or(Value::Null)))
+        }
+    };
+
+    let cmp = json(&server, "/o/r/api/compare/main...topic").await?;
+    assert_eq!(
+        (cmp["ahead"].as_u64(), cmp["behind"].as_u64()),
+        (Some(1), Some(0))
+    );
+    assert_eq!(cmp["commits"][0]["subject"], "add topic");
+    assert_eq!(cmp["stats"][0]["path"], "topic.txt");
+    assert!(cmp["patch"].as_str().unwrap().contains("+new file"));
+
+    let (status, pr) = post(
+        "/o/r/api/pulls",
+        json!({"title": "Add topic", "base": "main", "head": "topic"}),
+    )
+    .await?;
+    assert_eq!(status, 201, "{pr}");
+    assert_eq!(
+        (pr["number"].as_u64(), pr["kind"].as_str()),
+        (Some(1), Some("pull"))
+    );
+    assert_eq!(
+        (pr["base_ref"].as_str(), pr["head_ref"].as_str()),
+        (Some("main"), Some("topic"))
+    );
+    assert_eq!(pr["head_sha"], topic);
+    let (status, dup) = post(
+        "/o/r/api/pulls",
+        json!({"title": "again", "base": "main", "head": "topic"}),
+    )
+    .await?;
+    assert_eq!(status, 400, "one open PR per head/base: {dup}");
+    let (status, _) = post(
+        "/o/r/api/pulls",
+        json!({"title": "x", "base": "main", "head": "nope"}),
+    )
+    .await?;
+    assert_eq!(status, 400, "the head branch must exist");
+    let (status, issue) = post("/o/r/api/issues", json!({"title": "an issue"})).await?;
+    assert_eq!(
+        (status, issue["number"].as_u64()),
+        (201, Some(2)),
+        "issues and PRs share numbers"
+    );
+
+    let pulls = json(&server, "/o/r/api/pulls").await?;
+    assert_eq!(
+        (
+            pulls["open_count"].as_u64(),
+            pulls["items"][0]["number"].as_u64()
+        ),
+        (Some(1), Some(1))
+    );
+    let issues = json(&server, "/o/r/api/issues").await?;
+    assert_eq!(
+        issues["items"][0]["number"], 2,
+        "the issue list holds issues only"
+    );
+
+    // Close, then move the branch: the closed PR keeps showing what it had.
+    let (status, closed) = post(
+        "/o/r/api/pulls/1/comments",
+        json!({"body": "not now", "close": "completed"}),
+    )
+    .await?;
+    assert_eq!((status, closed["state"].as_str()), (201, Some("closed")));
+    git_in(&src, &["commit", "-q", "--allow-empty", "-m", "later"])?;
+    git_in(&src, &["push", "-q", &server.repo_url("o", "r"), "topic"])?;
+    let pr = json(&server, "/o/r/api/pulls/1").await?;
+    assert_eq!(pr["head_sha"], topic);
+    Ok(())
+}

@@ -114,6 +114,16 @@ export function ApiPage() {
               cache="SWR"
             />
             <Row
+              path={`/${r}/api/pulls?q=&page=`}
+              desc={<>Pull requests: the issue routes over <code>pulls</code>, plus <code>base_ref</code>/<code>head_ref</code> and, on <code>pulls/{"{n}"}</code>, <code>base_sha</code>/<code>head_sha</code>; open with <code>{`POST {title,body,base,head}`}</code>.</>}
+              cache="SWR"
+            />
+            <Row
+              path={`/${r}/api/compare/{base}...{head}`}
+              desc={<>Three-dot compare: <code>{`{base,head,merge_base,ahead,behind,commits,stats,patch}`}</code> — what merging <code>head</code> into <code>base</code> brings.</>}
+              cache="SWR"
+            />
+            <Row
               path={`/${r}/api/resolve/{ref/path…}`}
               desc={<>Splits a GitHub-shaped <code>ref/path</code> into <code>{`{ref,sha,path,kind}`}</code>; longest existing branch/tag wins, then a revision. Do this once, then address by sha.</>}
               cache="SWR + ETag"

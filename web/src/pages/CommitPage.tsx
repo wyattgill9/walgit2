@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { parsePatchFiles } from "@pierre/diffs";
 import { FileDiff } from "@pierre/diffs/react";
-import { api } from "../api";
+import { api, type FileStat } from "../api";
 import { useData } from "../data";
 import { useRepo } from "./RepoLayout";
 import { Box } from "../components/Layout";
@@ -15,19 +15,7 @@ export function CommitPage() {
   const { full } = useRepo();
   const { sha = "" } = useParams();
   const data = useData(`commit:${full}:${sha}`, () => api.commit(full, sha), Infinity);
-  const [split, setSplit] = useState(false);
-  const files = useMemo(() => {
-    if (!data.patch) return [];
-    try {
-      return parsePatchFiles(data.patch, sha).flatMap((p) => p.files);
-    } catch (e) {
-      console.error(e);
-      return [];
-    }
-  }, [data, sha]);
   const { commit: c, stats } = data;
-  const add = stats.reduce((n, s) => n + Math.max(0, s.additions), 0);
-  const del = stats.reduce((n, s) => n + Math.max(0, s.deletions), 0);
   return (
     <>
       <Box className="commit-box">
@@ -74,7 +62,27 @@ export function CommitPage() {
           </span>
         </div>
       </Box>
+      <Diff patch={data.patch} stats={stats} cacheKey={sha} />
+    </>
+  );
+}
 
+/** Diffstat, file list and one `FileDiff` per file (unified/split): a commit, a compare, a PR. */
+export function Diff({ patch, stats, cacheKey }: { patch: string; stats: FileStat[]; cacheKey: string }) {
+  const [split, setSplit] = useState(false);
+  const files = useMemo(() => {
+    if (!patch) return [];
+    try {
+      return parsePatchFiles(patch, cacheKey).flatMap((p) => p.files);
+    } catch (e) {
+      console.error(e);
+      return [];
+    }
+  }, [patch, cacheKey]);
+  const add = stats.reduce((n, s) => n + Math.max(0, s.additions), 0);
+  const del = stats.reduce((n, s) => n + Math.max(0, s.deletions), 0);
+  return (
+    <>
       <div className="diffstat row wrap gap">
         <span>
           Showing <strong>{stats.length}</strong> changed file{stats.length === 1 ? "" : "s"} with{" "}
@@ -116,7 +124,7 @@ export function CommitPage() {
       ))}
       {files.length === 0 && stats.length > 0 && (
         <Box>
-          <pre className="pad code-block">{data.patch}</pre>
+          <pre className="pad code-block">{patch}</pre>
         </Box>
       )}
     </>

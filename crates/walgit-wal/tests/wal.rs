@@ -3029,6 +3029,7 @@ fn forge_close(number: u64) -> walgit_proto::v1::ForgeEvent {
         walgit_proto::v1::forge_event::Body::State(walgit_proto::v1::ForgeStateChange {
             closed: true,
             reason: "completed".into(),
+            ..Default::default()
         }),
     )
 }

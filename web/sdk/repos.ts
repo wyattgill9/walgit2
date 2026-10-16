@@ -73,6 +73,9 @@ export interface Issue {
   updated_at: string;
   closed_at: string | null;
   comments: number;
+  /** Pull requests only: `head_ref` merges into `base_ref`. */
+  base_ref?: string;
+  head_ref?: string;
 }
 /** One entry of an issue's timeline; `id` addresses a comment for edit/delete. */
 export type TimelineItem = { id: number; actor: string; at: string } & (
@@ -85,6 +88,26 @@ export type TimelineItem = { id: number; actor: string; at: string } & (
 );
 export interface IssueDetail extends Issue {
   timeline: TimelineItem[];
+}
+/** A pull request: `head_ref` merges into `base_ref`; compare `base_sha...head_sha`. */
+export interface PullDetail extends IssueDetail {
+  base_ref: string;
+  head_ref: string;
+  base_sha: string;
+  head_sha: string;
+}
+/** `api/compare/{base}...{head}`. */
+export interface Compare {
+  base: string;
+  head: string;
+  merge_base: string;
+  /** Commits only on head / only on base. */
+  ahead: number;
+  behind: number;
+  /** merge_base..head, oldest first, at most 250. */
+  commits: Commit[];
+  stats: FileStat[];
+  patch: string;
 }
 /** `api/issues?q=&page=`: one page of 25 plus GitHub's open/closed counts for the query. */
 export interface IssuePage {
@@ -767,22 +790,40 @@ export class RepoClient {
   /** Issues (D50). Writes need a signed-in principal; closing others' issues, labels and
    * assignees need write. A refused change is a 400 with the reason. */
   readonly issues = {
-    /** GitHub search syntax: `is:open|closed`, `author:`, `assignee:`, `label:`, `sort:`, words. */
-    list: (q = "is:open", page = 1, opts?: CallOptions) =>
-      this.client.json<IssuePage>(`${this.p}/issues${qs({ q, page: page > 1 ? String(page) : undefined })}`, opts),
-    get: (n: number, opts?: CallOptions) => this.client.json<IssueDetail>(`${this.p}/issues/${n}`, opts),
+    ...this.items<IssueDetail>("issues"),
     create: (issue: { title: string; body?: string; labels?: string[]; assignees?: string[] }, opts?: CallOptions) =>
       this.client.json<IssueDetail>(`${this.p}/issues`, opts, jsonBody("POST", issue)),
-    update: (n: number, patch: IssuePatch, opts?: CallOptions) =>
-      this.client.json<IssueDetail>(`${this.p}/issues/${n}`, opts, jsonBody("PATCH", patch)),
-    /** `close` = GitHub's "Close with comment" (one change). */
-    comment: (n: number, body: string, close?: "completed" | "not_planned", opts?: CallOptions) =>
-      this.client.json<IssueDetail>(`${this.p}/issues/${n}/comments`, opts, jsonBody("POST", { body, close })),
-    editComment: (n: number, id: number, body: string, opts?: CallOptions) =>
-      this.client.json<IssueDetail>(`${this.p}/issues/${n}/comments/${id}`, opts, jsonBody("PATCH", { body })),
-    deleteComment: (n: number, id: number, opts?: CallOptions) =>
-      this.client.json<IssueDetail>(`${this.p}/issues/${n}/comments/${id}`, opts, { method: "DELETE" }),
   };
+
+  /** Pull requests (D50): the same calls as `issues`, plus `create` from two branches. While
+   * open, `head_sha`/`base_sha` are the branches' tips; closing freezes them. */
+  readonly pulls = {
+    ...this.items<PullDetail>("pulls"),
+    create: (pr: { title: string; body?: string; base: string; head: string }, opts?: CallOptions) =>
+      this.client.json<PullDetail>(`${this.p}/pulls`, opts, jsonBody("POST", pr)),
+  };
+
+  /** GitHub's three-dot compare: what merging `head` into `base` brings (branches, tags or shas). */
+  compare(base: string, head: string, opts?: CallOptions) {
+    return this.client.json<Compare>(`${this.p}/compare/${enc(base)}...${enc(head)}`, opts);
+  }
+
+  private items<D>(seg: "issues" | "pulls") {
+    const p = () => `${this.p}/${seg}`;
+    return {
+      /** GitHub search syntax: `is:open|closed`, `author:`, `assignee:`, `label:`, `sort:`, words. */
+      list: (q = "is:open", page = 1, opts?: CallOptions) =>
+        this.client.json<IssuePage>(`${p()}${qs({ q, page: page > 1 ? String(page) : undefined })}`, opts),
+      get: (n: number, opts?: CallOptions) => this.client.json<D>(`${p()}/${n}`, opts),
+      update: (n: number, patch: IssuePatch, opts?: CallOptions) => this.client.json<D>(`${p()}/${n}`, opts, jsonBody("PATCH", patch)),
+      /** `close` = GitHub's "Close with comment" (one change). */
+      comment: (n: number, body: string, close?: "completed" | "not_planned", opts?: CallOptions) =>
+        this.client.json<D>(`${p()}/${n}/comments`, opts, jsonBody("POST", { body, close })),
+      editComment: (n: number, id: number, body: string, opts?: CallOptions) =>
+        this.client.json<D>(`${p()}/${n}/comments/${id}`, opts, jsonBody("PATCH", { body })),
+      deleteComment: (n: number, id: number, opts?: CallOptions) => this.client.json<D>(`${p()}/${n}/comments/${id}`, opts, { method: "DELETE" }),
+    };
+  }
 
   readonly ops = {
     /** Available maintenance operations + recent runs. */

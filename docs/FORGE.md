@@ -15,7 +15,9 @@ Forge state is a fold of events in the WAL. There is no other store.
   requests never load it. Each checkpoint writes the folded state to `checkpoints/<seq>/forge.pb`. Cold
   start reads that, then the log tail.
 - **PR head:** read live from `refs/heads/<head_ref>` while the PR is open, and frozen into the
-  closing or merging event.
+  closing or merging event. `ForgeOpened` records both tips, so a PR whose branch was deleted
+  still shows what it had. Commits and Files changed are the three-dot compare of the tips
+  shown (`compare/{base}...{head}`). There are no `refs/pull/*` refs.
 
 ## Status
 
@@ -24,7 +26,7 @@ Forge state is a fold of events in the WAL. There is no other store.
 | 0 Groundwork (Garage CAS emulation, S3 checksums, D50) | done |
 | 1 Issues: API, SDK, list/detail/new pages, labels, assignees; checkpointed `forge.pb` | done |
 | 2 Checkpointed state, recovery, benchmarks | — |
-| 3 Pull requests | — |
+| 3 Pull requests: compare, open, list, Conversation / Commits / Files changed, close and reopen | done |
 | 4 Reviews | — |
 | 5 Merge (merge / squash / rebase) | — |
 

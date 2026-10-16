@@ -1,7 +1,7 @@
-//! D50: the issues API (`docs/FORGE.md`, `web/API.md`). Reads fold the WAL's forge events at
-//! refs level (no objects); writes are one forge entry each through the publisher. Bodies are
-//! JSON only (`Json` refuses other content types with 415), which keeps a cross-site form from
-//! riding the session cookie.
+//! D50: the issues and pull-requests API (`docs/FORGE.md`, `web/API.md`). Reads fold the WAL's
+//! forge events at refs level (no objects); writes are one forge entry each through the
+//! publisher. Bodies are JSON only (`Json` refuses other content types with 415), which keeps a
+//! cross-site form from riding the session cookie. Handlers are shared: `PULL` picks the kind.
 
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, patch},
+    routing::{get, patch, post},
 };
 use serde::{Deserialize, Serialize};
 use walgit_proto::v1::{
@@ -27,22 +27,25 @@ use crate::web::api::{REPO_API_BASES, auth_err, json_swr};
 pub fn router(state: Arc<AppState>) -> Router {
     let mut r = Router::new();
     for base in REPO_API_BASES {
-        r = r
-            .route(&format!("{base}/issues"), get(list).post(create))
-            .route(
-                &format!("{base}/issues/{{number}}"),
-                get(detail).patch(update),
-            )
-            .route(
-                &format!("{base}/issues/{{number}}/comments"),
-                axum::routing::post(comment),
-            )
-            .route(
-                &format!("{base}/issues/{{number}}/comments/{{id}}"),
-                patch(edit_comment).delete(delete_comment),
-            );
+        r = routes::<false>(r, &format!("{base}/issues"))
+            .route(&format!("{base}/issues"), post(create_issue));
+        r = routes::<true>(r, &format!("{base}/pulls"))
+            .route(&format!("{base}/pulls"), post(create_pull));
     }
     r.with_state(state)
+}
+
+fn routes<const PULL: bool>(r: Router<Arc<AppState>>, p: &str) -> Router<Arc<AppState>> {
+    r.route(p, get(list::<PULL>))
+        .route(
+            &format!("{p}/{{number}}"),
+            get(detail::<PULL>).patch(update::<PULL>),
+        )
+        .route(&format!("{p}/{{number}}/comments"), post(comment::<PULL>))
+        .route(
+            &format!("{p}/{{number}}/comments/{{id}}"),
+            patch(edit_comment::<PULL>).delete(delete_comment::<PULL>),
+        )
 }
 
 #[derive(Deserialize)]
@@ -56,6 +59,12 @@ struct Detail {
     #[serde(flatten)]
     item: Item,
     timeline: Vec<TimelineItem>,
+    /// Pull requests: the tips to compare — the branches' current tips while open, the tips
+    /// when it was closed after that.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    head_sha: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -69,9 +78,19 @@ struct NewIssue {
     assignees: Vec<String>,
 }
 
+#[derive(Deserialize)]
+struct NewPull {
+    title: String,
+    #[serde(default)]
+    body: String,
+    /// Branch names: merge `head` into `base`.
+    base: String,
+    head: String,
+}
+
 /// Every field optional; the present ones commit together as one entry.
 #[derive(Deserialize, Default)]
-struct IssuePatch {
+struct ItemPatch {
     title: Option<String>,
     body: Option<String>,
     /// "open" | "closed"
@@ -98,6 +117,10 @@ struct NewComment {
 #[derive(Deserialize)]
 struct CommentPatch {
     body: String,
+}
+
+const fn kind_name(pull: bool) -> &'static str {
+    if pull { "pull" } else { "issue" }
 }
 
 async fn open(
@@ -128,39 +151,68 @@ async fn synced(
     Ok(handle)
 }
 
-fn detail_of(handle: &RepoHandle, number: u64) -> Result<Detail, ApiError> {
-    handle
+/// A branch's tip from the synced ref state.
+fn branch_tip(handle: &RepoHandle, branch: &str) -> Option<String> {
+    let refs = handle.local().ref_view().ok()?;
+    refs.get(&format!("refs/heads/{branch}"))
+        .filter(|oid| !oid.is_empty())
+}
+
+/// (base, head) a pull request shows: live while open (the recorded tip once a branch is gone).
+fn tips(handle: &RepoHandle, i: &Item) -> (String, String) {
+    if i.state == "open" {
+        (
+            branch_tip(handle, &i.base_ref).unwrap_or_else(|| i.base_oid.clone()),
+            branch_tip(handle, &i.head_ref).unwrap_or_else(|| i.head_oid.clone()),
+        )
+    } else {
+        (i.base_oid.clone(), i.head_oid.clone())
+    }
+}
+
+fn detail_of(handle: &RepoHandle, number: u64, pull: bool) -> Result<Detail, ApiError> {
+    let item = handle
         .forge_read(|s| {
             s.items
                 .get(&number)
-                .filter(|i| i.kind == "issue")
-                .map(|i| Detail {
-                    item: i.clone(),
-                    timeline: i.timeline.clone(),
-                })
+                .filter(|i| i.kind == kind_name(pull))
+                .cloned()
         })
-        .ok_or_else(|| ApiError::NotFound(format!("issue #{number}")))
+        .ok_or_else(|| ApiError::NotFound(format!("{} #{number}", kind_name(pull))))?;
+    let (base_sha, head_sha) = if pull {
+        let (b, h) = tips(handle, &item);
+        (Some(b), Some(h))
+    } else {
+        (None, None)
+    };
+    Ok(Detail {
+        timeline: item.timeline.clone(),
+        item,
+        base_sha,
+        head_sha,
+    })
 }
 
-async fn list(
+async fn list<const PULL: bool>(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((owner, repo)): Path<(String, String)>,
     Query(q): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
     let handle = synced(&st, &headers, &owner, &repo).await?;
-    let query = format!("is:issue {}", q.q.as_deref().unwrap_or("is:open"));
+    let kind = if PULL { "is:pr" } else { "is:issue" };
+    let query = format!("{kind} {}", q.q.as_deref().unwrap_or("is:open"));
     let page: SearchPage = handle.forge_read(|s| s.search(&query, q.page.unwrap_or(1)));
     Ok(json_swr(&page, None).into_response(&headers))
 }
 
-async fn detail(
+async fn detail<const PULL: bool>(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((owner, repo, number)): Path<(String, String, u64)>,
 ) -> Result<Response, ApiError> {
     let handle = synced(&st, &headers, &owner, &repo).await?;
-    Ok(json_swr(&detail_of(&handle, number)?, None).into_response(&headers))
+    Ok(json_swr(&detail_of(&handle, number, PULL)?, None).into_response(&headers))
 }
 
 /// Publishes `events` as the signed-in principal; anonymous readers can't write.
@@ -203,38 +255,109 @@ fn set_change(add: Vec<String>, remove: Vec<String>) -> Option<ForgeSetChange> {
     (!add.is_empty() || !remove.is_empty()).then_some(ForgeSetChange { add, remove })
 }
 
-fn closing(reason: Option<String>) -> Body {
-    Body::State(ForgeStateChange {
-        closed: true,
-        reason: reason.unwrap_or_else(|| "completed".into()),
-    })
+/// The close event; a pull request freezes the tips it shows from now on.
+async fn closing<const PULL: bool>(
+    st: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    reason: Option<String>,
+) -> Result<ForgeEvent, ApiError> {
+    let (base_oid, head_oid) = if PULL {
+        let handle = synced(st, headers, owner, repo).await?;
+        let item = handle
+            .forge_read(|s| s.items.get(&number).cloned())
+            .ok_or_else(|| ApiError::NotFound(format!("pull #{number}")))?;
+        tips(&handle, &item)
+    } else {
+        Default::default()
+    };
+    Ok(event(
+        number,
+        Body::State(ForgeStateChange {
+            closed: true,
+            reason: reason.unwrap_or_else(|| "completed".into()),
+            base_oid,
+            head_oid,
+        }),
+    ))
 }
 
-async fn create(
+async fn create_issue(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((owner, repo)): Path<(String, String)>,
     Json(new): Json<NewIssue>,
 ) -> Result<Response, ApiError> {
-    let opened = Body::Opened(ForgeOpened {
+    let opened = ForgeOpened {
         kind: ForgeKind::Issue as i32,
         title: new.title,
         body: new.body,
         labels: new.labels,
         assignees: new.assignees,
-    });
-    let (handle, seq) = publish(&st, &headers, &owner, &repo, vec![event(0, opened)]).await?;
-    let number = handle
-        .forge_read(|s| s.opened_at(seq))
-        .ok_or_else(|| ApiError::Internal(format!("issue opened at seq {seq} not found")))?;
-    Ok((StatusCode::CREATED, Json(detail_of(&handle, number)?)).into_response())
+        ..Default::default()
+    };
+    created(&st, &headers, &owner, &repo, opened, false).await
 }
 
-async fn update(
+async fn create_pull(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo)): Path<(String, String)>,
+    Json(new): Json<NewPull>,
+) -> Result<Response, ApiError> {
+    let handle = synced(&st, &headers, &owner, &repo).await?;
+    let tip = |b: &str| {
+        branch_tip(&handle, b).ok_or_else(|| ApiError::BadRequest(format!("no branch {b:?}")))
+    };
+    let (base_oid, head_oid) = (tip(&new.base)?, tip(&new.head)?);
+    if base_oid == head_oid {
+        return Err(ApiError::BadRequest(format!(
+            "{} and {} are identical",
+            new.base, new.head
+        )));
+    }
+    let opened = ForgeOpened {
+        kind: ForgeKind::Pull as i32,
+        title: new.title,
+        body: new.body,
+        base_ref: new.base,
+        head_ref: new.head,
+        base_oid,
+        head_oid,
+        ..Default::default()
+    };
+    created(&st, &headers, &owner, &repo, opened, true).await
+}
+
+async fn created(
+    st: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+    repo: &str,
+    opened: ForgeOpened,
+    pull: bool,
+) -> Result<Response, ApiError> {
+    let (handle, seq) = publish(
+        st,
+        headers,
+        owner,
+        repo,
+        vec![event(0, Body::Opened(opened))],
+    )
+    .await?;
+    let number = handle
+        .forge_read(|s| s.opened_at(seq))
+        .ok_or_else(|| ApiError::Internal(format!("item opened at seq {seq} not found")))?;
+    Ok((StatusCode::CREATED, Json(detail_of(&handle, number, pull)?)).into_response())
+}
+
+async fn update<const PULL: bool>(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((owner, repo, number)): Path<(String, String, u64)>,
-    Json(p): Json<IssuePatch>,
+    Json(p): Json<ItemPatch>,
 ) -> Result<Response, ApiError> {
     let mut events = Vec::new();
     let edit = |change| {
@@ -259,7 +382,8 @@ async fn update(
         events.push(event(number, Body::Assignees(c)));
     }
     match p.state.as_deref() {
-        Some("closed") => events.push(event(number, closing(p.state_reason))),
+        Some("closed") => events
+            .push(closing::<PULL>(&st, &headers, &owner, &repo, number, p.state_reason).await?),
         Some("open") => events.push(event(number, Body::State(ForgeStateChange::default()))),
         Some(other) => {
             return Err(ApiError::BadRequest(format!(
@@ -272,10 +396,10 @@ async fn update(
         return Err(ApiError::BadRequest("nothing to change".into()));
     }
     let (handle, _) = publish(&st, &headers, &owner, &repo, events).await?;
-    Ok(Json(detail_of(&handle, number)?).into_response())
+    Ok(Json(detail_of(&handle, number, PULL)?).into_response())
 }
 
-async fn comment(
+async fn comment<const PULL: bool>(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((owner, repo, number)): Path<(String, String, u64)>,
@@ -283,13 +407,13 @@ async fn comment(
 ) -> Result<Response, ApiError> {
     let mut events = vec![event(number, Body::Comment(ForgeComment { body: c.body }))];
     if let Some(reason) = c.close {
-        events.push(event(number, closing(Some(reason))));
+        events.push(closing::<PULL>(&st, &headers, &owner, &repo, number, Some(reason)).await?);
     }
     let (handle, _) = publish(&st, &headers, &owner, &repo, events).await?;
-    Ok((StatusCode::CREATED, Json(detail_of(&handle, number)?)).into_response())
+    Ok((StatusCode::CREATED, Json(detail_of(&handle, number, PULL)?)).into_response())
 }
 
-async fn edit_comment(
+async fn edit_comment<const PULL: bool>(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((owner, repo, number, id)): Path<(String, String, u64, u64)>,
@@ -304,10 +428,10 @@ async fn edit_comment(
         }),
     );
     let (handle, _) = publish(&st, &headers, &owner, &repo, vec![ev]).await?;
-    Ok(Json(detail_of(&handle, number)?).into_response())
+    Ok(Json(detail_of(&handle, number, PULL)?).into_response())
 }
 
-async fn delete_comment(
+async fn delete_comment<const PULL: bool>(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((owner, repo, number, id)): Path<(String, String, u64, u64)>,
@@ -321,5 +445,5 @@ async fn delete_comment(
         }),
     );
     let (handle, _) = publish(&st, &headers, &owner, &repo, vec![ev]).await?;
-    Ok(Json(detail_of(&handle, number)?).into_response())
+    Ok(Json(detail_of(&handle, number, PULL)?).into_response())
 }

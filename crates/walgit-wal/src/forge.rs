@@ -44,6 +44,16 @@ pub struct Item {
     pub updated_at: String,
     pub closed_at: Option<String>,
     pub comments: u64,
+    /// Pull requests (empty on issues): `head_ref` merges into `base_ref`. The oids are the
+    /// tips when opened, replaced by the tips when closed.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub base_ref: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub head_ref: String,
+    #[serde(skip)]
+    pub base_oid: String,
+    #[serde(skip)]
+    pub head_oid: String,
     #[serde(skip)]
     pub timeline: Vec<TimelineItem>,
 }
@@ -204,6 +214,10 @@ impl ForgeState {
                     updated_at: at.to_owned(),
                     closed_at: None,
                     comments: 0,
+                    base_ref: o.base_ref.clone(),
+                    head_ref: o.head_ref.clone(),
+                    base_oid: o.base_oid.clone(),
+                    head_oid: o.head_oid.clone(),
                     timeline: Vec::new(),
                 },
             );
@@ -269,6 +283,10 @@ impl ForgeState {
                 item.state = "closed";
                 item.state_reason.clone_from(&s.reason);
                 item.closed_at = Some(at.to_owned());
+                if !s.head_oid.is_empty() {
+                    item.base_oid.clone_from(&s.base_oid);
+                    item.head_oid.clone_from(&s.head_oid);
+                }
                 Timeline::Closed {
                     reason: s.reason.clone(),
                 }
@@ -316,6 +334,20 @@ impl ForgeState {
                 }
                 if !actor.write && (!o.labels.is_empty() || !o.assignees.is_empty()) {
                     return Err("only collaborators can set labels and assignees".into());
+                }
+                if o.kind() == ForgeKind::Pull {
+                    if o.base_ref.is_empty() || o.head_ref.is_empty() || o.base_ref == o.head_ref {
+                        return Err("a pull request merges one branch into another".into());
+                    }
+                    let open = self.items.values().find(|i| {
+                        i.state == "open" && i.base_ref == o.base_ref && i.head_ref == o.head_ref
+                    });
+                    if let Some(i) = open {
+                        return Err(format!(
+                            "a pull request already exists for {}: #{}",
+                            o.head_ref, i.number
+                        ));
+                    }
                 }
                 continue;
             }
@@ -433,7 +465,7 @@ impl ForgeState {
                     .then(b.number.cmp(&a.number))
             }),
             "comments-desc" => {
-                rows.sort_by(|a, b| b.comments.cmp(&a.comments).then(b.number.cmp(&a.number)))
+                rows.sort_by(|a, b| b.comments.cmp(&a.comments).then(b.number.cmp(&a.number)));
             }
             _ => rows.sort_by_key(|i| std::cmp::Reverse(i.number)),
         }
@@ -650,6 +682,7 @@ mod tests {
                 forge_event::Body::State(ForgeStateChange {
                     closed: true,
                     reason: "completed".into(),
+                    ..Default::default()
                 }),
             )
         };

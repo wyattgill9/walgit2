@@ -522,6 +522,33 @@ A refused change is a `400` with the reason; nothing is published.
 | `PATCH …/issues/{n}/comments/{id}` | `{body}` | the comment's author or write |
 | `DELETE …/issues/{n}/comments/{id}` | — | the comment's author or write |
 
+### Pull requests (D50)
+
+`…/api/pulls`, `…/pulls/{n}`, `…/pulls/{n}/comments[/{id}]` behave exactly like the issue
+routes above, over pull requests (issues and pull requests share one number sequence; each
+list holds its own kind). A pull request adds `base_ref`/`head_ref` (branch names) and, on
+`GET …/pulls/{n}`, `base_sha`/`head_sha`: the branches' current tips while open, the tips
+at closing once closed (a deleted branch falls back to its tip when opened). Show its
+Commits and Files changed with `compare/{base_sha}...{head_sha}`.
+
+- `POST …/api/pulls` (`201`) `{title, body?, base, head}`: both branches must exist and
+  differ; one open pull request per `head`→`base` (`400` otherwise). Anyone signed in.
+- Closing (`PATCH {state: "closed"}` or a comment with `close`) freezes the tips.
+
+### `GET /{owner}/{repo}/api/compare/{base}...{head}`
+
+GitHub's three-dot compare (branches, tags or shas; branch names may contain `/`):
+
+```json
+{ "base": "<sha>", "head": "<sha>", "merge_base": "<sha>", "ahead": 1, "behind": 2,
+  "commits": [Commit], "stats": [{ "path": "src/main.rs", "additions": 1, "deletions": 1 }],
+  "patch": "diff --git …" }
+```
+
+`commits` = `merge_base..head`, oldest first, at most 250; `stats`/`patch` = the diff from
+`merge_base` to `head` (as `commit/{sha}`). Unrelated histories diff against `base`. Needs the
+packs on the answering host (`503` on remote-served repositories). Cache: SWR.
+
 ### `GET /{owner}/{repo}/api/overview` — optional, walgit-specific
 
 Backs the "WAL" tab. Not needed by Code/Commits pages; a host without a

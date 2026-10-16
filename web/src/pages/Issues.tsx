@@ -1,16 +1,19 @@
-import { useState, useTransition, type ReactNode } from "react";
+import { Suspense, useState, useTransition, type ReactNode } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { api, type Issue, type IssueDetail, type TimelineItem } from "../api";
+import { api, type Issue, type IssueDetail, type PullDetail, type TimelineItem } from "../api";
 import { useRepo } from "./RepoLayout";
 import { invalidate, reportError, useData } from "../data";
 import { Box } from "../components/Layout";
-import { Avatar } from "../components/CommitRow";
+import { Skeleton } from "../components/Loading";
+import { Avatar, CommitRow } from "../components/CommitRow";
 import { Markdown } from "../components/Markdown";
 import { Pager } from "./BranchesPage";
+import { Diff } from "./CommitPage";
 import { relTime } from "../format";
 
-// Octicons (MIT): issue-opened, issue-closed, circle-slash (not planned), comment.
+// Octicons (MIT): issue-opened, issue-closed, circle-slash (not planned), comment, git-pull-request.
 const ICON = {
+  pull: "M1.5 3.25a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 1.5 3.25Zm5.677-.177L9.573.677A.25.25 0 0 1 10 .854V2.5h1A2.5 2.5 0 0 1 13.5 5v5.628a2.251 2.251 0 1 1-1.5 0V5a1 1 0 0 0-1-1h-1v1.646a.25.25 0 0 1-.427.177L7.177 3.427a.25.25 0 0 1 0-.354ZM3.75 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm0 9.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm8.25.75a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0Z",
   open: "M8 9.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3ZM8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0ZM1.5 8a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Z",
   completed:
     "M11.28 6.78a.75.75 0 0 0-1.06-1.06L7.25 8.69 5.78 7.22a.75.75 0 0 0-1.06 1.06l2 2a.75.75 0 0 0 1.06 0l3.5-3.5ZM16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0Zm-1.5 0a6.5 6.5 0 1 0-13 0 6.5 6.5 0 0 0 13 0Z",
@@ -34,8 +37,11 @@ const STATE_LABEL: Record<StateKey, string> = { open: "Open", completed: "Closed
 
 function StateIcon({ issue }: { issue: Issue }) {
   const s = stateOf(issue);
-  return <Icon d={ICON[s]} className={`issue-state ${s}`} />;
+  return <Icon d={issue.kind === "pull" ? ICON.pull : ICON[s]} className={`issue-state ${s}`} />;
 }
+
+/** URL segment of one item: GitHub's `/issues/{n}` and `/pull/{n}`. */
+const itemPath = (full: string, i: { kind: Issue["kind"]; number: number }) => `/${full}/${i.kind === "pull" ? "pull" : "issues"}/${i.number}`;
 
 /** Signed-in principal (`/api/v1/me`); anonymous readers get no write controls. */
 function useMe() {
@@ -58,8 +64,9 @@ const SORTS: [string, string][] = [
   ["comments-desc", "Most commented"],
 ];
 
-/** GitHub's `/issues`: search box, Open/Closed counts, sort, rows; query and page in the URL. */
-export function IssuesPage() {
+/** GitHub's `/issues` and `/pulls`: search box, Open/Closed counts, sort, rows; query and page
+ * in the URL. */
+export function IssuesPage({ pull = false }: { pull?: boolean }) {
   const { full } = useRepo();
   const [params, setParams] = useSearchParams();
   const q = params.get("q") ?? "is:open";
@@ -77,11 +84,11 @@ export function IssuesPage() {
     <>
       <div className="issues-bar">
         <SearchBox key={q} q={q} onSearch={(nq) => go({ q: nq, page: 1 })} />
-        <Link to={`/${full}/issues/new`} className="btn primary">
-          New issue
+        <Link to={pull ? `/${full}/compare` : `/${full}/issues/new`} className="btn primary">
+          {pull ? "New pull request" : "New issue"}
         </Link>
       </div>
-      <IssueList full={full} q={q} page={page} go={go} />
+      <IssueList full={full} q={q} page={page} go={go} pull={pull} />
     </>
   );
 }
@@ -101,8 +108,8 @@ function SearchBox({ q, onSearch }: { q: string; onSearch: (q: string) => void }
   );
 }
 
-function IssueList({ full, q, page, go }: { full: string; q: string; page: number; go: (n: { q?: string; page?: number }) => void }) {
-  const data = useData(`issues:${full}:${q}:${page}`, () => api.issuePage(full, q, page));
+function IssueList({ full, q, page, go, pull }: { full: string; q: string; page: number; go: (n: { q?: string; page?: number }) => void; pull: boolean }) {
+  const data = useData(`${pull ? "pulls" : "issues"}:${full}:${q}:${page}`, () => (pull ? api.pullPage(full, q, page) : api.issuePage(full, q, page)));
   const state = words(q).find((t) => STATE_RE.test(t))?.slice(3);
   const total = state === "open" ? data.open_count : state === "closed" ? data.closed_count : data.open_count + data.closed_count;
   const sort = words(q).find((t) => SORT_RE.test(t))?.slice(5) ?? "created-desc";
@@ -113,7 +120,7 @@ function IssueList({ full, q, page, go }: { full: string; q: string; page: numbe
         title={
           <div className="issues-head">
             <button type="button" className={state === "open" ? "subtab active" : "subtab"} onClick={() => go({ q: setQ(q, STATE_RE, "is:open"), page: 1 })}>
-              <Icon d={ICON.open} /> {data.open_count} Open
+              <Icon d={pull ? ICON.pull : ICON.open} /> {data.open_count} Open
             </button>
             <button type="button" className={state === "closed" ? "subtab active" : "subtab"} onClick={() => go({ q: setQ(q, STATE_RE, "is:closed"), page: 1 })}>
               <Icon d={ICON.completed} /> {data.closed_count} Closed
@@ -146,7 +153,7 @@ function IssueRow({ full, issue: i, onFilter }: { full: string; issue: Issue; on
       <StateIcon issue={i} />
       <div className="issue-main">
         <div className="issue-line">
-          <Link to={`/${full}/issues/${i.number}`} className="issue-title">
+          <Link to={itemPath(full, i)} className="issue-title">
             {i.title}
           </Link>
           {i.labels.map((l) => (
@@ -180,7 +187,7 @@ function IssueRow({ full, issue: i, onFilter }: { full: string; issue: Issue; on
           <Avatar key={a} name={a} />
         ))}
         {i.comments > 0 && (
-          <Link to={`/${full}/issues/${i.number}`} className="issue-comments" aria-label={`${i.comments} comments`}>
+          <Link to={itemPath(full, i)} className="issue-comments" aria-label={`${i.comments} comments`}>
             <Icon d={ICON.comment} /> {i.comments}
           </Link>
         )}
@@ -191,21 +198,24 @@ function IssueRow({ full, issue: i, onFilter }: { full: string; issue: Issue; on
 
 // ---- one issue ----
 
-/** GitHub's `/issues/{n}`: title, state, timeline, composer, assignees/labels sidebar. */
-export function IssuePage() {
+/** GitHub's `/issues/{n}` and `/pull/{n}[/commits|/files]`: title, state, timeline, composer,
+ * assignees/labels sidebar; a pull request adds its branches and the Commits/Files tabs. */
+export function IssuePage({ pull = false }: { pull?: boolean }) {
   const { full } = useRepo();
-  const n = Number(useParams().number);
-  const issue = useData(`issue:${full}:${n}`, () => api.issue(full, n));
+  const { number, tab } = useParams();
+  const n = Number(number);
+  const key = `${pull ? "pull" : "issue"}:${full}:${n}`;
+  const issue: IssueDetail & Partial<PullDetail> = useData(key, () => (pull ? api.pull(full, n) : api.issue(full, n)));
   const me = useMe();
   const signedIn = !me.anonymous || me.write;
   const canEdit = (author: string) => me.write || (signedIn && me.principal === author);
-  const issues = api.issues(full);
-  /** Run a write; refresh this issue and the lists. False (+ the error tray) when refused. */
+  const issues = pull ? api.pulls(full) : api.issues(full);
+  /** Run a write; refresh this item and the lists. False (+ the error tray) when refused. */
   const act = async (what: string, write: () => Promise<unknown>) => {
     try {
       await write();
-      invalidate(`issue:${full}:${n}`);
-      invalidate(`issues:${full}`);
+      invalidate(key);
+      invalidate(`${pull ? "pulls" : "issues"}:${full}`);
       return true;
     } catch (e) {
       reportError(e, what);
@@ -215,7 +225,13 @@ export function IssuePage() {
   const participants = [...new Set([issue.author, ...issue.timeline.map((t) => t.actor)])];
   return (
     <>
-      <IssueHeader issue={issue} canEdit={canEdit(issue.author)} onTitle={(title) => act("rename issue", () => issues.update(n, { title }))} />
+      <IssueHeader issue={issue} canEdit={canEdit(issue.author)} onTitle={(title) => act("rename", () => issues.update(n, { title }))} />
+      {pull && <PullTabs full={full} n={n} tab={tab} />}
+      {pull && tab ? (
+        <Suspense fallback={<Skeleton title={false} rows={6} />}>
+          <PullChanges full={full} pr={issue as PullDetail} tab={tab} />
+        </Suspense>
+      ) : (
       <div className="issue-layout">
         <div className="issue-timeline">
           <CommentBox
@@ -230,6 +246,7 @@ export function IssuePage() {
             <TimelineEntry
               key={t.id}
               item={t}
+              pull={pull}
               canEdit={canEdit(t.actor)}
               onSave={(body) => act("edit comment", () => issues.editComment(n, t.id, body))}
               onDelete={() => act("delete comment", () => issues.deleteComment(n, t.id))}
@@ -238,6 +255,7 @@ export function IssuePage() {
           {signedIn ? (
             <Composer
               issue={issue}
+              me={me.principal}
               canClose={canEdit(issue.author)}
               onComment={(body) => act("comment", () => issues.comment(n, body))}
               onClose={(reason, body) => act("close issue", () => (body ? issues.comment(n, body, reason) : issues.update(n, { state: "closed", state_reason: reason })))}
@@ -280,8 +298,43 @@ export function IssuePage() {
           </div>
         </aside>
       </div>
+      )}
     </>
   );
+}
+
+function PullTabs({ full, n, tab }: { full: string; n: number; tab?: string }) {
+  const base = `/${full}/pull/${n}`;
+  const tabs: [string | undefined, string, string][] = [
+    [undefined, base, "Conversation"],
+    ["commits", `${base}/commits`, "Commits"],
+    ["files", `${base}/files`, "Files changed"],
+  ];
+  return (
+    <nav className="subtabs pull-tabs" aria-label="Pull request views">
+      {tabs.map(([t, to, label]) => (
+        <Link key={label} to={to} className={t === tab ? "subtab active" : "subtab"}>
+          {label}
+        </Link>
+      ))}
+    </nav>
+  );
+}
+
+/** Commits / Files changed: the three-dot compare of the tips the PR shows (immutable by sha). */
+function PullChanges({ full, pr, tab }: { full: string; pr: PullDetail; tab: string }) {
+  const spec = `${pr.base_sha}...${pr.head_sha}`;
+  const cmp = useData(`compare:${full}:${spec}`, () => api.compare(full, pr.base_sha, pr.head_sha), Infinity);
+  if (tab === "commits") {
+    return (
+      <Box title={`${cmp.commits.length} commit${cmp.commits.length === 1 ? "" : "s"}`}>
+        {cmp.commits.map((c) => (
+          <CommitRow key={c.sha} repo={full} commit={c} />
+        ))}
+      </Box>
+    );
+  }
+  return <Diff patch={cmp.patch} stats={cmp.stats} cacheKey={spec} />;
 }
 
 function IssueHeader({ issue, canEdit, onTitle }: { issue: IssueDetail; canEdit: boolean; onTitle: (t: string) => Promise<boolean> }) {
@@ -317,11 +370,18 @@ function IssueHeader({ issue, canEdit, onTitle }: { issue: IssueDetail; canEdit:
       )}
       <div className="row wrap gap small muted">
         <span className={`state-badge ${s}`}>
-          <Icon d={ICON[s]} /> {STATE_LABEL[s]}
+          <Icon d={issue.kind === "pull" ? ICON.pull : ICON[s]} /> {issue.kind === "pull" && s !== "open" ? "Closed" : STATE_LABEL[s]}
         </span>
-        <span>
-          <strong>{issue.author}</strong> opened this issue {relTime(issue.created_at)} · {issue.comments} comment{issue.comments === 1 ? "" : "s"}
-        </span>
+        {issue.kind === "pull" ? (
+          <span>
+            <strong>{issue.author}</strong> wants to merge into <code className="branch-tag">{issue.base_ref}</code> from{" "}
+            <code className="branch-tag">{issue.head_ref}</code> · opened {relTime(issue.created_at)}
+          </span>
+        ) : (
+          <span>
+            <strong>{issue.author}</strong> opened this issue {relTime(issue.created_at)} · {issue.comments} comment{issue.comments === 1 ? "" : "s"}
+          </span>
+        )}
       </div>
     </div>
   );
@@ -405,11 +465,13 @@ const names = (v: string[]) =>
 
 function TimelineEntry({
   item: t,
+  pull,
   canEdit,
   onSave,
   onDelete,
 }: {
   item: TimelineItem;
+  pull: boolean;
   canEdit: boolean;
   onSave: (body: string) => Promise<boolean>;
   onDelete: () => Promise<boolean>;
@@ -427,7 +489,9 @@ function TimelineEntry({
     case "comment":
       return t.deleted ? null : <CommentBox author={t.actor} at={t.at} body={t.body} edited={t.edited} canEdit={canEdit} onSave={onSave} onDelete={onDelete} />;
     case "closed":
-      return event(ICON[t.reason === "not_planned" ? "not_planned" : "completed"], <>closed this as {t.reason === "not_planned" ? "not planned" : "completed"}</>);
+      return pull
+        ? event(ICON.completed, <>closed this</>)
+        : event(ICON[t.reason === "not_planned" ? "not_planned" : "completed"], <>closed this as {t.reason === "not_planned" ? "not planned" : "completed"}</>);
     case "reopened":
       return event(ICON.open, <>reopened this</>);
     case "renamed":
@@ -463,12 +527,14 @@ function Editor({ value, onChange, placeholder }: { value: string; onChange: (v:
 
 function Composer({
   issue,
+  me,
   canClose,
   onComment,
   onClose,
   onReopen,
 }: {
   issue: IssueDetail;
+  me: string;
   canClose: boolean;
   onComment: (body: string) => Promise<boolean>;
   onClose: (reason: "completed" | "not_planned", body: string) => Promise<boolean>;
@@ -482,9 +548,10 @@ function Composer({
     setBusy(false);
   };
   const body = text.trim();
+  const noun = issue.kind === "pull" ? "pull request" : "issue";
   return (
     <div className="comment composer">
-      <Avatar name="+" />
+      <Avatar name={me} />
       <div className="comment-box">
         <Editor value={text} onChange={setText} placeholder="Leave a comment" />
         <div className="composer-actions">
@@ -492,15 +559,17 @@ function Composer({
             (issue.state === "open" ? (
               <>
                 <button type="button" className="btn" disabled={busy} onClick={() => run(() => onClose("completed", body))}>
-                  <Icon d={ICON.completed} /> {body ? "Close with comment" : "Close issue"}
+                  <Icon d={ICON.completed} /> {body ? "Close with comment" : `Close ${noun}`}
                 </button>
-                <button type="button" className="btn" disabled={busy} onClick={() => run(() => onClose("not_planned", body))}>
-                  <Icon d={ICON.not_planned} /> Close as not planned
-                </button>
+                {issue.kind === "issue" && (
+                  <button type="button" className="btn" disabled={busy} onClick={() => run(() => onClose("not_planned", body))}>
+                    <Icon d={ICON.not_planned} /> Close as not planned
+                  </button>
+                )}
               </>
             ) : (
               <button type="button" className="btn" disabled={busy} onClick={() => run(() => onReopen(body))}>
-                <Icon d={ICON.open} /> {body ? "Reopen with comment" : "Reopen issue"}
+                <Icon d={ICON.open} /> {body ? "Reopen with comment" : `Reopen ${noun}`}
               </button>
             ))}
           <button type="button" className="btn primary" disabled={busy || !body} onClick={() => run(() => onComment(body))}>
@@ -606,5 +675,126 @@ export function NewIssuePage() {
         </div>
       </div>
     </form>
+  );
+}
+
+// ---- compare / new pull request ----
+
+/** GitHub's `/compare/{base}...{head}`: pick two branches, see what merging brings, open a PR. */
+export function ComparePage() {
+  const { full, refs } = useRepo();
+  const spec = useParams()["*"] ?? "";
+  const navigate = useNavigate();
+  const [b, h] = spec.includes("...") ? spec.split("...", 2) : ["", spec];
+  const base = b || refs.head?.name || "main";
+  const head = h ?? "";
+  const branches = useData(`branch-pick:${full}`, () => api.refList(full, "branches", { n: 1000 }));
+  const pick = (nb: string, nh: string) => navigate(`/${full}/compare/${nb}...${nh}`);
+  const options = branches.refs.map((r) => (
+    <option key={r.name} value={r.name}>
+      {r.name}
+    </option>
+  ));
+  return (
+    <>
+      <h2 className="page-title">Compare changes</h2>
+      <p className="muted small">Choose two branches to see what's changed or to start a new pull request.</p>
+      <div className="box compare-bar">
+        <label>
+          base{" "}
+          <select value={base} onChange={(e) => pick(e.target.value, head)}>
+            {options}
+          </select>
+        </label>
+        <span className="muted">←</span>
+        <label>
+          compare{" "}
+          <select value={head} onChange={(e) => pick(base, e.target.value)}>
+            <option value="">choose a branch…</option>
+            {options}
+          </select>
+        </label>
+      </div>
+      {head && head !== base && (
+        <Suspense fallback={<Skeleton title={false} rows={6} />}>
+          <CompareBody key={`${base}...${head}`} full={full} base={base} head={head} />
+        </Suspense>
+      )}
+    </>
+  );
+}
+
+function CompareBody({ full, base, head }: { full: string; base: string; head: string }) {
+  const cmp = useData(`compare:${full}:${base}...${head}`, () => api.compare(full, base, head));
+  const me = useMe();
+  const navigate = useNavigate();
+  const one = cmp.commits.length === 1 ? cmp.commits[0] : undefined;
+  const [form, setForm] = useState(false);
+  const [title, setTitle] = useState(one?.subject ?? head);
+  const [body, setBody] = useState(one?.body ?? "");
+  const [busy, setBusy] = useState(false);
+  if (cmp.ahead === 0) {
+    return (
+      <Box>
+        <div className="pad muted">
+          There isn't anything to compare: <strong>{base}</strong> is up to date with all commits from <strong>{head}</strong>.
+        </div>
+      </Box>
+    );
+  }
+  const create = async () => {
+    setBusy(true);
+    try {
+      const pr = await api.pulls(full).create({ title: title.trim(), body, base, head });
+      invalidate(`pulls:${full}`);
+      navigate(`/${full}/pull/${pr.number}`);
+    } catch (e) {
+      reportError(e, "open pull request");
+      setBusy(false);
+    }
+  };
+  return (
+    <>
+      {form ? (
+        <div className="comment">
+          <Avatar name={me.principal} />
+          <div className="comment-box">
+            <div className="comment-body">
+              <input className="issue-title-input" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Title" aria-label="Title" autoFocus />
+              <Editor value={body} onChange={setBody} placeholder="Add a description" />
+              <div className="composer-actions">
+                <button type="button" className="btn" onClick={() => setForm(false)}>
+                  Cancel
+                </button>
+                <button type="button" className="btn primary" disabled={busy || !title.trim()} onClick={create}>
+                  Create pull request
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="box compare-cta">
+          <span className="small">
+            <strong>{cmp.ahead}</strong> commit{cmp.ahead === 1 ? "" : "s"} · <strong>{cmp.stats.length}</strong> file{cmp.stats.length === 1 ? "" : "s"} changed
+            {cmp.behind > 0 && <span className="muted"> · {cmp.behind} behind {base}</span>}
+          </span>
+          <span className="spacer" />
+          {!me.anonymous || me.write ? (
+            <button type="button" className="btn primary" onClick={() => setForm(true)}>
+              Create pull request
+            </button>
+          ) : (
+            <span className="muted small">Sign in to open a pull request.</span>
+          )}
+        </div>
+      )}
+      <Box title={`${cmp.commits.length} commit${cmp.commits.length === 1 ? "" : "s"}`}>
+        {cmp.commits.map((c) => (
+          <CommitRow key={c.sha} repo={full} commit={c} />
+        ))}
+      </Box>
+      <Diff patch={cmp.patch} stats={cmp.stats} cacheKey={`${cmp.base}...${cmp.head}`} />
+    </>
   );
 }

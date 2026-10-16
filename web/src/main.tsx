@@ -21,6 +21,7 @@ const SettingsPage = lazy(() => track(import("./pages/SettingsPage")).then((m) =
 const BranchesPage = lazy(() => track(import("./pages/BranchesPage")).then((m) => ({ default: m.BranchesPage })));
 const IssuesPage = lazy(() => track(import("./pages/Issues")).then((m) => ({ default: m.IssuesPage })));
 const IssuePage = lazy(() => track(import("./pages/Issues")).then((m) => ({ default: m.IssuePage })));
+const ComparePage = lazy(() => track(import("./pages/Issues")).then((m) => ({ default: m.ComparePage })));
 const NewIssuePage = lazy(() => track(import("./pages/Issues")).then((m) => ({ default: m.NewIssuePage })));
 const ApiPage = lazy(() => track(import("./pages/ApiPage")).then((m) => ({ default: m.ApiPage })));
 
@@ -46,6 +47,11 @@ createRoot(document.getElementById("root")!).render(
             <Route path="issues" element={<IssuesPage />} />
             <Route path="issues/new" element={<NewIssuePage />} />
             <Route path="issues/:number" element={<IssuePage />} />
+            <Route path="pulls" element={<IssuesPage pull />} />
+            <Route path="pull/:number" element={<IssuePage pull />} />
+            <Route path="pull/:number/:tab" element={<IssuePage pull />} />
+            <Route path="compare" element={<ComparePage />} />
+            <Route path="compare/*" element={<ComparePage />} />
           </Route>
         </Route>
       </Routes>

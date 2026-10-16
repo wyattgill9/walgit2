@@ -230,6 +230,12 @@ message ForgeOpened {
   string body = 3;
   repeated string labels = 4;
   repeated string assignees = 5;
+  // Pull requests: merge `head_ref` into `base_ref` (branch names), and both tips when opened.
+  // While open, the PR's head is the branch's current tip.
+  string base_ref = 6;
+  string head_ref = 7;
+  string base_oid = 8;
+  string head_oid = 9;
 }
 
 message ForgeComment {
@@ -250,6 +256,9 @@ message ForgeStateChange {
   bool closed = 1;
   // Closing: "completed" | "not_planned".
   string reason = 2;
+  // Closing a pull request: both tips at that moment (what it shows from then on).
+  string base_oid = 3;
+  string head_oid = 4;
 }
 
 message ForgeSetChange {
