@@ -1117,3 +1117,129 @@ input.text.small { font-size: 11px; padding: 2px 6px; margin-left: 8px; }
   .branch-updated, .branch-cols span:nth-child(2) { display: none; }
   .branch-search { max-width: none; margin-left: 0; }
 }
+
+/* ---- issues (D50) ---- */
+.issues-bar { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+.issues-search { flex: 1; }
+.issues-search input { width: 100%; padding: 5px 10px; font-size: 12px; }
+.issues-head { display: flex; align-items: center; gap: 6px; width: 100%; }
+.issues-head .subtab { display: inline-flex; align-items: center; gap: 6px; }
+.issues-head select { font-size: 11.5px; padding: 3px 6px; }
+.issue-state.open { color: var(--s-green); }
+.issue-state.completed { color: var(--l9); }
+.issue-state.not_planned { color: var(--l6); }
+.issue-row {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: start;
+  padding: 10px 16px;
+  border-top: 1px solid var(--l3);
+  transition: background 0.2s;
+}
+.issue-row:first-child { border-top: 0; }
+.issue-row:hover { background: linear-gradient(90deg, var(--l2), transparent 70%); }
+.issue-row .issue-state { margin-top: 2px; }
+.issue-line { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.issue-title { color: var(--la); font-weight: 500; }
+.issue-side { display: flex; align-items: center; gap: 10px; }
+.issue-comments { display: inline-flex; align-items: center; gap: 4px; color: var(--l7); }
+.label-chip {
+  font: inherit;
+  font-size: 10.5px;
+  line-height: 1.5;
+  padding: 0 7px;
+  border: 1px solid var(--l5);
+  background: var(--l2);
+  color: var(--l9);
+  cursor: pointer;
+}
+.label-chip:hover { border-color: var(--l8); }
+.label-chip.static { cursor: default; display: inline-flex; align-items: center; gap: 2px; }
+.issue-header { margin-bottom: 20px; padding-bottom: 14px; border-bottom: 1px solid var(--l3); }
+.issue-h { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; margin: 0 0 10px; font-size: 22px; }
+.issue-h .btn { margin-left: auto; align-self: center; }
+.issue-h-edit { display: flex; gap: 8px; margin-bottom: 10px; }
+.issue-h-edit input { flex: 1; padding: 5px 10px; font-size: 14px; }
+.state-badge { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border: 1px solid var(--l5); color: var(--l9); }
+.state-badge.open { color: var(--s-green); border-color: var(--s-green); }
+.issue-layout { display: grid; grid-template-columns: minmax(0, 1fr) 220px; gap: 32px; }
+.comment { display: grid; grid-template-columns: 20px minmax(0, 1fr); gap: 12px; margin-bottom: 16px; }
+.comment-box { border: 1px solid var(--l3); background: var(--l1); min-width: 0; }
+.comment-head { display: flex; align-items: center; gap: 8px; padding: 6px 12px; border-bottom: 1px solid var(--l3); background: var(--l2); }
+.comment-body { padding: 12px; }
+.danger-text { color: var(--s-red); }
+.timeline-event { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 0 0 16px 32px; padding-left: 12px; border-left: 1px solid var(--l4); }
+.editor-tabs { display: flex; gap: 6px; padding: 8px 12px 0; }
+.editor textarea { display: block; width: calc(100% - 24px); margin: 8px 12px; min-height: 110px; padding: 8px; resize: vertical; }
+.editor-preview { margin: 8px 12px; min-height: 110px; padding: 8px; border: 1px dashed var(--l4); }
+.composer-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; padding: 0 12px 12px; }
+.composer-actions .btn { display: inline-flex; align-items: center; gap: 6px; }
+.comment-body .composer-actions,
+.comment-body .editor textarea,
+.comment-body .editor-preview,
+.comment-body .editor-tabs { margin-left: 0; margin-right: 0; padding-left: 0; padding-right: 0; }
+.comment-body .editor textarea { width: 100%; }
+.issue-sidebar { font-size: 12px; }
+.side-section { padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid var(--l3); }
+.side-title { color: var(--l7); font-size: 11px; margin-bottom: 8px; }
+.side-values { display: flex; flex-direction: column; gap: 6px; }
+.side-value { display: flex; align-items: center; gap: 6px; }
+.side-input { width: 100%; margin-top: 8px; padding: 3px 8px; font-size: 11.5px; }
+.issue-title-input { width: 100%; padding: 6px 10px; font-size: 14px; margin-bottom: 4px; }
+@media (max-width: 760px) {
+  .issue-layout { grid-template-columns: minmax(0, 1fr); }
+  .issue-side .avatar { display: none; }
+}
+/* pull requests */
+.pull-tabs { margin-bottom: 16px; }
+.pull-tabs .subtab:hover { text-decoration: none; }
+.branch-tag { padding: 0 6px; border: 1px solid var(--l4); background: var(--l2); color: var(--l9); font-size: 11px; }
+.compare-bar, .compare-cta { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 10px 16px; }
+.compare-bar select { font-size: 12px; padding: 3px 6px; max-width: 280px; }
+/* reviews */
+.review-approved, .review-approved svg { color: var(--s-green); }
+.review-changes, .review-changes svg { color: var(--s-red); }
+.review-chip { font-size: inherit; }
+.review-entry { margin-bottom: 16px; }
+.review-entry .timeline-event { margin-bottom: 8px; }
+.review-box { margin-left: 32px; }
+.review-line { padding: 10px 12px; border-top: 1px solid var(--l3); }
+.review-line:first-child { border-top: 0; }
+.review-status { display: flex; align-items: flex-start; gap: 12px; padding: 12px 16px; margin-left: 32px; }
+.review-status.approved { border-color: var(--s-green); }
+.review-status.changes { border-color: var(--s-red); }
+.review-status.approved svg { color: var(--s-green); }
+.review-status.changes svg { color: var(--s-red); }
+.review-panel { position: relative; display: flex; justify-content: flex-end; margin-bottom: 12px; }
+.review-panel .btn .pill { margin-left: 6px; }
+.review-pop { position: absolute; top: 34px; right: 0; z-index: 5; width: min(520px, 100%); box-shadow: 0 8px 24px var(--shadow); }
+.review-choices { display: flex; flex-direction: column; gap: 8px; padding: 0 12px 12px; }
+.review-choices label { display: flex; gap: 8px; align-items: baseline; cursor: pointer; }
+.review-thread { margin: 6px 12px; border: 1px solid var(--l4); background: var(--l1); font-family: var(--f); }
+.review-thread-item { padding: 8px 12px; border-bottom: 1px solid var(--l3); }
+.review-thread-item:last-child { border-bottom: 0; }
+.line-form { padding: 4px 12px 0; }
+.line-form .editor textarea, .line-form .editor-preview { width: 100%; margin-left: 0; margin-right: 0; }
+.line-form .editor-tabs, .line-form .composer-actions { padding-left: 0; padding-right: 0; }
+/* merging */
+.issue-state.merged, .state-badge.merged, .review-status.merged svg { color: var(--la); }
+.state-badge.merged { border-color: var(--l8); background: var(--l2); }
+.review-status.merged { border-color: var(--l7); }
+.review-status .grow { flex: 1; min-width: 0; }
+.merge-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.merge-actions select { font-size: 12px; padding: 3px 6px; }
+.merge-confirm { margin-top: 10px; }
+.merge-confirm textarea { width: 100%; padding: 8px; resize: vertical; }
+.merge-confirm .composer-actions { padding: 8px 0 0; }
+/* counts on tabs, filter menus */
+.tab-count { display: inline-block; margin-left: 6px; padding: 0 6px; border: 1px solid var(--l4); background: var(--l2); color: var(--l8); font-size: 10.5px; line-height: 1.5; }
+.issues-head select { max-width: 140px; }
+/* label catalog: the label's color is a dot; the chip stays greyscale */
+.label-chip::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 5px; border-radius: 50%; background: var(--label, var(--l6)); vertical-align: 1px; }
+.label-row { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-top: 1px solid var(--l3); }
+.label-row:first-child { border-top: 0; }
+.label-row .grow { flex: 1; min-width: 0; }
+.label-form input:not([type="color"]) { padding: 4px 8px; font-size: 12px; }
+.label-form input[type="color"] { width: 36px; height: 26px; padding: 0 2px; }
+.issue-state.draft, .state-badge.draft { color: var(--l7); }

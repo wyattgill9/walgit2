@@ -702,6 +702,7 @@ async fn s3_contract() {
             access_key_env: "AWS_ACCESS_KEY_ID".into(),
             secret_key_env: "AWS_SECRET_ACCESS_KEY".into(),
             force_path_style: true,
+            emulate_conditional_writes: std::env::var_os("WALGIT_TEST_S3_EMULATE_CAS").is_some(),
         },
         multipart_threshold: bytesize::ByteSize::mib(5),
         multipart_part_size: bytesize::ByteSize::mib(5),

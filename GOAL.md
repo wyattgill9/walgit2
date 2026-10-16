@@ -30,8 +30,9 @@ anyone can run against a bucket, and predictable enough that tooling can build o
 4. **All the features a git host needs, and only those**: smart HTTP v0/v2 (ls-refs, fetch with
    filter/shallow/deepen, receive-pack atomic/delete/tags/push-options/report-status-v2), negotiated packfile delivery, LFS,
    `<owner>/<repo>` namespaces, per-repo push policy and settings, ref events, a browsing web UI + one JSON API +
-   one SDK (`repos.js`), tasks/narration so nothing ever waits silently. Not in scope: code review, merge
-   queues, CI, issues — those live elsewhere and build on this.
+   one SDK (`repos.js`), issues and pull requests with review and merge (forge events on the WAL, D50),
+   tasks/narration so nothing ever waits silently. Not in scope: merge queues, CI — those live elsewhere
+   and build on this.
 5. **Works great for developers and their laptops.** One auth story (browser sign-in through your identity
    provider, a token for git), one install script, `git` does the rest; errors tell you the fix; every long
    wait is narrated. The developer on a rebased branch must get *cheaper*, never slower.

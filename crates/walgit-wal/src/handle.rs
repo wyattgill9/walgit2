@@ -96,6 +96,8 @@ pub struct RepoHandle {
     /// writer's own push today must not turn the current slots `unavailable` — the planner keeps
     /// learning first state from replayed segments and checkpoints only.
     pub(crate) first_seq_published_at: parking_lot::Mutex<Option<std::time::SystemTime>>,
+    /// D50: folded issues/PRs, loaded by the first forge request (`forge.rs`).
+    pub(crate) forge: PLMutex<Option<crate::forge::ForgeState>>,
     pub(crate) history_install_inflight: std::sync::atomic::AtomicBool,
     /// Fires when a history-pack install finishes (for `wait_history_pack_installed`).
     pub(crate) history_install_done: tokio::sync::Notify,
@@ -173,6 +175,7 @@ impl RepoHandle {
             active_reporter: PLMutex::new(None),
             blocks,
             remote: PLMutex::new(None),
+            forge: PLMutex::new(None),
         }
     }
 
@@ -1023,18 +1026,56 @@ impl RepoHandle {
                 "a push pack requires a nonempty ref transaction".into(),
             ));
         }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.send_publish(
+            PublishRequest {
+                pack,
+                txn,
+                meta,
+                synced,
+                created_at,
+                forge: Vec::new(),
+                actor: None,
+                response: tx,
+            },
+            rx,
+        )
+        .await
+    }
+
+    /// D50: forge events, alone (a FORGE entry) or with a ref change and its pack (one PUSH
+    /// entry, e.g. a merge). See `forge.rs::publish_forge`.
+    pub(crate) async fn enqueue_forge(
+        &self,
+        actor: crate::forge::Actor,
+        forge: Vec<walgit_proto::v1::ForgeEvent>,
+        pack: Option<walgit_git::IngestedPack>,
+        txn: walgit_proto::v1::RefTransaction,
+    ) -> Result<PublishResult, WalError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.send_publish(
+            PublishRequest {
+                pack,
+                txn,
+                meta: HashMap::new(),
+                synced: false,
+                created_at: None,
+                forge,
+                actor: Some(actor),
+                response: tx,
+            },
+            rx,
+        )
+        .await
+    }
+
+    async fn send_publish(
+        &self,
+        request: PublishRequest,
+        rx: tokio::sync::oneshot::Receiver<Result<PublishResult, WalError>>,
+    ) -> Result<PublishResult, WalError> {
         let sender = self.get_or_init_publisher()?;
         self.publish_waiters.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let request = PublishRequest {
-            pack,
-            txn,
-            meta,
-            synced,
-            created_at,
-            response: tx,
-        };
-
         if sender.send(request).is_err() {
             self.publish_waiters.fetch_sub(1, Ordering::Relaxed);
             return Err(WalError::Corrupt("publisher channel closed".into()));

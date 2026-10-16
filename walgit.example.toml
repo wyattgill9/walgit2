@@ -77,6 +77,7 @@ region = "us-east-1"
 access_key_env = "AWS_ACCESS_KEY_ID"            # env var names read at runtime; AWS_SESSION_TOKEN is also honored when set
 secret_key_env = "AWS_SECRET_ACCESS_KEY"
 force_path_style = false                        # true for most self-hosted S3 implementations
+emulate_conditional_writes = false              # true for stores that ignore If-Match/If-None-Match (Garage); ONE instance only
 
 [store.gcs]
 endpoint = "https://storage.googleapis.com" # gRPC endpoint; credentials = Application Default Credentials

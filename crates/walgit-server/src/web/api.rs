@@ -216,7 +216,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             .route(&format!("{base}/tree/{{*rest}}"), get(tree))
             .route(&format!("{base}/blob/{{*rest}}"), get(blob))
             .route(&format!("{base}/commits"), get(commits))
-            .route(&format!("{base}/commit/{{sha}}"), get(commit_detail));
+            .route(&format!("{base}/commit/{{sha}}"), get(commit_detail))
+            .route(&format!("{base}/compare/{{*spec}}"), get(compare));
     }
     r.with_state(state)
 }
@@ -1709,6 +1710,115 @@ async fn commit_detail(
     )
     .await
 }
+#[derive(Serialize)]
+struct Compare {
+    base: String,
+    head: String,
+    merge_base: String,
+    /// Commits only on `head` / only on `base`.
+    ahead: u64,
+    behind: u64,
+    /// `merge_base..head`, oldest first, at most 250 (GitHub's cap).
+    commits: Vec<Commit>,
+    stats: Vec<Stat>,
+    patch: String,
+}
+
+/// GitHub's three-dot compare, `compare/{base}...{head}` (branches, tags or shas): what
+/// merging `head` into `base` would bring — the PR's Commits and Files changed tabs.
+async fn compare(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo_name, spec)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    let (base, head) = spec
+        .split_once("...")
+        .map(|(b, h)| (b.to_string(), h.to_string()))
+        .ok_or_else(|| ApiError::BadRequest("compare is {base}...{head}".into()))?;
+    run(
+        &st,
+        &headers,
+        &owner,
+        &repo_name,
+        Need::Objects,
+        None,
+        move |r| async move {
+            // ponytail: local packs only; remote-served repositories would need the diff's
+            // objects faulted in like `commit_detail` does.
+            if r.remote().is_some() {
+                return Err(ApiError::ServiceUnavailable(
+                    "compare needs this repository's packs on this host".into(),
+                ));
+            }
+            let base = resolve_name(&r, &base).await?.sha;
+            let head = resolve_name(&r, &head).await?.sha;
+            let counts = git(
+                &r.local,
+                vec![
+                    "rev-list".into(),
+                    "--left-right".into(),
+                    "--count".into(),
+                    format!("{base}...{head}"),
+                ],
+            )
+            .await?;
+            let counts = String::from_utf8_lossy(&counts);
+            let mut n = counts.split_whitespace().map(|v| v.parse().unwrap_or(0));
+            let (behind, ahead) = (n.next().unwrap_or(0), n.next().unwrap_or(0));
+            // Unrelated histories have no merge base: diff against `base` itself.
+            let merge_base = git(
+                &r.local,
+                vec!["merge-base".into(), base.clone(), head.clone()],
+            )
+            .await
+            .map_or_else(
+                |_| base.clone(),
+                |o| String::from_utf8_lossy(&o).trim().to_string(),
+            );
+            let mut commits = parse_commits(
+                &git(
+                    &r.local,
+                    vec![
+                        "log".into(),
+                        "--max-count=250".into(),
+                        format!("--format={}", log_format()),
+                        format!("{merge_base}..{head}"),
+                    ],
+                )
+                .await?,
+            );
+            commits.reverse();
+            let diff = |extra: &str| {
+                vec![
+                    "diff".into(),
+                    extra.into(),
+                    "-M".into(),
+                    "--no-color".into(),
+                    "--no-ext-diff".into(),
+                    merge_base.clone(),
+                    head.clone(),
+                ]
+            };
+            let stats = parse_stats(&git(&r.local, diff("--numstat")).await?);
+            let patch = String::from_utf8_lossy(&git(&r.local, diff("-p")).await?).into_owned();
+            Ok(json_swr(
+                &Compare {
+                    base,
+                    head,
+                    merge_base,
+                    ahead,
+                    behind,
+                    commits,
+                    stats,
+                    patch,
+                },
+                None,
+            ))
+        },
+    )
+    .await
+}
+
 fn parse_stats(bytes: &[u8]) -> Vec<Stat> {
     String::from_utf8_lossy(bytes)
         .lines()

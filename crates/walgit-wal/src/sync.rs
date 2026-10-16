@@ -1025,7 +1025,7 @@ pub(crate) async fn replay_log(
         }
     }
     let wanted: Vec<&LogEntry> = all.iter().collect();
-    apply_entries(handle, &wanted)?;
+    apply_entries(handle, from_seq, &wanted)?;
 
     Ok(())
 }
@@ -1038,6 +1038,7 @@ pub(crate) async fn replay_log(
 /// installs/removes packs against `Manifest.packs` on the next full sync.
 pub(crate) fn apply_entries(
     handle: &super::handle::RepoHandle,
+    after: u64,
     entries: &[&LogEntry],
 ) -> Result<(), WalError> {
     let local = &handle.local;
@@ -1053,7 +1054,7 @@ pub(crate) fn apply_entries(
             EntryKind::Compact => {
                 supersedes.extend(entry.supersedes.iter().cloned());
             }
-            EntryKind::Checkpoint | EntryKind::Settings => {}
+            EntryKind::Checkpoint | EntryKind::Settings | EntryKind::Forge => {}
             // Settings live on the manifest; the entry is history only.
             EntryKind::Unspecified => {
                 tracing::warn!(seq = entry.seq, "unspecified log entry kind, skipping");
@@ -1071,6 +1072,7 @@ pub(crate) fn apply_entries(
             }
         }
     }
+    handle.forge_fold(after, entries);
     Ok(())
 }
 

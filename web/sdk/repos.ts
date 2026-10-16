@@ -55,6 +55,127 @@ export interface BranchRow {
   ahead: number | null;
   behind: number | null;
 }
+/** An issue (D50; `api/issues`). Times are ISO 8601 UTC. */
+export interface Issue {
+  number: number;
+  kind: "issue" | "pull";
+  title: string;
+  body: string;
+  /** The body changed after opening. */
+  edited: boolean;
+  author: string;
+  state: "open" | "closed";
+  /** "completed" | "not_planned" when closed. */
+  state_reason: string;
+  labels: string[];
+  assignees: string[];
+  created_at: string;
+  updated_at: string;
+  closed_at: string | null;
+  comments: number;
+  /** Pull requests only: `head_ref` merges into `base_ref`. */
+  base_ref?: string;
+  head_ref?: string;
+  /** Pull requests: from each reviewer's latest approval or change request; absent = none. */
+  review_decision?: "approved" | "changes_requested";
+  /** Pull requests: merged (then also `state: "closed"`), and the commit the base moved to. */
+  merged: boolean;
+  /** Pull requests: a draft is not mergeable until marked ready for review. */
+  draft: boolean;
+  merge_commit?: string;
+}
+/** A label of the catalog (`api/labels`); `open` = open items carrying it. Labels items carry
+ * without a definition are listed gray. */
+export interface Label {
+  name: string;
+  /** `#rrggbb` */
+  color: string;
+  description: string;
+  open: number;
+}
+/** `GET api/pulls/{n}/merge`: can the head merge cleanly into the base right now. */
+export interface Mergeability {
+  mergeable: boolean;
+  /** Its commits also replay onto the base one by one ("Rebase and merge" is offered). */
+  rebaseable: boolean;
+  /** The base already contains the head: nothing to merge. */
+  up_to_date: boolean;
+  conflicts: string[];
+  base_sha: string;
+  head_sha: string;
+}
+export type MergeMethod = "merge" | "squash" | "rebase";
+/** One entry of an issue's timeline; `id` addresses a comment for edit/delete. */
+export type TimelineItem = { id: number; actor: string; at: string } & (
+  | { type: "comment"; body: string; edited: boolean; deleted: boolean }
+  | { type: "closed"; reason: string }
+  | { type: "reopened" }
+  | { type: "renamed"; from: string; to: string }
+  | { type: "labeled"; added: string[]; removed: string[] }
+  | { type: "assigned"; added: string[]; removed: string[] }
+  | { type: "review"; state: ReviewState; body: string; commit_oid: string; comments: LineComment[] }
+  | { type: "merged"; method: MergeMethod; commit: string }
+  /** Marked as draft (`draft: true`) or ready for review. */
+  | { type: "draft"; draft: boolean }
+  /** `#n` of this item in another one's text: "mentioned this in #source". */
+  | { type: "referenced"; source: number }
+);
+export type ReviewState = "approved" | "changes_requested" | "commented";
+/** A review's comment on one line: `RIGHT` = the head's line, `LEFT` = the merge base's. */
+export interface LineComment {
+  path: string;
+  side: "LEFT" | "RIGHT";
+  line: number;
+  body: string;
+}
+export interface IssueDetail extends Issue {
+  timeline: TimelineItem[];
+}
+/** A pull request: `head_ref` merges into `base_ref`; compare `base_sha...head_sha`. */
+export interface PullDetail extends IssueDetail {
+  base_ref: string;
+  head_ref: string;
+  base_sha: string;
+  head_sha: string;
+}
+/** `api/compare/{base}...{head}`. */
+export interface Compare {
+  base: string;
+  head: string;
+  merge_base: string;
+  /** Commits only on head / only on base. */
+  ahead: number;
+  behind: number;
+  /** merge_base..head, oldest first, at most 250. */
+  commits: Commit[];
+  stats: FileStat[];
+  patch: string;
+}
+/** `api/issues?q=&page=`: one page of 25 plus GitHub's open/closed counts for the query. */
+export interface IssuePage {
+  items: Issue[];
+  open_count: number;
+  closed_count: number;
+  page: number;
+  per_page: number;
+  /** Every author, label and assignee among items of this kind (the filter menus). */
+  authors: string[];
+  labels: string[];
+  assignees: string[];
+}
+/** Fields of `PATCH api/issues/{n}`; the present ones commit together. */
+export interface IssuePatch {
+  title?: string;
+  body?: string;
+  state?: "open" | "closed";
+  state_reason?: "completed" | "not_planned";
+  add_labels?: string[];
+  remove_labels?: string[];
+  add_assignees?: string[];
+  remove_assignees?: string[];
+  /** Pull requests: `true` = convert to draft, `false` = ready for review. */
+  draft?: boolean;
+}
 /** `api/branches`: the default branch on its own, then one page newest-first. */
 export interface BranchPage {
   default: BranchRow | null;
@@ -300,6 +421,11 @@ const qs = (q: object) => {
   const s = p.toString();
   return s ? `?${s}` : "";
 };
+const jsonBody = (method: string, body: unknown): RequestInit => ({
+  method,
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify(body),
+});
 
 function scriptOrigin(): string | undefined {
   try {
@@ -707,6 +833,70 @@ export class RepoClient {
     if (!onEvent) return this.client.json<TaskRecord>(`${this.p}/tasks/${enc(id)}`, opts);
     await this.client.sse(`${this.p}/tasks/${enc(id)}`, {}, onEvent, opts);
     return undefined;
+  }
+
+  /** Issues (D50). Writes need a signed-in principal; closing others' issues, labels and
+   * assignees need write. A refused change is a 400 with the reason. */
+  /** The label catalog (D50): colors and descriptions; writes need write access. Deleting a
+   * label also takes it off every issue and pull request. */
+  readonly labels = {
+    list: (opts?: CallOptions) => this.client.json<Label[]>(`${this.p}/labels`, opts),
+    put: (name: string, label: { color: string; description?: string }, opts?: CallOptions) =>
+      this.client.json<Label[]>(`${this.p}/labels/${encodeURIComponent(name)}`, opts, jsonBody("PUT", label)),
+    delete: (name: string, opts?: CallOptions) => this.client.json<Label[]>(`${this.p}/labels/${encodeURIComponent(name)}`, opts, { method: "DELETE" }),
+  };
+
+  /** Open issue and pull request counts (the repository tabs). */
+  forgeSummary(opts?: CallOptions) {
+    return this.client.json<{ open_issues: number; open_pulls: number }>(`${this.p}/forge/summary`, opts);
+  }
+
+  readonly issues = {
+    ...this.items<IssueDetail>("issues"),
+    create: (issue: { title: string; body?: string; labels?: string[]; assignees?: string[] }, opts?: CallOptions) =>
+      this.client.json<IssueDetail>(`${this.p}/issues`, opts, jsonBody("POST", issue)),
+  };
+
+  /** Pull requests (D50): the same calls as `issues`, plus `create` from two branches. While
+   * open, `head_sha`/`base_sha` are the branches' tips; closing freezes them. */
+  readonly pulls = {
+    ...this.items<PullDetail>("pulls"),
+    create: (pr: { title: string; body?: string; base: string; head: string; draft?: boolean }, opts?: CallOptions) =>
+      this.client.json<PullDetail>(`${this.p}/pulls`, opts, jsonBody("POST", pr)),
+    /** Review the current head: approve (not your own), request changes or comment; line
+     * comments anchor to that head. */
+    review: (n: number, review: { state: ReviewState; body?: string; comments?: LineComment[] }, opts?: CallOptions) =>
+      this.client.json<PullDetail>(`${this.p}/pulls/${n}/reviews`, opts, jsonBody("POST", review)),
+    mergeability: (n: number, opts?: CallOptions) => this.client.json<Mergeability>(`${this.p}/pulls/${n}/merge`, opts, { cache: "no-store" }),
+    /** Needs write and the push policy's consent for the base. `sha` = the head you looked at
+     * (409 if it moved); `message` replaces the merge or squash commit message. One change moves
+     * the base, marks the PR merged and closes the issues its body fixes (`Fixes #n`). */
+    merge: (n: number, merge: { method?: MergeMethod; sha?: string; message?: string } = {}, opts?: CallOptions) =>
+      this.client.json<PullDetail>(`${this.p}/pulls/${n}/merge`, opts, jsonBody("POST", merge)),
+    /** GitHub's "Delete branch" once the pull request is closed or merged. */
+    deleteBranch: (n: number, opts?: CallOptions) => this.client.json<PullDetail>(`${this.p}/pulls/${n}/branch`, opts, { method: "DELETE" }),
+  };
+
+  /** GitHub's three-dot compare: what merging `head` into `base` brings (branches, tags or shas). */
+  compare(base: string, head: string, opts?: CallOptions) {
+    return this.client.json<Compare>(`${this.p}/compare/${enc(base)}...${enc(head)}`, opts);
+  }
+
+  private items<D>(seg: "issues" | "pulls") {
+    const p = () => `${this.p}/${seg}`;
+    return {
+      /** GitHub search syntax: `is:open|closed`, `author:`, `assignee:`, `label:`, `sort:`, words. */
+      list: (q = "is:open", page = 1, opts?: CallOptions) =>
+        this.client.json<IssuePage>(`${p()}${qs({ q, page: page > 1 ? String(page) : undefined })}`, opts),
+      get: (n: number, opts?: CallOptions) => this.client.json<D>(`${p()}/${n}`, opts),
+      update: (n: number, patch: IssuePatch, opts?: CallOptions) => this.client.json<D>(`${p()}/${n}`, opts, jsonBody("PATCH", patch)),
+      /** `close` = GitHub's "Close with comment" (one change). */
+      comment: (n: number, body: string, close?: "completed" | "not_planned", opts?: CallOptions) =>
+        this.client.json<D>(`${p()}/${n}/comments`, opts, jsonBody("POST", { body, close })),
+      editComment: (n: number, id: number, body: string, opts?: CallOptions) =>
+        this.client.json<D>(`${p()}/${n}/comments/${id}`, opts, jsonBody("PATCH", { body })),
+      deleteComment: (n: number, id: number, opts?: CallOptions) => this.client.json<D>(`${p()}/${n}/comments/${id}`, opts, { method: "DELETE" }),
+    };
   }
 
   readonly ops = {

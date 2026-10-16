@@ -45,7 +45,9 @@ use tracing::Instrument;
 use walgit_git::{IngestedPack, PackInfo};
 use walgit_proto::keys;
 use walgit_proto::v1::PackKind;
-use walgit_proto::v1::{EntryKind, LogEntry, LogSegmentRef, Manifest, PackRef, RefTransaction};
+use walgit_proto::v1::{
+    EntryKind, ForgeEvent, LogEntry, LogSegmentRef, Manifest, PackRef, RefTransaction,
+};
 use walgit_proto::{frame, time};
 use walgit_store::{ObjectStore, Prefixed, PutBody, PutMode, PutOptions, StoreError};
 
@@ -54,6 +56,8 @@ pub struct PublishResult {
     /// Committed entry, or zero for a no-op/rejection (inspect `per_ref`).
     pub seq: u64,
     pub per_ref: Vec<(String, Result<(), RefError>)>,
+    /// D50: why the request's forge events were refused (then nothing was published).
+    pub forge_error: Option<String>,
 }
 
 /// Request sent to the single-flight publisher.
@@ -66,6 +70,9 @@ pub(crate) struct PublishRequest {
     /// Explicit entry time (history replay); None = now. Validated monotonic
     /// (>= the head entry's `created_at`) before the batch is written.
     pub(crate) created_at: Option<prost_types::Timestamp>,
+    /// D50: forge events, verified against the forge state on every CAS attempt.
+    pub(crate) forge: Vec<ForgeEvent>,
+    pub(crate) actor: Option<crate::forge::Actor>,
     pub(crate) response: oneshot::Sender<Result<PublishResult, WalError>>,
 }
 
@@ -422,6 +429,7 @@ fn build_log_entry_at(
     meta: &HashMap<String, String>,
     writer: &str,
     created_at: Option<prost_types::Timestamp>,
+    forge: Vec<ForgeEvent>,
 ) -> LogEntry {
     LogEntry {
         seq,
@@ -434,6 +442,7 @@ fn build_log_entry_at(
         writer: writer.to_string(),
         meta: meta.clone(),
         settings: None,
+        forge,
     }
 }
 
@@ -498,6 +507,9 @@ pub(crate) async fn publisher_task(
 struct Verified {
     per_ref: Vec<(String, Result<(), RefError>)>,
     valid: bool,
+    /// The request's forge events with `opened` numbers assigned for this attempt.
+    forge: Vec<ForgeEvent>,
+    forge_error: Option<String>,
 }
 
 /// Process a batch of publish requests through the full CAS loop.
@@ -541,6 +553,12 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
             (manifest, version, refs)
         };
         let head_seq = manifest.head_seq;
+        // D50: forge requests verify against the forge state at this basis.
+        let has_forge = batch.iter().any(|req| !req.forge.is_empty());
+        if has_forge && let Err(e) = handle.forge_ensure().instrument(span.clone()).await {
+            return finish_all_errors(batch, e);
+        }
+        let mut forge_next = manifest.forge_next_number.max(1);
 
         // 2. Verify each txn against working ref map (+ explicit created_at
         //    must be monotonic: >= the head entry's time, >= earlier explicit
@@ -549,7 +567,20 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
         let mut floor: Option<std::time::SystemTime> = *handle.last_entry_time.lock();
         for req in &batch {
             let mut per_ref = verify_txn(&req.txn, &working_refs);
-            let changes = req.pack.is_some()
+            let mut forge = req.forge.clone();
+            let forge_after = crate::forge::ForgeState::number(&mut forge, forge_next);
+            let forge_error = match (&req.actor, forge.is_empty()) {
+                (_, true) => None,
+                (Some(actor), false) => handle.forge_read(|s| s.verify(actor, &forge)).err(),
+                (None, false) => Some("forge events need an actor".into()),
+            };
+            if let Some(msg) = &forge_error {
+                for (_, r) in &mut per_ref {
+                    *r = Err(RefError::Rejected(msg.clone()));
+                }
+            }
+            let changes = !forge.is_empty()
+                || req.pack.is_some()
                 || req.txn.updates.iter().any(|update| {
                     if !update.new_symbolic_target.is_empty() {
                         return update.name != "HEAD"
@@ -580,9 +611,12 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
                     floor = Some(t);
                 }
             }
-            let all_ok = per_ref.iter().all(|(_, r)| r.is_ok());
+            let all_ok = forge_error.is_none() && per_ref.iter().all(|(_, r)| r.is_ok());
             if all_ok {
                 apply_txn_to_map(&req.txn, &mut working_refs);
+                if changes {
+                    forge_next = forge_after;
+                }
             } else {
                 for (_, status) in &mut per_ref {
                     if status.is_ok() {
@@ -597,6 +631,8 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
                 // A no-op still validates its preconditions and reports success,
                 // but must not manufacture a log entry or claim a sibling's seq.
                 valid: all_ok && changes,
+                forge,
+                forge_error,
             });
         }
 
@@ -615,6 +651,7 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
                 .map(|v| PublishResult {
                     seq: 0,
                     per_ref: v.per_ref.clone(),
+                    forge_error: v.forge_error.clone(),
                 })
                 .collect();
             for (req, resp) in batch.into_iter().zip(responses) {
@@ -630,7 +667,7 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
         let build = |first_seq: u64| -> (Vec<LogEntry>, Vec<PackRef>) {
             let mut entries = Vec::with_capacity(valid_indices.len());
             let mut new_packs = Vec::new();
-            for (offset, (req, _)) in batch
+            for (offset, (req, v)) in batch
                 .iter()
                 .zip(&verified)
                 .filter(|(_, v)| v.valid)
@@ -645,15 +682,21 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
                 if let Some(pr) = &pack_ref {
                     new_packs.push(pr.clone());
                 }
+                let forge_only = pack_ref.is_none() && req.txn.updates.is_empty();
                 entries.push(build_log_entry_at(
                     seq,
-                    EntryKind::Push,
+                    if forge_only {
+                        EntryKind::Forge
+                    } else {
+                        EntryKind::Push
+                    },
                     pack_ref,
-                    Some(&req.txn),
+                    (!forge_only).then_some(&req.txn),
                     Vec::new(),
                     &req.meta,
                     &writer,
                     req.created_at,
+                    v.forge.clone(),
                 ));
             }
             (entries, new_packs)
@@ -713,6 +756,9 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
         // 6. Build updated manifest
         let mut updated: Manifest = (*manifest).clone();
         updated.head_seq = last_seq;
+        if forge_next > updated.forge_next_number.max(1) {
+            updated.forge_next_number = forge_next;
+        }
         updated.packs.extend(new_packs.iter().cloned());
         updated.packs.sort_by_key(|p| p.seq);
         let seg_ref = LogSegmentRef {
@@ -851,6 +897,8 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
                     handle.manifest_version.lock().take();
                 }
             }
+            // D50: our entries are every committed entry after this attempt's basis.
+            handle.forge_fold(head_seq, &entries.iter().collect::<Vec<_>>());
             sweep_burned(&handle.store, &slot)
                 .instrument(span.clone())
                 .await;
@@ -882,11 +930,13 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
                     responses.push(PublishResult {
                         seq,
                         per_ref: v.per_ref.clone(),
+                        forge_error: None,
                     });
                 } else {
                     responses.push(PublishResult {
                         seq: 0,
                         per_ref: v.per_ref.clone(),
+                        forge_error: v.forge_error.clone(),
                     });
                 }
             }
@@ -1099,6 +1149,7 @@ pub(crate) async fn publish_compact_classified(
             writer: writer.clone(),
             meta: HashMap::new(),
             settings: None,
+            forge: Vec::new(),
         };
 
         let slot = match claim_log_slot(&handle.store, manifest.head_seq, |seq| {
@@ -1431,6 +1482,7 @@ pub(crate) async fn publish_settings_impl(
                 ("message".to_string(), message.to_string()),
             ]),
             settings: Some(settings.clone()),
+            forge: Vec::new(),
         };
 
         let slot = match claim_log_slot(&handle.store, manifest.head_seq, |seq| {

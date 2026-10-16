@@ -31,6 +31,18 @@ export type {
   OpEvent,
   RepoSummary,
   Me,
+  Issue,
+  IssueDetail,
+  IssuePage,
+  IssuePatch,
+  TimelineItem,
+  PullDetail,
+  Compare,
+  LineComment,
+  ReviewState,
+  Mergeability,
+  MergeMethod,
+  Label,
 } from "../sdk/repos";
 import type { RefInfo, OpEvent, OpSpec, OpRecord, Tasks, BranchQuery } from "../sdk/repos";
 export type { SettingsDescribe, SettingsValidation, SettingsHistory, SettingsField, Policy, PolicyValidation, PolicyDryRun, RepoSettings } from "../sdk/repos";
@@ -104,6 +116,19 @@ export const api = {
   overview: (repo: string) => authRedirect(client.repo(repo).overview() as unknown as Promise<Overview>),
   /** What is happening to this repo on the instance that answers (API.md §2c). Never cached. */
   tasks: (repo: string): Promise<Tasks> => client.repo(repo).tasks(),
+  /** Who this browser is signed in as (decides which write controls show). */
+  me: () => authRedirect(client.me()),
+  forgeSummary: (repo: string) => authRedirect(client.repo(repo).forgeSummary()),
+  labelList: (repo: string) => authRedirect(client.repo(repo).labels.list()),
+  labels: (repo: string) => client.repo(repo).labels,
+  issuePage: (repo: string, q: string, page: number) => authRedirect(client.repo(repo).issues.list(q, page)),
+  issue: (repo: string, n: number) => authRedirect(client.repo(repo).issues.get(n)),
+  /** D50 issue writes (the SDK namespace; callers `invalidate("issue")` after). */
+  issues: (repo: string) => client.repo(repo).issues,
+  pullPage: (repo: string, q: string, page: number) => authRedirect(client.repo(repo).pulls.list(q, page)),
+  pull: (repo: string, n: number) => authRedirect(client.repo(repo).pulls.get(n)),
+  pulls: (repo: string) => client.repo(repo).pulls,
+  compare: (repo: string, base: string, head: string) => authRedirect(client.repo(repo).compare(base, head)),
   /** D24 settings + policy (Settings tab). Writes are never cached. */
   settings: (repo: string) => client.repo(repo).settings,
   policy: (repo: string) => client.repo(repo).policy,

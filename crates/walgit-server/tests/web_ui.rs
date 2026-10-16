@@ -24,6 +24,15 @@ async fn page_routes_serve_index_without_cache() -> Result<()> {
         "/owner/repo/commit/abc",
         "/owner/repo/wal",
         "/owner/repo/settings",
+        "/owner/repo/issues",
+        "/owner/repo/issues/new",
+        "/owner/repo/issues/3",
+        "/owner/repo/labels",
+        "/owner/repo/pulls",
+        "/owner/repo/pull/3",
+        "/owner/repo/pull/3/files",
+        "/owner/repo/compare",
+        "/owner/repo/compare/main...feature/x",
         "/api",
     ] {
         let response = client

@@ -490,6 +490,106 @@ list by `commit_date` day and shows `subject` + `author`.
   walgit passes `--diff-merges=first-parent`). Do not return a combined
   (`diff --cc`) patch or an empty patch with non-empty `stats`.
 
+### Issues (D50, `docs/FORGE.md`)
+
+Issues are WAL forge events; every answer folds them at refs level (no objects), so a
+read after an acknowledged write sees it on any instance. Cache: SWR.
+
+- `GET /{owner}/{repo}/api/issues?q=&page=` — one page of 25 plus GitHub's
+  counts for the same query without its state filter:
+  `{ "items": [Issue], "open_count": 3, "closed_count": 9, "page": 1, "per_page": 25 }`.
+  `q` defaults to `is:open`; it understands `is:open|closed`, `author:`,
+  `assignee:`, `label:` (repeat = all of them; quote spaces),
+  `sort:created-desc|created-asc|updated-desc|comments-desc`, and words
+  (case-insensitive, title and body).
+- `Issue` = `{ number, kind: "issue", title, body, edited, author, state: "open"|"closed",
+  state_reason: ""|"completed"|"not_planned", labels, assignees, created_at, updated_at,
+  closed_at, comments }`; times are ISO 8601 UTC.
+- `GET /{owner}/{repo}/api/issues/{n}` — `Issue` + `timeline`: comments
+  `{ type: "comment", id, actor, at, body, edited, deleted }` and events
+  (`closed {reason}`, `reopened`, `renamed {from,to}`, `labeled {added,removed}`,
+  `assigned {added,removed}`).
+
+Writes take `Content-Type: application/json` only (anything else is `415`), need a
+signed-in principal (`401` for anonymous readers), and answer the issue as above.
+A refused change is a `400` with the reason; nothing is published.
+
+| Write | Body | Who |
+|---|---|---|
+| `POST …/issues` (`201`) | `{title, body?, labels?, assignees?}` | anyone signed in; labels/assignees need write |
+| `PATCH …/issues/{n}` | any of `title, body, state: "open"|"closed", state_reason, add_labels, remove_labels, add_assignees, remove_assignees` — one change | title/body/state: the author or write; labels/assignees: write |
+| `POST …/issues/{n}/comments` (`201`) | `{body, close?: "completed"|"not_planned"}` ("Close with comment" is one change) | anyone signed in; `close` as above |
+| `PATCH …/issues/{n}/comments/{id}` | `{body}` | the comment's author or write |
+| `DELETE …/issues/{n}/comments/{id}` | — | the comment's author or write |
+
+More issue surface:
+
+- The list answer also carries `authors`, `labels` and `assignees`: every value among items
+  of that kind (plus every catalog label), for the filter menus.
+- `GET …/issues/{n}` also answers for a pull request (`kind: "pull"`), as GitHub's API does.
+  An `#n` link needs no kind; the UI forwards `/issues/{n}` to `/pull/{n}`.
+- `#n` anywhere in a title, body, comment or review adds
+  `{type: "referenced", source}` to item `n`'s timeline, once per source item. It is derived
+  in the fold, with no event of its own.
+- `GET …/api/forge/summary` — `{open_issues, open_pulls}` (the repository tabs).
+- `GET …/api/labels` — `[{name, color: "#rrggbb", description, open}]`: the catalog, plus
+  labels items carry without a definition (gray), and how many open items carry each.
+  `PUT …/labels/{name}` `{color, description?}` creates or updates one. `DELETE
+  …/labels/{name}` removes it from the catalog and from every item. Both need write.
+
+### Pull requests (D50)
+
+`…/api/pulls`, `…/pulls/{n}`, `…/pulls/{n}/comments[/{id}]` behave exactly like the issue
+routes above, over pull requests (issues and pull requests share one number sequence; each
+list holds its own kind). A pull request adds `base_ref`/`head_ref` (branch names) and, on
+`GET …/pulls/{n}`, `base_sha`/`head_sha`: the branches' current tips while open, the tips
+at closing once closed (a deleted branch falls back to its tip when opened). Show its
+Commits and Files changed with `compare/{base_sha}...{head_sha}`.
+
+- `POST …/api/pulls` (`201`) `{title, body?, base, head, draft?}`: both branches must exist and
+  differ; one open pull request per `head`→`base` (`400` otherwise). Anyone signed in.
+- Drafts: `draft: true` items can't be merged (`400`). `PATCH …/pulls/{n}` `{draft: false}`
+  marks one ready for review; `{draft: true}` converts it back. Either needs the author or
+  write. Both appear in the timeline as `{type: "draft", draft}`. Search: `is:draft`.
+- Closing (`PATCH {state: "closed"}` or a comment with `close`) freezes the tips.
+- `POST …/api/pulls/{n}/reviews` (`201`) `{state: "approved"|"changes_requested"|"commented",
+  body?, comments?: [{path, side: "RIGHT"|"LEFT", line, body}]}` reviews the current head:
+  open pull requests only; the author may only comment; a comment or change request needs a
+  body or a line comment. Anyone signed in. The timeline gains
+  `{type: "review", state, body, commit_oid, comments}` (a line comment whose `commit_oid` is
+  not the shown head is outdated), and the pull request `review_decision`: each reviewer's
+  latest approval or change request, any change request winning (absent = none).
+  Search: `review:approved|changes_requested|none`.
+- `GET …/api/pulls/{n}/merge` — `{mergeable, up_to_date, conflicts: [path], base_sha, head_sha}`
+  for the branches' current tips (`merge-tree` in a scratch object directory). Needs the packs
+  on the answering host (`503` otherwise).
+- `POST …/api/pulls/{n}/merge` `{method?: "merge"|"squash"|"rebase", sha?, message?}` — write
+  access, and the repository's push policy must allow the principal to move the base branch.
+  `merge` commits with parents (base, head); `squash` one commit on the base; `rebase` replays
+  each commit (author and message kept). `message` defaults to GitHub's (`Merge pull request
+  #n from <head>\n\n<title>`; squash `<title> (#n)\n\n<body>`). One WAL entry moves the base
+  branch, marks the pull request merged (`merged: true`, `merge_commit`, timeline
+  `{type: "merged", method, commit}`, base and head tips frozen) and closes the open issues its
+  body names with GitHub's keywords (`Fixes #n`, `closes`, `resolves`, …). `sha` that is not
+  the head's tip, conflicts, or a base that moved meanwhile: `409`. A merged pull request
+  can't be reopened. Search: `is:merged|unmerged`.
+- `DELETE …/api/pulls/{n}/branch` — "Delete branch" for a closed or merged pull request (write
+  access, push policy).
+
+### `GET /{owner}/{repo}/api/compare/{base}...{head}`
+
+GitHub's three-dot compare (branches, tags or shas; branch names may contain `/`):
+
+```json
+{ "base": "<sha>", "head": "<sha>", "merge_base": "<sha>", "ahead": 1, "behind": 2,
+  "commits": [Commit], "stats": [{ "path": "src/main.rs", "additions": 1, "deletions": 1 }],
+  "patch": "diff --git …" }
+```
+
+`commits` = `merge_base..head`, oldest first, at most 250; `stats`/`patch` = the diff from
+`merge_base` to `head` (as `commit/{sha}`). Unrelated histories diff against `base`. Needs the
+packs on the answering host (`503` on remote-served repositories). Cache: SWR.
+
 ### `GET /{owner}/{repo}/api/overview` — optional, walgit-specific
 
 Backs the "WAL" tab. Not needed by Code/Commits pages; a host without a

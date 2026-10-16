@@ -1,6 +1,6 @@
 import { Suspense, createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { Link, NavLink, Outlet, useLocation, useParams } from "react-router-dom";
-import { api, type Refs } from "../api";
+import { api, client, type Refs } from "../api";
 import { useData } from "../data";
 import { RouteBoundary, Skeleton } from "../components/Loading";
 import { CloneSetup } from "../components/CloneSetup";
@@ -35,6 +35,27 @@ function CloneMenu({ full }: { full: string }) {
   );
 }
 
+/** Open count beside a tab. Fetched quietly on every navigation (it follows your own writes)
+ * and never holds up or breaks the header: no count on error. */
+function TabCount({ full, which }: { full: string; which: "open_issues" | "open_pulls" }) {
+  const [n, setN] = useState(0);
+  const { pathname } = useLocation();
+  useEffect(() => {
+    let live = true;
+    client
+      .repo(full)
+      .forgeSummary()
+      .then(
+        (s) => live && setN(s[which]),
+        () => {},
+      );
+    return () => {
+      live = false;
+    };
+  }, [full, which, pathname]);
+  return n > 0 ? <span className="tab-count">{n}</span> : null;
+}
+
 export interface RepoCtx {
   owner: string;
   name: string;
@@ -65,7 +86,10 @@ export function RepoLayout() {
   }, [full]);
   const walActive = pathname.endsWith("/wal");
   const settingsActive = pathname.endsWith("/settings");
-  const codeActive = !walActive && !settingsActive && !/\/commits?(\/|$)/.test(pathname);
+  const issuesActive = /\/(issues|labels)(\/|$)/.test(pathname);
+  const pullsActive = /\/(pulls|pull|compare)(\/|$)/.test(pathname);
+  const commitsActive = /\/commits?(\/|$)/.test(pathname);
+  const codeActive = !walActive && !settingsActive && !issuesActive && !pullsActive && !commitsActive;
   return (
     <>
       <div className="repo-head">
@@ -87,7 +111,13 @@ export function RepoLayout() {
           <NavLink to={`/${full}`} className={() => (codeActive ? "tab active" : "tab")} end>
             Code
           </NavLink>
-          <NavLink to={`/${full}/commits`} className={() => (codeActive || walActive || settingsActive ? "tab" : "tab active")}>
+          <NavLink to={`/${full}/issues`} className={() => (issuesActive ? "tab active" : "tab")}>
+            Issues <TabCount full={full} which="open_issues" />
+          </NavLink>
+          <NavLink to={`/${full}/pulls`} className={() => (pullsActive ? "tab active" : "tab")}>
+            Pull requests <TabCount full={full} which="open_pulls" />
+          </NavLink>
+          <NavLink to={`/${full}/commits`} className={() => (commitsActive ? "tab active" : "tab")}>
             Commits
           </NavLink>
           <NavLink to={`/${full}/wal`} className={() => (walActive ? "tab active" : "tab")}>

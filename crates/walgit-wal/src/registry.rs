@@ -226,6 +226,7 @@ impl Registry {
             revision: 1,
             settings: None,
             retired_packs: Vec::new(),
+            forge_next_number: 0,
         };
 
         let buf = manifest.encode_to_vec();

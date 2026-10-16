@@ -630,3 +630,576 @@ async fn browser_localhost_redirects_to_walgit_localhost() -> TestResult {
     assert_ne!(git.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
     Ok(())
 }
+
+/// D50 issues: who may do what, JSON-only writes, search counts and the timeline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issues_api() -> TestResult {
+    use reqwest::Method as M;
+    use serde_json::json;
+    let token = |principal: &str, write: bool| walgit_config::StaticToken {
+        principal: principal.into(),
+        token: format!("{principal}-token"),
+        token_env: None,
+        write,
+        admin: false,
+    };
+    let server = Server::start_with_tweak(|c| {
+        c.server.auth.mode = walgit_config::AuthMode::Token;
+        c.server.auth.anonymous_read = true;
+        c.server.auth.tokens = vec![
+            token("alice", false),
+            token("bob", false),
+            token("maint", true),
+        ];
+    })
+    .await?;
+    let call = |method: reqwest::Method, path: &str, who: Option<&str>, body: Option<Value>| {
+        let mut req = reqwest::Client::new().request(method, format!("{}{path}", server.base_url));
+        if let Some(who) = who {
+            req = req.bearer_auth(format!("{who}-token"));
+        }
+        if let Some(body) = body {
+            req = req.json(&body);
+        }
+        async move {
+            let resp = req.send().await?;
+            let status = resp.status().as_u16();
+            let text = resp.text().await?;
+            anyhow::Ok((
+                status,
+                serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text)),
+            ))
+        }
+    };
+    assert_eq!(call(M::PUT, "/o/r/api", Some("maint"), None).await?.0, 201);
+
+    let (status, _) = call(
+        M::POST,
+        "/o/r/api/issues",
+        None,
+        Some(json!({"title": "x"})),
+    )
+    .await?;
+    assert_eq!(status, 401, "anonymous readers can't open issues");
+    let form = reqwest::Client::new()
+        .post(format!("{}/o/r/api/issues", server.base_url))
+        .bearer_auth("alice-token")
+        .header("content-type", "text/plain")
+        .body(r#"{"title":"x"}"#)
+        .send()
+        .await?;
+    assert_eq!(form.status().as_u16(), 415, "writes are JSON only");
+
+    let (status, issue) = call(
+        M::POST,
+        "/o/r/api/issues",
+        Some("alice"),
+        Some(json!({"title": "Crash on push", "body": "steps"})),
+    )
+    .await?;
+    assert_eq!(
+        (status, issue["number"].as_u64(), issue["state"].as_str()),
+        (201, Some(1), Some("open"))
+    );
+    let (status, issue) = call(
+        M::POST,
+        "/o/r/api/issues/1/comments",
+        Some("bob"),
+        Some(json!({"body": "same here"})),
+    )
+    .await?;
+    assert_eq!((status, issue["comments"].as_u64()), (201, Some(1)));
+
+    let (status, refused) = call(
+        M::PATCH,
+        "/o/r/api/issues/1",
+        Some("bob"),
+        Some(json!({"state": "closed"})),
+    )
+    .await?;
+    assert_eq!(status, 400, "{refused}");
+    let (status, _) = call(
+        M::PATCH,
+        "/o/r/api/issues/1",
+        Some("alice"),
+        Some(json!({"add_labels": ["bug"]})),
+    )
+    .await?;
+    assert_eq!(status, 400, "labels need write");
+    let (status, _) = call(
+        M::PATCH,
+        "/o/r/api/issues/1",
+        Some("maint"),
+        Some(json!({"add_labels": ["bug"]})),
+    )
+    .await?;
+    assert_eq!(status, 200);
+    let (status, issue) = call(
+        M::POST,
+        "/o/r/api/issues/1/comments",
+        Some("alice"),
+        Some(json!({"body": "fixed in main", "close": "completed"})),
+    )
+    .await?;
+    assert_eq!(
+        (
+            status,
+            issue["state"].as_str(),
+            issue["state_reason"].as_str()
+        ),
+        (201, Some("closed"), Some("completed"))
+    );
+    call(
+        M::POST,
+        "/o/r/api/issues",
+        Some("bob"),
+        Some(json!({"title": "Docs typo"})),
+    )
+    .await?;
+
+    let open = json(&server, "/o/r/api/issues").await?;
+    assert_eq!(
+        (open["open_count"].as_u64(), open["closed_count"].as_u64()),
+        (Some(1), Some(1))
+    );
+    assert_eq!(open["items"][0]["number"], 2);
+    let closed = json(&server, "/o/r/api/issues?q=is:closed%20label:bug").await?;
+    assert_eq!(closed["items"][0]["labels"], json!(["bug"]));
+
+    let detail = json(&server, "/o/r/api/issues/1").await?;
+    let kinds: Vec<&str> = detail["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["comment", "labeled", "comment", "closed"]);
+    let bobs = detail["timeline"][0]["id"].as_u64().unwrap();
+    let (status, _) = call(
+        M::PATCH,
+        &format!("/o/r/api/issues/1/comments/{bobs}"),
+        Some("alice"),
+        Some(json!({"body": "edited"})),
+    )
+    .await?;
+    assert_eq!(
+        status, 400,
+        "only the author or a collaborator edits a comment"
+    );
+
+    // The label catalog: writers define colors; deleting a label takes it off every issue.
+    let label = |who: &'static str, color: &str| {
+        call(
+            M::PUT,
+            "/o/r/api/labels/bug",
+            Some(who),
+            Some(json!({"color": color, "description": "Something isn't working"})),
+        )
+    };
+    assert_eq!(label("alice", "#d73a4a").await?.0, 400, "labels need write");
+    assert_eq!(label("maint", "red").await?.0, 400, "colors are #rrggbb");
+    let (status, catalog) = label("maint", "#d73a4a").await?;
+    assert_eq!(status, 200, "{catalog}");
+    assert_eq!(
+        (
+            catalog[0]["name"].as_str(),
+            catalog[0]["color"].as_str(),
+            catalog[0]["open"].as_u64()
+        ),
+        (Some("bug"), Some("#d73a4a"), Some(0))
+    );
+    let (status, _) = call(M::DELETE, "/o/r/api/labels/bug", Some("maint"), None).await?;
+    assert_eq!(status, 200);
+    assert_eq!(
+        json(&server, "/o/r/api/issues/1").await?["labels"],
+        json!([]),
+        "deleted from the issue too"
+    );
+    let (status, issue) = call(
+        M::DELETE,
+        &format!("/o/r/api/issues/1/comments/{bobs}"),
+        Some("bob"),
+        None,
+    )
+    .await?;
+    assert_eq!((status, issue["comments"].as_u64()), (200, Some(1)));
+    Ok(())
+}
+
+/// D50 pull requests: open from a pushed branch, compare (commits + diff), refusals, close
+/// freezes the tips it shows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pulls_api() -> TestResult {
+    use serde_json::json;
+    let server = Server::start().await?;
+    server.put_repo("o", "r").await?;
+    let src = fixture(&server)?;
+    git_in(&src, &["checkout", "-q", "-b", "topic", "main"])?;
+    std::fs::write(src.join("topic.txt"), "new file\n")?;
+    git_in(&src, &["add", "topic.txt"])?;
+    git_in(&src, &["commit", "-q", "-m", "add topic"])?;
+    git_in(&src, &["push", "-q", &server.repo_url("o", "r"), "topic"])?;
+    let topic = git_in(&src, &["rev-parse", "topic"])?.trim().to_string();
+    let post = |path: &str, body: Value| {
+        let req = reqwest::Client::new()
+            .post(format!("{}{path}", server.base_url))
+            .json(&body);
+        async move {
+            let resp = req.send().await?;
+            let status = resp.status().as_u16();
+            anyhow::Ok((status, resp.json::<Value>().await.unwrap_or(Value::Null)))
+        }
+    };
+
+    let cmp = json(&server, "/o/r/api/compare/main...topic").await?;
+    assert_eq!(
+        (cmp["ahead"].as_u64(), cmp["behind"].as_u64()),
+        (Some(1), Some(0))
+    );
+    assert_eq!(cmp["commits"][0]["subject"], "add topic");
+    assert_eq!(cmp["stats"][0]["path"], "topic.txt");
+    assert!(cmp["patch"].as_str().unwrap().contains("+new file"));
+
+    let (status, pr) = post(
+        "/o/r/api/pulls",
+        json!({"title": "Add topic", "base": "main", "head": "topic"}),
+    )
+    .await?;
+    assert_eq!(status, 201, "{pr}");
+    assert_eq!(
+        (pr["number"].as_u64(), pr["kind"].as_str()),
+        (Some(1), Some("pull"))
+    );
+    assert_eq!(
+        (pr["base_ref"].as_str(), pr["head_ref"].as_str()),
+        (Some("main"), Some("topic"))
+    );
+    assert_eq!(pr["head_sha"], topic);
+    let (status, dup) = post(
+        "/o/r/api/pulls",
+        json!({"title": "again", "base": "main", "head": "topic"}),
+    )
+    .await?;
+    assert_eq!(status, 400, "one open PR per head/base: {dup}");
+    let (status, _) = post(
+        "/o/r/api/pulls",
+        json!({"title": "x", "base": "main", "head": "nope"}),
+    )
+    .await?;
+    assert_eq!(status, 400, "the head branch must exist");
+    let (status, issue) = post("/o/r/api/issues", json!({"title": "an issue"})).await?;
+    assert_eq!(
+        (status, issue["number"].as_u64()),
+        (201, Some(2)),
+        "issues and PRs share numbers"
+    );
+
+    // Reviews: the author can't approve their own PR; a comment review anchors its line
+    // comments to the head it saw.
+    let (status, own) = post("/o/r/api/pulls/1/reviews", json!({"state": "approved"})).await?;
+    assert_eq!(status, 400, "{own}");
+    let (status, _) = post("/o/r/api/pulls/1/reviews", json!({"state": "commented"})).await?;
+    assert_eq!(status, 400, "an empty comment review says nothing");
+    let line =
+        json!({"path": "topic.txt", "side": "RIGHT", "line": 1, "body": "trailing newline?"});
+    let (status, pr) = post(
+        "/o/r/api/pulls/1/reviews",
+        json!({"state": "commented", "body": "one nit", "comments": [line]}),
+    )
+    .await?;
+    assert_eq!(status, 201, "{pr}");
+    let review = pr["timeline"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(
+        (review["type"].as_str(), review["commit_oid"].as_str()),
+        (Some("review"), Some(topic.as_str()))
+    );
+    assert_eq!(review["comments"][0]["path"], "topic.txt");
+    assert!(
+        pr.get("review_decision").is_none(),
+        "a comment review decides nothing"
+    );
+
+    let pulls = json(&server, "/o/r/api/pulls").await?;
+    assert_eq!(
+        (
+            pulls["open_count"].as_u64(),
+            pulls["items"][0]["number"].as_u64()
+        ),
+        (Some(1), Some(1))
+    );
+    let issues = json(&server, "/o/r/api/issues").await?;
+    assert_eq!(
+        issues["items"][0]["number"], 2,
+        "the issue list holds issues only"
+    );
+    assert_eq!(
+        issues["authors"],
+        json!(["anon"]),
+        "the filter menus' values"
+    );
+    let counts = json(&server, "/o/r/api/forge/summary").await?;
+    assert_eq!(
+        (
+            counts["open_issues"].as_u64(),
+            counts["open_pulls"].as_u64()
+        ),
+        (Some(1), Some(1))
+    );
+    let via_issues = json(&server, "/o/r/api/issues/1").await?;
+    assert_eq!(
+        via_issues["kind"], "pull",
+        "an #1 link resolves through the issues route"
+    );
+    let (status, _) = post(
+        "/o/r/api/issues/2/comments",
+        json!({"body": "blocked by #1"}),
+    )
+    .await?;
+    assert_eq!(status, 201);
+    let pr1 = json(&server, "/o/r/api/pulls/1").await?;
+    let mentioned = pr1["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["type"] == "referenced" && t["source"] == 2);
+    assert!(
+        mentioned,
+        "#1 in issue 2 shows on the pull request's timeline: {pr1}"
+    );
+
+    // Close, then move the branch: the closed PR keeps showing what it had.
+    let (status, closed) = post(
+        "/o/r/api/pulls/1/comments",
+        json!({"body": "not now", "close": "completed"}),
+    )
+    .await?;
+    assert_eq!((status, closed["state"].as_str()), (201, Some("closed")));
+    git_in(&src, &["commit", "-q", "--allow-empty", "-m", "later"])?;
+    git_in(&src, &["push", "-q", &server.repo_url("o", "r"), "topic"])?;
+    let pr = json(&server, "/o/r/api/pulls/1").await?;
+    assert_eq!(pr["head_sha"], topic);
+    Ok(())
+}
+
+/// D50 merges: merge / squash / rebase move main as git would, one entry closes the PR and
+/// the issues it fixes, conflicts are reported and refused, and what landed fsck-checks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_api() -> TestResult {
+    use reqwest::Method as M;
+    use serde_json::json;
+    let server = Server::start().await?;
+    server.put_repo("o", "r").await?;
+    let src = fixture(&server)?;
+    let url = server.repo_url("o", "r");
+    let branch = |name: &str, files: &[(&str, &str)]| -> anyhow::Result<()> {
+        git_in(&src, &["checkout", "-q", "-B", name, "main"])?;
+        for (i, (path, text)) in files.iter().enumerate() {
+            std::fs::write(src.join(path), text)?;
+            git_in(&src, &["add", path])?;
+            git_in(&src, &["commit", "-q", "-m", &format!("{name} {i}")])?;
+        }
+        git_in(&src, &["push", "-q", &url, name])?;
+        Ok(())
+    };
+    let call = |method: reqwest::Method, path: &str, body: Option<Value>| {
+        let mut req = reqwest::Client::new().request(method, format!("{}{path}", server.base_url));
+        if let Some(body) = body {
+            req = req.json(&body);
+        }
+        async move {
+            let resp = req.send().await?;
+            let status = resp.status().as_u16();
+            let text = resp.text().await?;
+            anyhow::Ok((
+                status,
+                serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text)),
+            ))
+        }
+    };
+    let open = |head: &str, body: &str| {
+        call(
+            M::POST,
+            "/o/r/api/pulls",
+            Some(json!({"title": head, "body": body, "base": "main", "head": head})),
+        )
+    };
+    let main = || {
+        git_in(&src, &["ls-remote", &url, "refs/heads/main"])
+            .map(|s| s.split_whitespace().next().unwrap_or("").to_string())
+    };
+
+    let (_, issue) = call(
+        M::POST,
+        "/o/r/api/issues",
+        Some(json!({"title": "a.txt is missing"})),
+    )
+    .await?;
+    let issue = issue["number"].as_u64().unwrap();
+    branch("m", &[("a.txt", "a\n")])?;
+    branch("s", &[("b.txt", "b\n"), ("b.txt", "b2\n")])?;
+    branch("r", &[("c.txt", "c\n"), ("d.txt", "d\n")])?;
+    let (_, pm) = open("m", &format!("Fixes #{issue}")).await?;
+    let (_, ps) = open("s", "").await?;
+    let (_, pr) = open("r", "").await?;
+    let [pm, ps, pr] = [pm, ps, pr].map(|p| p["number"].as_u64().unwrap());
+
+    let m = json(&server, &format!("/o/r/api/pulls/{pm}/merge")).await?;
+    assert_eq!(
+        (m["mergeable"].as_bool(), m["up_to_date"].as_bool()),
+        (Some(true), Some(false))
+    );
+    let before = main()?;
+    let (status, merged) = call(
+        M::POST,
+        &format!("/o/r/api/pulls/{pm}/merge"),
+        Some(json!({})),
+    )
+    .await?;
+    assert_eq!(status, 200, "{merged}");
+    assert_eq!(
+        (merged["state"].as_str(), merged["merged"].as_bool()),
+        (Some("closed"), Some(true))
+    );
+    let tip = main()?;
+    assert_eq!(merged["merge_commit"], tip);
+    git_in(&src, &["fetch", "-q", &url, "main"])?;
+    let parents = git_in(&src, &["log", "-1", "--format=%P", "FETCH_HEAD"])?;
+    assert_eq!(
+        parents.split_whitespace().next(),
+        Some(before.as_str()),
+        "a merge commit's first parent is the old main"
+    );
+    assert_eq!(parents.split_whitespace().count(), 2);
+    let closed = json(&server, &format!("/o/r/api/issues/{issue}")).await?;
+    assert_eq!(
+        closed["state"], "closed",
+        "Fixes #n closes the issue with the merge"
+    );
+
+    let (status, _) = call(
+        M::POST,
+        &format!("/o/r/api/pulls/{ps}/merge"),
+        Some(json!({"method": "squash", "sha": "0000"})),
+    )
+    .await?;
+    assert_eq!(
+        status, 409,
+        "a head that moved since the client looked is refused"
+    );
+    let (status, _) = call(
+        M::POST,
+        &format!("/o/r/api/pulls/{ps}/merge"),
+        Some(json!({"method": "squash"})),
+    )
+    .await?;
+    assert_eq!(status, 200);
+    git_in(&src, &["fetch", "-q", &url, "main"])?;
+    assert_eq!(
+        git_in(&src, &["log", "-1", "--format=%P", "FETCH_HEAD"])?
+            .split_whitespace()
+            .count(),
+        1,
+        "squash: one parent"
+    );
+    assert_eq!(git_in(&src, &["show", "FETCH_HEAD:b.txt"])?, "b2\n");
+
+    let (status, _) = call(
+        M::POST,
+        &format!("/o/r/api/pulls/{pr}/merge"),
+        Some(json!({"method": "rebase"})),
+    )
+    .await?;
+    assert_eq!(status, 200);
+    git_in(&src, &["fetch", "-q", &url, "main"])?;
+    assert_eq!(
+        git_in(&src, &["log", "-2", "--format=%s", "FETCH_HEAD"])?,
+        "r 1\nr 0\n",
+        "rebase replays each commit"
+    );
+    git_in(&src, &["fsck", "--no-progress"])?;
+
+    // Two branches editing one line: the second conflicts after the first lands.
+    git_in(&src, &["branch", "-f", "main", "FETCH_HEAD"])?;
+    branch("x", &[("a.txt", "x\n")])?;
+    branch("y", &[("a.txt", "y\n")])?;
+    let (_, px) = open("x", "").await?;
+    let (_, py) = open("y", "").await?;
+    assert_eq!(
+        call(
+            M::POST,
+            &format!("/o/r/api/pulls/{}/merge", px["number"]),
+            Some(json!({}))
+        )
+        .await?
+        .0,
+        200
+    );
+    let m = json(&server, &format!("/o/r/api/pulls/{}/merge", py["number"])).await?;
+    assert_eq!(
+        (m["mergeable"].as_bool(), m["conflicts"].clone()),
+        (Some(false), json!(["a.txt"]))
+    );
+    let (status, why) = call(
+        M::POST,
+        &format!("/o/r/api/pulls/{}/merge", py["number"]),
+        Some(json!({})),
+    )
+    .await?;
+    assert_eq!(status, 409, "{why}");
+
+    let (status, _) = call(
+        M::PATCH,
+        &format!("/o/r/api/pulls/{pm}"),
+        Some(json!({"state": "open"})),
+    )
+    .await?;
+    assert_eq!(status, 400, "a merged pull request stays merged");
+    let (status, _) = call(M::DELETE, &format!("/o/r/api/pulls/{pm}/branch"), None).await?;
+    assert_eq!(status, 200);
+    assert!(
+        git_in(&src, &["ls-remote", &url, "refs/heads/m"])?.is_empty(),
+        "the head branch is gone"
+    );
+    let merged_list = json(&server, "/o/r/api/pulls?q=is:merged").await?;
+    assert_eq!(merged_list["items"].as_array().unwrap().len(), 4);
+
+    // A draft can't merge until it is ready for review.
+    git_in(&src, &["branch", "-f", "main", "FETCH_HEAD"])?;
+    branch("d", &[("e.txt", "e\n")])?;
+    let (_, pd) = call(
+        M::POST,
+        "/o/r/api/pulls",
+        Some(json!({"title": "wip", "base": "main", "head": "d", "draft": true})),
+    )
+    .await?;
+    let pd = pd["number"].as_u64().unwrap();
+    assert_eq!(
+        json(&server, "/o/r/api/pulls?q=is:draft").await?["items"][0]["number"],
+        pd
+    );
+    let (status, why) = call(
+        M::POST,
+        &format!("/o/r/api/pulls/{pd}/merge"),
+        Some(json!({})),
+    )
+    .await?;
+    assert_eq!(status, 400, "{why}");
+    let (status, ready) = call(
+        M::PATCH,
+        &format!("/o/r/api/pulls/{pd}"),
+        Some(json!({"draft": false})),
+    )
+    .await?;
+    assert_eq!((status, ready["draft"].as_bool()), (200, Some(false)));
+    assert_eq!(
+        call(
+            M::POST,
+            &format!("/o/r/api/pulls/{pd}/merge"),
+            Some(json!({}))
+        )
+        .await?
+        .0,
+        200
+    );
+    Ok(())
+}

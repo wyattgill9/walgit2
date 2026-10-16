@@ -90,7 +90,7 @@ fn origin_allowed(cfg: &walgit_config::Config, origin: &str) -> bool {
 }
 
 const CORS_HEADERS: &str = "Authorization, Content-Type, Accept, If-None-Match, X-Requested-With";
-const CORS_METHODS: &str = "GET, HEAD, POST, PUT, DELETE, OPTIONS";
+const CORS_METHODS: &str = "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS";
 const CORS_EXPOSE: &str = "ETag, Cache-Control, Content-Type, Location";
 
 /// CORS for `/api*`: only origins in `server.cors_origins` get credentials;
