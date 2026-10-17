@@ -199,6 +199,17 @@ impl Registry {
         id: &RepoId,
         format: ObjectFormat,
     ) -> Result<Arc<RepoHandle>, WalError> {
+        self.create_with_access(id, format, None).await
+    }
+
+    /// `create` with the repository's initial access document (D51) in the same CAS, so a
+    /// new repository is never visible with any other visibility.
+    pub async fn create_with_access(
+        &self,
+        id: &RepoId,
+        format: ObjectFormat,
+        access: Option<walgit_proto::v1::RepoAccess>,
+    ) -> Result<Arc<RepoHandle>, WalError> {
         if let Some(h) = self.repos.get(id) {
             return Ok(h.clone());
         }
@@ -227,6 +238,7 @@ impl Registry {
             settings: None,
             retired_packs: Vec::new(),
             forge_next_number: 0,
+            access,
         };
 
         let buf = manifest.encode_to_vec();
@@ -279,9 +291,23 @@ impl Registry {
         id: &RepoId,
         format: ObjectFormat,
     ) -> Result<Arc<RepoHandle>, WalError> {
+        self.open_or_create_with_access(id, format, None).await
+    }
+
+    /// `open_or_create`; a repository created here starts with `access` (D51).
+    pub async fn open_or_create_with_access(
+        &self,
+        id: &RepoId,
+        format: ObjectFormat,
+        access: Option<walgit_proto::v1::RepoAccess>,
+    ) -> Result<Arc<RepoHandle>, WalError> {
         match self.open(id).await {
             Ok(h) => Ok(h),
-            Err(WalError::NotFound) => self.create(id, format).await,
+            Err(WalError::NotFound) => match self.create_with_access(id, format, access).await {
+                // Another host created it between the open and the create.
+                Err(WalError::AlreadyExists) => self.open(id).await,
+                r => r,
+            },
             Err(e) => Err(e),
         }
     }

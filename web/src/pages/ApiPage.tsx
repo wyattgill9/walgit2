@@ -89,7 +89,7 @@ export function ApiPage() {
           </thead>
           <tbody>
             <Row path="/api/v1" desc={<>Discovery: <code>{`{base, browser_base, sdk, auth, endpoints}`}</code>.</>} cache="—" />
-            <Row path="/api/v1/me" desc={<><code>{`{principal, write, anonymous}`}</code> — who you are on this host.</>} cache="no-store" />
+            <Row path="/api/v1/me" desc={<><code>{`{login, user_id, can_create, site_admin, anonymous, auth_mode}`}</code> — who you are on this host; your role on a repository is in its summary.</>} cache="no-store" />
             <Row path="/api/v1/owners" desc="Owners (namespaces), sorted." cache="SWR" />
             <Row path="/api/v1/owners/{owner}/repos" desc="Repository names under one owner." cache="SWR" />
             <Row

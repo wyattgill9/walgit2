@@ -120,13 +120,13 @@ Three laws:
      raise the ceiling for the whole repo.
 3. **One glob dialect.** Doublestar. `*` and `?` stop at `/`. `**` crosses.
    `^` is an exclusion, not a second field. Same grammar for refs, paths, and
-   principal names.
+   principal names. A principal is matched by its login and by its account's email.
 
 Actors are three spellings, nothing else:
 
 | Spelling | Means |
 |---|---|
-| `alice@example.com` | Exact principal (case-insensitive). |
+| `alice` or `alice@example.com` | Exact principal (case-insensitive): an account's login or its email (D51). |
 | `@okta:platform` | Tag the edge already bound. |
 | `group:bots` | Roster in this file. |
 

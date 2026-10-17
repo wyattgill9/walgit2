@@ -3,6 +3,7 @@ import { useState, type ReactNode } from "react";
 import { RouteBoundary, TopProgress, useBusy } from "./Loading";
 import { ErrorTray } from "./ErrorTray";
 import { InstanceFooter } from "./InstanceFooter";
+import { UserMenu } from "./UserMenu";
 
 export function Layout() {
   const busy = useBusy();
@@ -20,6 +21,7 @@ export function Layout() {
             /api
           </NavLink>
           <ThemeToggle />
+          <UserMenu />
         </nav>
       </header>
       <TopProgress />

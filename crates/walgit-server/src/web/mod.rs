@@ -3,6 +3,7 @@ pub mod forge;
 mod forge_merge;
 pub mod login;
 pub mod objects;
+pub mod people;
 pub mod trailers;
 pub mod ui;
 pub mod v1;
@@ -101,7 +102,7 @@ pub async fn require_auth(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    match st.auth.require_read(req.headers()).await {
+    match crate::access::signed_in(&st, req.headers()).await {
         Ok(_) => next.run(req).await,
         Err(e) => {
             let accepts_html = req
@@ -120,7 +121,9 @@ pub async fn require_auth(
                 return Redirect::temporary(&format!("/_auth/login?next={q}")).into_response();
             }
             let status = match e {
-                crate::auth::AuthError::Forbidden => StatusCode::FORBIDDEN,
+                crate::auth::AuthError::Forbidden | crate::auth::AuthError::NoAccount(_) => {
+                    StatusCode::FORBIDDEN
+                }
                 crate::auth::AuthError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
                 _ => StatusCode::UNAUTHORIZED,
             };
@@ -128,6 +131,7 @@ pub async fn require_auth(
                 crate::auth::AuthError::Forbidden => {
                     "your account is not in an allowed domain".to_string()
                 }
+                crate::auth::AuthError::NoAccount(why) => why,
                 crate::auth::AuthError::Unavailable => {
                     "the token verifier is temporarily unavailable; retry".to_string()
                 }

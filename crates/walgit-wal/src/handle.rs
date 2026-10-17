@@ -23,6 +23,37 @@ use crate::sync::{PackPlan, SyncLevel};
 use crate::tasks::{Begin, Tasks};
 use walgit_proto::v1::PackRef;
 
+tokio::task_local! {
+    /// D51: repositories this request just revalidated for authorization
+    /// (`sync_refs_for_request`); its next sync of each skips the manifest round trip once.
+    static REQUEST_FRESH: std::cell::RefCell<std::collections::HashSet<RepoId>>;
+}
+
+/// Runs one request: inside, authorization's refs sync is reused by the handler's own sync.
+/// Work spawned onto other tasks is outside the scope and revalidates as usual.
+pub async fn request_scope<F: std::future::Future>(f: F) -> F::Output {
+    REQUEST_FRESH.scope(std::cell::RefCell::default(), f).await
+}
+
+/// `f` continues this request's work for `id` on another task (a streamed response): it
+/// takes over the request's unused revalidation of `id`, if any.
+pub fn carry_request_fresh<F: std::future::Future>(
+    id: &RepoId,
+    f: F,
+) -> impl std::future::Future<Output = F::Output> + use<F> {
+    let mut carried = std::collections::HashSet::new();
+    if take_request_fresh(id) {
+        carried.insert(id.clone());
+    }
+    REQUEST_FRESH.scope(std::cell::RefCell::new(carried), f)
+}
+
+fn take_request_fresh(id: &RepoId) -> bool {
+    REQUEST_FRESH
+        .try_with(|s| s.borrow_mut().remove(id))
+        .unwrap_or(false)
+}
+
 pub(crate) fn instance_id() -> String {
     walgit_store::coord::instance_id().to_string()
 }
@@ -98,6 +129,8 @@ pub struct RepoHandle {
     pub(crate) first_seq_published_at: parking_lot::Mutex<Option<std::time::SystemTime>>,
     /// D50: folded issues/PRs, loaded by the first forge request (`forge.rs`).
     pub(crate) forge: PLMutex<Option<crate::forge::ForgeState>>,
+    /// D51: the user directory, on the account log's handle only (`accounts.rs`).
+    pub(crate) accounts: PLMutex<Option<crate::accounts::AccountsState>>,
     pub(crate) history_install_inflight: std::sync::atomic::AtomicBool,
     /// Fires when a history-pack install finishes (for `wait_history_pack_installed`).
     pub(crate) history_install_done: tokio::sync::Notify,
@@ -176,6 +209,7 @@ impl RepoHandle {
             blocks,
             remote: PLMutex::new(None),
             forge: PLMutex::new(None),
+            accounts: PLMutex::new(None),
         }
     }
 
@@ -448,6 +482,16 @@ impl RepoHandle {
         Ok(guard)
     }
 
+    /// D51: the refs sync authorization makes before it reads `access()`. Inside
+    /// [`request_scope`], the request's next sync of this repository reuses it instead of a
+    /// second manifest round trip (once: later syncs revalidate as usual), so checking access
+    /// costs nothing on the request's critical path (docs/ROUNDTRIPS.md).
+    pub async fn sync_refs_for_request(&self) -> Result<(), WalError> {
+        drop(self.sync_refs().await?);
+        let _ = REQUEST_FRESH.try_with(|s| s.borrow_mut().insert(self.id.clone()));
+        Ok(())
+    }
+
     /// Revalidate immutable download membership without materializing pack data.
     /// Bucket existence alone never authorizes a pack or index download.
     pub async fn serves_pack_fresh(&self, checksum: &str) -> Result<bool, WalError> {
@@ -608,7 +652,9 @@ impl RepoHandle {
         // clone's ReadGuard lives for the whole stream (prod 2026-08-20: a
         // 24-minute clone + one queued writer = every info/refs on the
         // instance waited 60–680 s on `rw.read()`).
-        self.sync_refs_phase(&span).instrument(span.clone()).await?;
+        if !take_request_fresh(&self.id) {
+            self.sync_refs_phase(&span).instrument(span.clone()).await?;
+        }
         if level.wants_packs() {
             self.sync_packs_phase(level, &span)
                 .instrument(span.clone())
@@ -979,6 +1025,38 @@ impl RepoHandle {
         self.enqueue_publish(pack, txn, meta, true).await
     }
 
+    /// D51: `publish_push_synced` on behalf of `actor`. The publisher re-derives the actor's
+    /// role from the access at each CAS attempt and refuses every ref below Write, so access
+    /// revoked before this push commits refuses it (docs/ACCOUNTS.md "Revocation").
+    pub async fn publish_push_as(
+        &self,
+        actor: crate::forge::Actor,
+        pack: Option<walgit_git::IngestedPack>,
+        txn: walgit_proto::v1::RefTransaction,
+        meta: HashMap<String, String>,
+    ) -> Result<PublishResult, WalError> {
+        if pack.is_some() && txn.updates.is_empty() {
+            return Err(WalError::Invalid(
+                "a push pack requires a nonempty ref transaction".into(),
+            ));
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.send_publish(
+            PublishRequest {
+                pack,
+                txn,
+                meta,
+                synced: true,
+                created_at: None,
+                forge: Vec::new(),
+                actor: Some(actor),
+                response: tx,
+            },
+            rx,
+        )
+        .await
+    }
+
     /// Publish with an explicit entry time (history replay into the WAL): the
     /// log entry's `created_at` is `at` instead of now, validated monotonic
     /// (≥ the head entry's time; ≥ earlier explicit times in the same batch),
@@ -1130,6 +1208,23 @@ impl RepoHandle {
     /// D24: the repository's settings as last applied (manifest-inline).
     pub fn settings(&self) -> Option<walgit_proto::v1::RepoSettings> {
         self.manifest().settings.clone()
+    }
+
+    /// D51: who may read and write, as of the last sync (manifest-inline; `None` = public, no
+    /// collaborators). Authorization reads this right after the request's own sync.
+    pub fn access(&self) -> Option<walgit_proto::v1::RepoAccess> {
+        self.manifest().access.clone()
+    }
+
+    /// D51: publish a new access document (whole replace): an ACCESS log entry + the
+    /// manifest's inline copy, one CAS. `if_revision` refuses a stale edit. Returns the new
+    /// revision.
+    pub async fn publish_access(
+        &self,
+        access: walgit_proto::v1::RepoAccess,
+        if_revision: Option<u64>,
+    ) -> Result<u64, WalError> {
+        crate::publish::publish_access_impl(self, access, if_revision).await
     }
 
     /// D24: effective configuration = host config ⊕ this repository's

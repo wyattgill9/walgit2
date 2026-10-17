@@ -25,6 +25,8 @@ const ComparePage = lazy(() => track(import("./pages/Issues")).then((m) => ({ de
 const LabelsPage = lazy(() => track(import("./pages/Issues")).then((m) => ({ default: m.LabelsPage })));
 const NewIssuePage = lazy(() => track(import("./pages/Issues")).then((m) => ({ default: m.NewIssuePage })));
 const ApiPage = lazy(() => track(import("./pages/ApiPage")).then((m) => ({ default: m.ApiPage })));
+const NewRepoPage = lazy(() => track(import("./pages/NewRepo")).then((m) => ({ default: m.NewRepoPage })));
+const AdminPage = lazy(() => track(import("./pages/Admin")).then((m) => ({ default: m.AdminPage })));
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
@@ -33,6 +35,8 @@ createRoot(document.getElementById("root")!).render(
         <Route element={<Layout />}>
           <Route index element={<Owners />} />
           <Route path="api" element={<ApiPage />} />
+          <Route path="new" element={<NewRepoPage />} />
+          <Route path="admin" element={<AdminPage />} />
           <Route path=":owner" element={<Repos />} />
           <Route path=":owner/:repo" element={<RepoLayout />}>
             <Route index element={<TreePage />} />

@@ -2576,6 +2576,7 @@ fn forge_open(title: &str) -> walgit_proto::v1::ForgeEvent {
     walgit_proto::v1::ForgeEvent {
         number: 0,
         actor: String::new(),
+        actor_id: String::new(),
         body: Some(walgit_proto::v1::forge_event::Body::Opened(
             walgit_proto::v1::ForgeOpened {
                 kind: walgit_proto::v1::ForgeKind::Issue as i32,
@@ -2590,6 +2591,7 @@ fn forge_comment(number: u64, body: &str) -> walgit_proto::v1::ForgeEvent {
     walgit_proto::v1::ForgeEvent {
         number,
         actor: String::new(),
+        actor_id: String::new(),
         body: Some(walgit_proto::v1::forge_event::Body::Comment(
             walgit_proto::v1::ForgeComment { body: body.into() },
         )),
@@ -2598,8 +2600,9 @@ fn forge_comment(number: u64, body: &str) -> walgit_proto::v1::ForgeEvent {
 
 fn forge_actor() -> walgit_wal::forge::Actor {
     walgit_wal::forge::Actor {
-        name: "sim".into(),
-        write: true,
+        login: "sim".into(),
+        user_id: "sim".into(),
+        owner_admin: true,
     }
 }
 

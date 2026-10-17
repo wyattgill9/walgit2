@@ -1054,7 +1054,11 @@ pub(crate) fn apply_entries(
             EntryKind::Compact => {
                 supersedes.extend(entry.supersedes.iter().cloned());
             }
-            EntryKind::Checkpoint | EntryKind::Settings | EntryKind::Forge => {}
+            EntryKind::Checkpoint
+            | EntryKind::Settings
+            | EntryKind::Forge
+            | EntryKind::Account
+            | EntryKind::Access => {}
             // Settings live on the manifest; the entry is history only.
             EntryKind::Unspecified => {
                 tracing::warn!(seq = entry.seq, "unspecified log entry kind, skipping");
@@ -1073,6 +1077,7 @@ pub(crate) fn apply_entries(
         }
     }
     handle.forge_fold(after, entries);
+    handle.accounts_fold(after, entries);
     Ok(())
 }
 

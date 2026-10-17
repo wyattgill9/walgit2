@@ -32,6 +32,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `docs/LFS.md` | Anyone touching LFS (`lfs.rs`, `lfs_upstream.rs`) or importing a repository whose LFS history lives elsewhere. |
 | `docs/INTEGRITY.md` | Anyone touching import, the maintainer's `fsck`/`repair` units, or seeing `connectivity: missing object` on a push. |
 | `docs/FORGE.md` | Anyone touching issues/pull requests: event schema, fold, checkpointed state, merge, measurements. |
+| `docs/ACCOUNTS.md` | Anyone touching sign-in, authorization, repository creation or roles: accounts, roles, visibility, the account log, `mode = none` boundary, revocation semantics. |
 | `docs/EVENTS.md` | Anyone changing WAL-derived ref events, the webhook bridge, consumer semantics or event cursors. |
 | `docs/CONTRACT.md` | When you touch a crate boundary. The cross-crate contract; *extend, don't rename*; code wins where they differ. |
 | `docs/reference/cursor-git-at-any-scale.md` | The source design, verbatim. Read once before touching WAL/publish/sync/placement. |
@@ -76,8 +77,11 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
   client: SSE envelope for the web UI, sideband band-2 lines for git. "Cloning into… and then nothing" is a bug.
 
 ### 1.3 Security contract (`Config::validate` fails closed)
-- Three auth modes (`server.auth.mode`): **`none`** (everyone is `anon` with write and admin — `validate` refuses unless `server.listen` is loopback),
-  **`token`** (static tokens from the config, as `Authorization: Bearer` or an HTTP Basic password), **`oidc`**
+- Three auth modes (`server.auth.mode`): **`none`** (everyone is the local site admin `anon` — `validate` refuses a
+  non-loopback `listen`/`public_url` and anything implying another host in front or beside (forwarders, accel,
+  CORS, a broker), and `access::local_only` answers only direct loopback requests with a loopback `Host` and no
+  proxy or `X-Walgit-*` headers), **`token`** (static tokens from the config, as `Authorization: Bearer` or an
+  HTTP Basic password, each bound to an account by `user = "<login>"`), **`oidc`**
   (any OpenID Connect issuer via discovery). In `oidc` mode `anonymous_read` must be false and an allowlist
   (`allowed_domains`/`allowed_emails`) must exist; three credentials are accepted — an ID token from the issuer
   (RS256/ES256, `iss`, `exp`, `aud` ∈ `audiences` ∪ {`oauth_client_id`}, `email_verified`), a **walgit access
@@ -85,6 +89,12 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
   `access_token_ttl`; rotating the secret revokes all), and the HMAC **session cookie** set by `/_auth/login` →
   issuer → `/_auth/callback`. Static `tokens` work in `oidc` mode too (robots). Every path ends in the same
   allowlist and `write_domains`.
+- **Authorization is per repository (D51, `docs/ACCOUNTS.md`).** A credential resolves to an **account**
+  (`user_id`; a first OIDC sign-in chooses its username at `/_auth/welcome`, robots are `walgit user create`).
+  Host flags: `admin` = site admin, `write` = may create repositories under your own login. On a repository the
+  role (read < triage < write < maintain < admin) is the highest of site admin, namespace owner, collaborator
+  role and the visibility floor (public / internal / private). Every repository route goes through
+  `access::authorize` (no other entry point exists); refusals read as missing (401 anonymous, 404 signed in).
 - Open at the application (no credential): `/healthz`, `/readyz`, `/repos.js`, `/repos.mjs`, `/_auth/*` (the
   sign-in flow itself) and **`/services/public/*`** (data-free; today `install.sh` + `ca.pem`; everything else
   under it 404; never reads repo data or takes a bearer — test `public_lane_serves_only_the_installer_without_auth`).
@@ -104,8 +114,8 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
   (`/api/v1/me`, or `ls-remote` of `?repo=`). Recipes come from one place (`setup::Recipes`,
   `/services/setup.json`); the Clone menu, API page, overview and git error help render them.
 - **Host to host**: a front that forwards pushes to a broker presents `wal.push_broker_token` (or
-  `WALGIT_BROKER_TOKEN`); the broker lists it in `tokens` and its principal in `trusted_forwarders`, so the end
-  user travels in `X-Walgit-Principal`.
+  `WALGIT_BROKER_TOKEN`, always, loopback too); the broker lists it in `tokens` and its `user` in
+  `trusted_forwarders`, so the end user's `user_id` travels in `X-Walgit-Principal` and the broker authorizes it.
 - Tests never write the user's global git config (private `GIT_CONFIG_GLOBAL`, `tests/lib-auth.sh`).
 
 ### 1.4 Requirements (the bar)
@@ -136,6 +146,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `cache/api/v1/<sha1>.json` | Shared render cache of immutable web API answers. |
 | `policy.json` | Per-repo push policy (rule language, not on the WAL). `docs/POLICY.md`. Missing = allow-all. |
 | `fsck.pb` | Last connectivity audit (`FsckReport`), written by the maintainer's `fsck` unit, consumed by `repair` (`docs/INTEGRITY.md`). |
+| `system/accounts/…` | D51: the **account log** — a WAL of its own (manifest, log, checkpoints + `accounts.pb`): users, identity links, minimal orgs, reserved namespaces. Repository access rides inline on each `manifest.pb` (`RepoAccess`). `docs/ACCOUNTS.md`. |
 | `events/cursor.json` | Durable acknowledged WAL sequence of the events bridge; advanced only after the webhook acknowledged (D32). |
 | `lfs/objects/<aa>/<bb>/<oid>` | LFS objects (sha256-addressed, immutable). Missing ones can be read through from `upstream.lfs` and persisted (`docs/LFS.md`). |
 Schema `crates/walgit-proto/proto/walgit/v1/wal.proto`; GCS over gRPC, S3 (AWS SDK) and in-memory stores share
@@ -497,6 +508,56 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
   bridge like ref events. Lean first: richer search, roles and snapshots wait for measurements
   ([FORGE.md](docs/FORGE.md)). S3 stores that ignore conditional PUTs (Garage) run one instance with
   `store.s3.emulate_conditional_writes = true`.
+
+- **D51 (2026-10-17): Accounts, repository roles and visibility; one authorization path.**
+  - **Accounts.** Accounts (users with an immutable `user_id`, and minimal orgs: a login and its owners) are a
+    fold of a WAL of their own, the account log at `system/accounts/`. Its events:
+    - `UserCreated`
+    - `IdentityLinked` (OIDC `(issuer, subject)`)
+    - `ProfileChanged`
+    - `NamespaceReserved`
+    - `OrgCreated` / `OrgOwnersChanged`
+
+    The publisher verifies unique logins and identities at every CAS attempt; `accounts.pb` rides each
+    checkpoint.
+  - **Repository access.** `RepoAccess` (visibility public / internal / private and `user_id → role`) is inline
+    on each repository's manifest, like settings (D24), with `ENTRY_KIND_ACCESS` as history.
+  - **Roles.** read < triage < write < maintain < admin; effective = max(site admin, namespace owner,
+    collaborator role, visibility floor). One pure function (`walgit_wal::access::role`) is called by the
+    server and again by the publisher at each CAS basis, so pushes, forge events and merges are refused when
+    access was revoked before they commit.
+  - **Host flags.** Static tokens bind to an account (`user = "<login>"`; `principal` is gone). The flag
+    meanings change: `admin` = site admin, `write` = may create repositories under your own login.
+  - **One entry point.** `Authenticator::require_*` are deleted: every repository route calls
+    `access::authorize`, which revalidates once per request (reused by the handler's sync,
+    `request_scope`).
+  - **Security cases.**
+    - A namespace holding repositories but no account is reserved (genesis + `NamespaceReserved` before every
+      such creation); only a site admin's org claims it.
+    - Anonymous read never writes the forge.
+    - `mode = none` serves only direct local requests (config and per-request checks).
+    - Revocation semantics are documented with their request-start bound.
+  - **Deployment.** Stop older writers first (D43): they don't reserve namespaces or check roles at CAS.
+  - Details, surface and costs: [ACCOUNTS.md](docs/ACCOUNTS.md), [ROUNDTRIPS.md](docs/ROUNDTRIPS.md).
+
+- **D52 (2026-10-17): walgit's own password accounts, and a front door in the UI.** This amends §1.3's "one auth
+  story": a host with `server.auth.passwords = "admin" | "open"` (needs `session_secret`, never `mode = none`)
+  signs people in at `/_auth/login` with a password; `open` also lets anyone sign up at `/_auth/signup`.
+  - **Storage.** The credential is an Argon2id PHC string in a `PasswordSet` account event (WAL + bucket, like
+    every account fact). The log keeps old hashes: a password change limits a stolen current hash, not a
+    copy of the bucket's history.
+  - **Sessions and tokens.** The session cookie and walgit access tokens now work in token mode as well as
+    oidc. With password accounts on, every account may create repositories under its own login.
+  - **Safeguards.**
+    - Failed sign-ins lock a login out after 10 failures in 15 minutes (in memory, per instance).
+    - Unknown users cost the same hashing as wrong passwords.
+    - Every form is same-origin only (`Sec-Fetch-Site`).
+  - **Admin.** Site admins create accounts and reset passwords (`POST /api/v1/users`,
+    `PUT /api/v1/users/{login}/password`, `walgit user create --password`, `walgit user password`).
+  - **UI.** The top bar signs you in and out and carries a user menu; `/new` creates a repository; `/admin`
+    (site admins) creates accounts and orgs.
+  - **Not covered.** The OIDC welcome flow is still not exercised end to end by a test (its issuer must be
+    https).
 
 ## 5. Working rules
 

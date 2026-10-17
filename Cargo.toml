@@ -157,6 +157,7 @@ rand = "0.9"
 sha1 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash", "std"] }
 hex = "0.4"
 humantime = "2"
 humantime-serde = "1"

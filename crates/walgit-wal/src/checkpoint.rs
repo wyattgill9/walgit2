@@ -201,26 +201,44 @@ async fn write_checkpoint_inner(handle: &RepoHandle) -> Result<CheckpointRef, Wa
     } else {
         None
     };
-    let forge_put = async {
-        match &forge {
-            Some((key, bytes)) => {
-                crate::snapshots::put_snapshot(&handle.store, key, bytes.clone()).await
+    // D51: the account log carries its directory the same way. Keyed on the log's id, not on
+    // whether the fold happens to be loaded: a checkpoint without it would drop every account
+    // event below `seq` from the log.
+    let accounts = if handle.id == crate::accounts::log_id() {
+        handle.accounts_ensure().await?;
+        let history = handle
+            .accounts_read(|s| (s.seq >= seq).then(|| s.history_upto(seq)))
+            .ok_or_else(|| WalError::Corrupt("account fold behind the checkpoint".into()))?;
+        let bytes = history.encode_to_vec();
+        Some((walgit_proto::snapshot::accounts_key(&bytes), bytes))
+    } else {
+        None
+    };
+    let side_put = |side: &Option<(String, Vec<u8>)>| {
+        let side = side.clone();
+        async move {
+            match side {
+                Some((key, bytes)) => {
+                    crate::snapshots::put_snapshot(&handle.store, &key, bytes).await
+                }
+                None => Ok(()),
             }
-            None => Ok(()),
         }
     };
-    let (r_refs, r_cp, r_forge) = tokio::join!(
+    let (r_refs, r_cp, r_forge, r_accounts) = tokio::join!(
         crate::snapshots::put_snapshot(&handle.store, &refs_key, snap_bytes),
         handle.store.put(
             &cp_key,
             PutBody::Bytes(bytes::Bytes::from(cp_bytes)),
             immutable
         ),
-        forge_put,
+        side_put(&forge),
+        side_put(&accounts),
     );
     r_refs?;
     r_cp?;
     r_forge?;
+    r_accounts?;
 
     let cp_ref = CheckpointRef {
         seq,
@@ -230,6 +248,7 @@ async fn write_checkpoint_inner(handle: &RepoHandle) -> Result<CheckpointRef, Wa
         as_of,
         refs_key,
         forge_key: forge.map(|(key, _)| key).unwrap_or_default(),
+        accounts_key: accounts.map(|(key, _)| key).unwrap_or_default(),
     };
 
     // Round 2: CAS manifest: set checkpoint, min_seq = seq+1, trim log_segments

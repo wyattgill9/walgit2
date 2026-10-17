@@ -1,6 +1,6 @@
 import { Suspense, useEffect, useMemo, useState, useTransition, type CSSProperties, type ReactNode } from "react";
 import { Link, Navigate, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { api, client, type Issue, type IssueDetail, type LineComment, type MergeMethod, type PullDetail, type ReviewState, type TimelineItem } from "../api";
+import { api, atLeast, client, type Issue, type IssueDetail, type LineComment, type MergeMethod, type PullDetail, type ReviewState, type TimelineItem } from "../api";
 import { useRepo } from "./RepoLayout";
 import { invalidate, reportError, useData } from "../data";
 import { Box } from "../components/Layout";
@@ -60,9 +60,14 @@ function useLabelColors(full: string): Map<string, string> {
 /** A chip's color dot (CSS `--label`); hue is the label's meaning, the chip stays greyscale. */
 const chipStyle = (color?: string) => (color ? ({ "--label": color } as CSSProperties) : undefined);
 
-/** Signed-in principal (`/api/v1/me`); anonymous readers get no write controls. */
+/** Who this browser is (`/api/v1/me`); anonymous readers get no write controls. */
 function useMe() {
   return useData("me", () => api.me(), 60_000);
+}
+
+/** D51: the caller's role on this repository (from the summary); it decides the controls. */
+function useRole(full: string) {
+  return useData(`summary:${full}`, () => api.summary(full)).role;
 }
 
 // ---- query helpers: the URL's `q` is GitHub's search string ----
@@ -275,9 +280,14 @@ export function IssuePage({ pull = false }: { pull?: boolean }) {
   const key = `${pull ? "pull" : "issue"}:${full}:${n}`;
   const issue: IssueDetail & Partial<PullDetail> = useData(key, () => (pull ? api.pull(full, n) : api.issue(full, n)));
   const me = useMe();
+  const role = useRole(full);
   const colors = useLabelColors(full);
-  const signedIn = !me.anonymous || me.write;
-  const canEdit = (author: string) => me.write || (signedIn && me.principal === author);
+  const signedIn = !me.anonymous;
+  const mine = (author: string) => signedIn && me.login === author;
+  // Editing others' text needs write; closing and reopening them, triage (D51).
+  const canEdit = (author: string) => atLeast(role, "write") || mine(author);
+  const canClose = (author: string) => atLeast(role, "triage") || mine(author);
+  const canTriage = atLeast(role, "triage");
   const issues = pull ? api.pulls(full) : api.issues(full);
   /** Run a write; refresh this item and the lists. False (+ the error tray) when refused. */
   const act = async (what: string, write: () => Promise<unknown>) => {
@@ -304,7 +314,7 @@ export function IssuePage({ pull = false }: { pull?: boolean }) {
             full={full}
             pr={issue as PullDetail}
             tab={tab}
-            me={signedIn ? me.principal : null}
+            me={signedIn ? me.login : null}
             onReview={(review) => act("review", () => api.pulls(full).review(n, review))}
           />
         </Suspense>
@@ -335,7 +345,7 @@ export function IssuePage({ pull = false }: { pull?: boolean }) {
             <MergeBox
               full={full}
               pr={issue as PullDetail}
-              canMerge={me.write}
+              canMerge={atLeast(role, "write")}
               onMerge={(m) => act("merge", () => api.pulls(full).merge(n, m))}
               onDeleteBranch={() => act("delete branch", () => api.pulls(full).deleteBranch(n))}
               canReady={canEdit(issue.author)}
@@ -345,8 +355,8 @@ export function IssuePage({ pull = false }: { pull?: boolean }) {
           {signedIn ? (
             <Composer
               issue={issue}
-              me={me.principal}
-              canClose={canEdit(issue.author)}
+              me={me.login}
+              canClose={canClose(issue.author)}
               onComment={(body) => act("comment", () => issues.comment(n, body))}
               onClose={(reason, body) => act("close issue", () => (body ? issues.comment(n, body, reason) : issues.update(n, { state: "closed", state_reason: reason })))}
               onReopen={(body) =>
@@ -365,8 +375,9 @@ export function IssuePage({ pull = false }: { pull?: boolean }) {
             title="Assignees"
             values={issue.assignees}
             empty="No one assigned"
-            editable={me.write}
+            editable={canTriage}
             onAdd={(v) => act("assign", () => issues.update(n, { add_assignees: [v] }))}
+            suggest={async (q) => (await api.users(q)).map((u) => u.login)}
             onRemove={(v) => act("unassign", () => issues.update(n, { remove_assignees: [v] }))}
           />
           <SideList
@@ -374,7 +385,7 @@ export function IssuePage({ pull = false }: { pull?: boolean }) {
             values={issue.labels}
             empty="None yet"
             chips
-            editable={me.write}
+            editable={canTriage}
             onAdd={(v) => act("label", () => issues.update(n, { add_labels: [v] }))}
             onRemove={(v) => act("unlabel", () => issues.update(n, { remove_labels: [v] }))}
             colors={colors}
@@ -1095,6 +1106,7 @@ function SideList({
   onAdd,
   onRemove,
   colors,
+  suggest,
 }: {
   title: string;
   values: string[];
@@ -1105,9 +1117,13 @@ function SideList({
   onRemove: (v: string) => Promise<boolean>;
   /** Chip colors and the input's suggestions (the label catalog). */
   colors?: Map<string, string>;
+  /** Suggestions for what is typed (D51: assignees pick from the user directory). */
+  suggest?: (q: string) => Promise<string[]>;
 }) {
   const [text, setText] = useState("");
+  const [found, setFound] = useState<string[]>([]);
   const listId = `side-${title}`;
+  const options = colors ? [...colors.keys()] : found;
   return (
     <div className="side-section">
       <div className="side-title">{title}</div>
@@ -1135,14 +1151,17 @@ function SideList({
           <input
             className="side-input"
             value={text}
-            list={colors ? listId : undefined}
-            onChange={(e) => setText(e.target.value)}
+            list={colors || suggest ? listId : undefined}
+            onChange={(e) => {
+              setText(e.target.value);
+              suggest?.(e.target.value.trim()).then(setFound, () => setFound([]));
+            }}
             placeholder={`Add ${title.toLowerCase().replace(/s$/, "")}…`}
             aria-label={`Add ${title}`}
           />
-          {colors && (
+          {(colors || suggest) && (
             <datalist id={listId}>
-              {[...colors.keys()]
+              {options
                 .filter((k) => !values.includes(k))
                 .map((k) => (
                   <option key={k} value={k} />
@@ -1164,7 +1183,7 @@ export function NewIssuePage() {
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
   const [busy, setBusy] = useState(false);
-  if (me.anonymous && !me.write) return <div className="pad muted">Sign in to open an issue.</div>;
+  if (me.anonymous) return <div className="pad muted">Sign in to open an issue.</div>;
   return (
     <form
       className="new-issue"
@@ -1183,7 +1202,7 @@ export function NewIssuePage() {
     >
       <h2 className="page-title">New issue</h2>
       <div className="comment">
-        <Avatar name={me.principal} />
+        <Avatar name={me.login} />
         <div className="comment-box">
           <div className="comment-body">
             <input className="issue-title-input" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Title" aria-label="Title" autoFocus />
@@ -1282,7 +1301,7 @@ function CompareBody({ full, base, head }: { full: string; base: string; head: s
     <>
       {form ? (
         <div className="comment">
-          <Avatar name={me.principal} />
+          <Avatar name={me.login} />
           <div className="comment-box">
             <div className="comment-body">
               <input className="issue-title-input" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Title" aria-label="Title" autoFocus />
@@ -1308,7 +1327,7 @@ function CompareBody({ full, base, head }: { full: string; base: string; head: s
             {cmp.behind > 0 && <span className="muted"> · {cmp.behind} behind {base}</span>}
           </span>
           <span className="spacer" />
-          {!me.anonymous || me.write ? (
+          {!me.anonymous ? (
             <button type="button" className="btn primary" onClick={() => setForm(true)}>
               Create pull request
             </button>
@@ -1337,7 +1356,7 @@ const randomColor = () => `#${Math.floor(Math.random() * 0xffffff).toString(16).
 export function LabelsPage() {
   const { full } = useRepo();
   const labels = useData(`labels:${full}`, () => api.labelList(full), 30_000);
-  const me = useMe();
+  const canTriage = atLeast(useRole(full), "triage");
   const [draft, setDraft] = useState<LabelDraft | null>(null);
   const refresh = () => {
     invalidate(`labels:${full}`);
@@ -1367,7 +1386,7 @@ export function LabelsPage() {
       <div className="issues-bar">
         <h2 className="page-title">Labels</h2>
         <span className="spacer" />
-        {me.write && (
+        {canTriage && (
           <button type="button" className="btn primary" onClick={() => setDraft({ name: "", color: randomColor(), description: "", isNew: true })}>
             New label
           </button>
@@ -1386,7 +1405,7 @@ export function LabelsPage() {
               </Link>
               <span className="muted small grow">{l.description}</span>
               <span className="muted small">{l.open} open</span>
-              {me.write && (
+              {canTriage && (
                 <span className="row gap">
                   <button type="button" className="btn link small" onClick={() => setDraft({ name: l.name, color: l.color, description: l.description, isNew: false })}>
                     Edit

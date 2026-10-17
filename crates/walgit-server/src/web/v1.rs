@@ -47,11 +47,40 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             &format!("{API_V1}/owners/{{owner}}/repos"),
             get(crate::web::api::owner_repos),
+        )
+        // D51: the directory (pickers) and minimal orgs.
+        .route(
+            &format!("{API_V1}/users"),
+            get(crate::web::people::users).post(crate::web::people::create_user),
+        )
+        .route(
+            &format!("{API_V1}/users/{{login}}/password"),
+            axum::routing::put(crate::web::people::put_password),
+        )
+        .route(
+            &format!("{API_BROWSER}/v1/users"),
+            get(crate::web::people::users),
+        )
+        .route(
+            &format!("{API_V1}/orgs"),
+            post(crate::web::people::create_org),
+        )
+        .route(
+            &format!("{API_V1}/orgs/{{login}}"),
+            get(crate::web::people::get_org),
+        )
+        .route(
+            &format!("{API_V1}/orgs/{{login}}/owners"),
+            axum::routing::put(crate::web::people::put_org_owners),
         );
-    // Repo admin under both lanes: summary/create/delete, policy, settings.
+    // Repo admin under both lanes: summary/create/delete, access, policy, settings.
     for base in crate::web::api::REPO_API_BASES {
         r = r
             .route(base, get(repo_summary).put(repo_admin).delete(repo_admin))
+            .route(
+                &format!("{base}/access"),
+                get(crate::web::people::get_access).put(crate::web::people::put_access),
+            )
             .route(
                 &format!("{base}/policy"),
                 get(repo_admin).put(repo_admin).delete(repo_admin),
@@ -227,6 +256,8 @@ async fn discovery(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Respo
             "GET  /api/v1/me",
             "GET  /api/v1/owners",
             "GET  /api/v1/owners/{owner}/repos",
+            "GET  /api/v1/users?q&n",
+            "GET  /api/v1/orgs/{login} | POST /api/v1/orgs | PUT /api/v1/orgs/{login}/owners",
             "GET  /api/v1/authenticate   (also /api-browser/v1/me|authenticate for the browser lane)",
             "-- repository routes live under the repository (D27): /{owner}/{repo}/api/… (bearer/session) and /{owner}/{repo}/api-browser/… (browser lane) --",
             "GET|PUT|DELETE /{owner}/{repo}/api",
@@ -242,6 +273,7 @@ async fn discovery(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Respo
             "GET  /{owner}/{repo}/api/tasks[/{id}]",
             "GET  /{owner}/{repo}/api/ops",
             "POST /{owner}/{repo}/api/ops/{op}",
+            "GET|PUT /{owner}/{repo}/api/access",
             "GET|PUT|DELETE /{owner}/{repo}/api/policy",
             "POST /{owner}/{repo}/api/policy/validate | dry-run?last=N",
             "GET|PUT|DELETE /{owner}/{repo}/api/settings",
@@ -255,22 +287,54 @@ async fn discovery(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     r
 }
 
-/// `GET /api/v1/me` — the caller, or 401. Never cached.
+/// `GET /api/v1/me` — the caller (D51: the account and its host flags), or 401. Never cached.
+/// What it may do on a repository is that repository's `role` (`GET /{o}/{r}/api`).
 async fn me(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    match st.auth.authenticate(&headers).await {
-        Ok(p) if !p.anonymous || st.auth.anonymous_read_allowed() => {
+    match crate::access::signed_in(&st, &headers).await {
+        Ok(s) => {
+            let (profile, orgs) = match s.user_id.as_deref() {
+                Some(id) => st
+                    .accounts
+                    .cached(|a| {
+                        let orgs: Vec<String> = a
+                            .orgs
+                            .values()
+                            .filter(|o| o.owners.contains(id))
+                            .map(|o| o.login.clone())
+                            .collect();
+                        (a.users.get(id).cloned(), orgs)
+                    })
+                    .await
+                    .unwrap_or_default(),
+                None => (None, Vec::new()),
+            };
             let mut r = axum::Json(serde_json::json!({
-                "principal": p.name,
-                "write": p.write,
-                "anonymous": p.anonymous,
+                "login": s.name,
+                "user_id": s.user_id,
+                "name": profile.as_ref().map(|u| u.name.clone()),
+                "email": (!s.email.is_empty()).then_some(&s.email),
+                "avatar_url": profile.as_ref().map(|u| u.avatar_url.clone()).filter(|a| !a.is_empty()),
+                "can_create": s.can_create,
+                "site_admin": s.site_admin,
+                "anonymous": s.is_anonymous(),
+                // `none`: no credentials, everyone the local site admin (loopback only).
+                "auth_mode": format!("{:?}", st.auth.mode()).to_lowercase(),
+                // The orgs it owns (where it may create repositories besides its own login).
+                "orgs": orgs,
+                // How a browser signs in here (D52): `/_auth/login`, and `/_auth/signup` when open.
+                "sign_in": {
+                    "available": st.auth.browser_login_enabled(),
+                    "passwords": format!("{:?}", st.auth.passwords()).to_lowercase(),
+                    "oidc": st.auth.oidc_login_enabled(),
+                    "tokens": st.auth.issued_tokens_enabled(),
+                },
             }))
             .into_response();
             r.headers_mut()
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
             r
         }
-        Ok(_) => ApiError::Unauthorized.into_response(),
-        Err(e) => crate::web::api::auth_err(e).into_response(),
+        Err(e) => crate::access::auth_err(e).into_response(),
     }
 }
 
@@ -279,15 +343,15 @@ async fn me(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
 /// authenticated page then tells its opener and closes. The SDK opens it when a
 /// browser-lane call answers 401.
 async fn authenticate(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    match st.auth.require_read(&headers).await {
-        Ok(p) => {
-            let page = AUTHENTICATE_HTML.replace("{{principal}}", &html_escape(&p.name));
+    match crate::access::signed_in(&st, &headers).await {
+        Ok(s) => {
+            let page = AUTHENTICATE_HTML.replace("{{principal}}", &html_escape(&s.name));
             let mut r = Html(page).into_response();
             r.headers_mut()
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
             r
         }
-        Err(e) => crate::web::api::auth_err(e).into_response(),
+        Err(e) => crate::access::auth_err(e).into_response(),
     }
 }
 
@@ -326,6 +390,10 @@ struct RepoSummary {
     clone_url: String,
     html_url: String,
     api_url: String,
+    /// D51: `public` | `internal` | `private`.
+    visibility: &'static str,
+    /// D51: the caller's role here: `read` | `triage` | `write` | `maintain` | `admin`.
+    role: &'static str,
 }
 
 /// `GET /{owner}/{repo}/api[-browser]` — one cheap, ref-level summary (SWR +
@@ -346,7 +414,12 @@ async fn repo_summary(
         None,
         move |r| async move {
             let head = r.index.head().map(|(name, sha)| RefInfo { name, sha });
-            let etag = etag_for(head.as_ref().map_or("unborn", |h| h.sha.as_str()));
+            // The summary carries the caller's role: it changes with access, not only the head.
+            let etag = etag_for(&format!(
+                "{}.{}",
+                head.as_ref().map_or("unborn", |h| h.sha.as_str()),
+                r.access_tag()
+            ));
             let full = format!("{o}/{n}");
             Ok(json_swr(
                 &RepoSummary {
@@ -359,6 +432,8 @@ async fn repo_summary(
                     clone_url: format!("{base_url}/{full}.git"),
                     html_url: format!("{base_url}/{full}"),
                     api_url: format!("{base_url}/{full}/api"),
+                    visibility: r.visibility(),
+                    role: r.role.as_str(),
                 },
                 Some(&etag),
             ))

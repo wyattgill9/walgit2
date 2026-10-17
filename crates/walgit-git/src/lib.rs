@@ -151,6 +151,8 @@ mod validate_ref_tests {
 // RepoId
 // ---------------------------------------------------------------------------
 
+const SYSTEM_OWNER: &str = ".system";
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RepoId {
     owner: String,
@@ -166,6 +168,15 @@ impl RepoId {
         Ok(RepoId { owner, name })
     }
 
+    /// D51: a system log (the account log) with the standard WAL layout at `system/<name>/`.
+    /// Its owner (`.system`) can never come from `new`, so it is neither routable nor listed.
+    pub fn system(name: &str) -> Self {
+        RepoId {
+            owner: SYSTEM_OWNER.to_string(),
+            name: name.to_string(),
+        }
+    }
+
     pub fn owner(&self) -> &str {
         &self.owner
     }
@@ -173,8 +184,12 @@ impl RepoId {
         &self.name
     }
 
-    /// `repos/<owner>/<repo>/` (`walgit_proto::keys::repo_prefix`).
+    /// `repos/<owner>/<repo>/` (`walgit_proto::keys::repo_prefix`); `system/<name>/` for a
+    /// system log.
     pub fn store_prefix(&self) -> String {
+        if self.owner == SYSTEM_OWNER {
+            return format!("system/{}/", self.name);
+        }
         walgit_proto::keys::repo_prefix(&self.owner, &self.name)
     }
 

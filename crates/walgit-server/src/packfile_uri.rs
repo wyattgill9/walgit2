@@ -257,11 +257,9 @@ pub async fn get(
     headers: &HeaderMap,
     peer: Option<std::net::SocketAddr>,
 ) -> Result<Response, ApiError> {
-    state
-        .auth
-        .require_read(headers)
+    let subject = crate::access::authenticate(state, headers)
         .await
-        .map_err(smart::auth_err)?;
+        .map_err(crate::access::auth_err)?;
     if !state
         .cfg
         .placement
@@ -287,7 +285,8 @@ pub async fn get(
     {
         return Err(ApiError::NotFound("packfile".into()));
     }
-    let handle = smart::open_repo(state, &route.id, false).await?;
+    let (handle, _) =
+        crate::access::repo(state, &route.id, &subject, crate::access::Role::Read).await?;
     if checksum.len() != handle.local().object_format().kind().len_in_hex()
         || !handle
             .serves_pack_fresh(checksum)
@@ -306,9 +305,7 @@ pub async fn get(
         method,
         headers,
         static_object::ServeOptions {
-            cache_control: (state.cfg.server.auth.mode != walgit_config::AuthMode::None
-                && !state.cfg.server.auth.anonymous_read)
-                .then_some("private, max-age=31536000, immutable"),
+            cache_control: crate::access::immutable_cache_control(state, &handle),
             accel: state.cfg.server.accel_redirect,
             peer,
             ..Default::default()

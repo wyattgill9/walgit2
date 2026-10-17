@@ -145,7 +145,7 @@ pub struct AuthConfig {
     pub mode: AuthMode,
     /// Allow unauthenticated read (upload-pack, LFS, web UI) when mode != none.
     pub anonymous_read: bool,
-    /// Static tokens (`token` mode, and accepted in `oidc` mode too — for robots): token → principal.
+    /// Static tokens (`token` mode, and accepted in `oidc` mode too — for robots): token → account (`user`).
     /// Presented as `Authorization: Bearer <token>` or as the password of HTTP Basic.
     pub tokens: Vec<StaticToken>,
     /// OIDC issuer (`oidc` mode). Discovery at `<issuer>/.well-known/openid-configuration`
@@ -163,9 +163,8 @@ pub struct AuthConfig {
     pub audiences: Vec<String>,
     /// Domains permitted to write. If unset, all allowed domains may write.
     pub write_domains: Option<Vec<String>>,
-    /// Principals allowed to forward an end-user identity (`X-Walgit-Principal`) to this
-    /// server — the host that fronts a push broker. Names as they authenticate here (a static
-    /// token's `principal`, or an email).
+    /// Static-token users allowed to forward an end user's account (`X-Walgit-Principal`,
+    /// a `user_id`) to this server — the host that fronts a push broker. The token's `user`.
     pub trusted_forwarders: Vec<String>,
     /// OIDC emails that may PUT/DELETE settings and `policy.json`. Empty = none via email.
     #[serde(default)]
@@ -182,7 +181,7 @@ pub struct AuthConfig {
     #[serde(with = "humantime_serde")]
     pub session_ttl: Duration,
     /// Lifetime of access tokens minted at `/_auth/tokens` for git and scripts (default 90 d).
-    /// Tokens are stateless (HMAC over principal + expiry); rotating `session_secret` revokes
+    /// Tokens are stateless (HMAC over the account id + expiry); rotating `session_secret` revokes
     /// every one of them.
     #[serde(with = "humantime_serde")]
     pub access_token_ttl: Duration,
@@ -190,6 +189,23 @@ pub struct AuthConfig {
     /// Pair with `oauth_client_secret`; both or neither.
     pub oauth_client_id: Option<String>,
     pub oauth_client_secret: Option<String>,
+    /// D52: walgit's own password accounts (`/_auth/login` form, `/_auth/signup`). `off`: none;
+    /// `admin`: people sign in with a password a site admin set (`walgit user create --password`,
+    /// the Admin page); `open`: anyone may also sign up. Needs `session_secret`; never `mode = none`.
+    #[serde(default)]
+    pub passwords: PasswordAccounts,
+}
+
+/// D52: who creates password accounts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PasswordAccounts {
+    #[default]
+    Off,
+    /// Site admins create them; their owners sign in.
+    Admin,
+    /// Anyone may sign up.
+    Open,
 }
 
 /// Prefix of access tokens walgit mints itself (`/_auth/tokens`): recognisable in logs and
@@ -213,7 +229,10 @@ pub enum AuthMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StaticToken {
-    pub principal: String,
+    /// D51: the login of the account this token acts as (`walgit user create <login>`).
+    /// `write` = may create repositories, `admin` = site admin; what it may do on a
+    /// repository is that account's role there.
+    pub user: String,
     /// Read from env var if set, else literal.
     #[serde(default)]
     pub token: String,
@@ -359,7 +378,7 @@ pub struct WalConfig {
     /// Route receive-pack writes through a single stateless broker when set.
     pub push_broker_url: Option<String>,
     /// Static token this host presents to the broker (`Authorization: Bearer`); the broker
-    /// lists it in `server.auth.tokens` and its principal in `trusted_forwarders`.
+    /// lists it in `server.auth.tokens` and its `user` in `trusted_forwarders`.
     /// `WALGIT_BROKER_TOKEN` in the environment overrides it.
     pub push_broker_token: Option<String>,
     /// Maximum receive-pack body retained for a safe broker-to-local fallback.
@@ -835,6 +854,7 @@ impl Default for AuthConfig {
             access_token_ttl: Duration::from_hours(2160),
             oauth_client_id: None,
             oauth_client_secret: None,
+            passwords: PasswordAccounts::Off,
         }
     }
 }
@@ -1179,11 +1199,38 @@ impl Config {
         // Security contract: identity modes fail closed.
         let a = &self.server.auth;
         if a.mode == AuthMode::None {
+            // D51: `none` makes every caller a site admin with no credential. It is for one
+            // person on one machine: loopback only, and nothing that implies another host in
+            // front of or beside it (`access::local_only` enforces the same per request).
             anyhow::ensure!(
                 self.server.listen.ip().is_loopback(),
                 "server.auth.mode = none is loopback-only (listen is {}); use token or oidc for a public bind",
                 self.server.listen
             );
+            if let Some(u) = &self.server.public_url {
+                anyhow::ensure!(
+                    origin_is_loopback(u),
+                    "server.auth.mode = none is loopback-only (public_url is {u}); use token or oidc"
+                );
+            }
+            for (set, key) in [
+                (
+                    !a.trusted_forwarders.is_empty(),
+                    "server.auth.trusted_forwarders",
+                ),
+                (self.server.accel_redirect, "server.accel_redirect"),
+                (!self.server.cors_origins.is_empty(), "server.cors_origins"),
+                (
+                    self.wal.push_broker_token.is_some(),
+                    "wal.push_broker_token",
+                ),
+                (self.wal.push_broker_url.is_some(), "wal.push_broker_url"),
+            ] {
+                anyhow::ensure!(
+                    !set,
+                    "{key} implies another host in front of or beside walgit, which server.auth.mode = none (no credentials, everyone a site admin) must never be; use token or oidc"
+                );
+            }
         }
         if a.mode == AuthMode::Token {
             anyhow::ensure!(
@@ -1193,13 +1240,23 @@ impl Config {
         }
         for t in &a.tokens {
             anyhow::ensure!(
-                !t.principal.is_empty(),
-                "server.auth.tokens[].principal must not be empty"
+                !t.user.is_empty(),
+                "server.auth.tokens[].user must name an account's login"
             );
             anyhow::ensure!(
                 !t.token.is_empty() || t.token_env.as_deref().is_some_and(|v| !v.is_empty()),
                 "server.auth.tokens[] for {:?} needs `token` or `token_env`",
-                t.principal
+                t.user
+            );
+        }
+        if a.passwords != PasswordAccounts::Off {
+            anyhow::ensure!(
+                a.mode != AuthMode::None,
+                "server.auth.passwords needs real accounts: use mode = \"token\" or \"oidc\", not none"
+            );
+            anyhow::ensure!(
+                a.session_secret.as_deref().is_some_and(|s| !s.is_empty()),
+                "server.auth.passwords needs server.auth.session_secret (it signs the session cookie)"
             );
         }
         if let Some(secret) = a.session_secret.as_deref().filter(|s| !s.is_empty()) {
@@ -1631,17 +1688,17 @@ audiences = ["walgit-cli", "https://git.example.com"]
         assert!(err.to_string().contains("tokens"), "{err}");
         // `token_env` alone is a whole entry: the README quick start writes exactly this.
         let readme = Config::parse(
-            "[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\ntokens = [{ principal = \"me\", token_env = \"WALGIT_TOKEN_ME\", write = true }]\n",
+            "[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\ntokens = [{ user = \"me\", token_env = \"WALGIT_TOKEN_ME\", write = true }]\n",
         )
         .unwrap();
         let t = &readme.server.auth.tokens[0];
-        assert_eq!(t.principal, "me");
+        assert_eq!(t.user, "me");
         assert!(t.token.is_empty(), "{:?}", t.token);
         assert_eq!(t.token_env.as_deref(), Some("WALGIT_TOKEN_ME"));
         assert!(t.write && !t.admin);
         // Neither key names a secret, so the entry could never let anyone in.
         let err = Config::parse(
-            "[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\ntokens = [{ principal = \"me\", write = true }]\n",
+            "[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\ntokens = [{ user = \"me\", write = true }]\n",
         )
         .unwrap_err();
         assert!(
@@ -1663,10 +1720,60 @@ audiences = ["walgit-cli", "https://git.example.com"]
         )
         .unwrap_err();
         assert!(err.to_string().contains("loopback-only"), "{err}");
+        // D51 security 3: `none` refuses everything that implies another host in front of or
+        // beside it, and a public origin.
+        for (extra, why) in [
+            (
+                "[server]\npublic_url = \"https://git.example.com\"\n",
+                "loopback-only",
+            ),
+            ("[server]\naccel_redirect = true\n", "server.accel_redirect"),
+            (
+                "[server]\ncors_origins = [\"https://app.example.com\"]\n",
+                "server.cors_origins",
+            ),
+            (
+                "[server.auth]\ntrusted_forwarders = [\"front\"]\n",
+                "trusted_forwarders",
+            ),
+            (
+                "[wal]\npush_broker_token = \"t\"\n",
+                "wal.push_broker_token",
+            ),
+        ] {
+            let err = Config::parse(&format!("[store]\nbucket = \"b\"\n{extra}")).unwrap_err();
+            assert!(err.to_string().contains(why), "{extra}: {err}");
+        }
+        let local = Config::parse(
+            "[store]\nbucket = \"b\"\n[server]\npublic_url = \"https://walgit.localhost:8080\"\n",
+        );
+        assert!(local.is_ok(), "{local:?}");
+        // D52: password accounts need a session secret and real accounts.
+        let err = Config::parse(
+            "[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\npasswords = \"open\"\ntokens = [{ user = \"me\", token = \"s\" }]\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("session_secret"), "{err}");
+        let err = Config::parse(
+            "[store]\nbucket = \"b\"\n[server.auth]\npasswords = \"admin\"\nsession_secret = \"0123456789abcdef0123456789abcdef\"\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not none"), "{err}");
+        let ok = Config::parse(
+            "[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\npasswords = \"open\"\nsession_secret = \"0123456789abcdef0123456789abcdef\"\ntokens = [{ user = \"me\", token = \"s\" }]\n",
+        )
+        .unwrap();
+        assert_eq!(ok.server.auth.passwords, PasswordAccounts::Open);
+        // The old token key is gone, not aliased.
+        let err = Config::parse(
+            "[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\ntokens = [{ principal = \"me\", token = \"s\" }]\n",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("principal"), "{err:#}");
         // The issuer is an oidc-only requirement: none and token mode validate without one.
         let none = Config::parse("[store]\nbucket = \"b\"\n").unwrap();
         assert_eq!(none.server.auth.issuer, "");
-        let tok = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\ntokens = [{ principal = \"ci\", token = \"s\" }]\n").unwrap();
+        let tok = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\ntokens = [{ user = \"ci\", token = \"s\" }]\n").unwrap();
         assert_eq!(tok.server.auth.issuer, "");
     }
 

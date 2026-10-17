@@ -282,6 +282,7 @@ async fn stock_git_downloads_static_baseline_and_native_residual_while_gix_stays
         &source,
         &["push", "-q", &server.repo_url("o", "delivery"), "main"],
     )?;
+    server.create_users(&["reader"]).await?;
     let tip = git_in(&source, &["rev-parse", "HEAD"])?;
     for (engine, protected) in [
         (walgit_config::UploadPackEngine::Git, false),
@@ -296,7 +297,7 @@ async fn stock_git_downloads_static_baseline_and_native_residual_while_gix_stays
                     cfg.server.auth.mode = walgit_config::AuthMode::Token;
                     cfg.server.auth.anonymous_read = false;
                     cfg.server.auth.tokens = vec![walgit_config::StaticToken {
-                        principal: "reader".into(),
+                        user: "reader".into(),
                         token: "test-reader".into(),
                         token_env: None,
                         write: false,
@@ -364,12 +365,13 @@ async fn protected_pack_downloads_require_membership_and_survive_retirement() ->
     let id = walgit_git::RepoId::new("o", "packs")?;
     let handle = writer.state.registry.open(&id).await?;
     let checksum = handle.manifest().packs[0].checksum.clone();
+    writer.create_users(&["reader"]).await?;
     let protected = writer
         .start_sibling_with(|cfg| {
             cfg.server.auth.mode = walgit_config::AuthMode::Token;
             cfg.server.auth.anonymous_read = false;
             cfg.server.auth.tokens = vec![walgit_config::StaticToken {
-                principal: "reader".into(),
+                user: "reader".into(),
                 token: "test-reader".into(),
                 token_env: None,
                 write: false,

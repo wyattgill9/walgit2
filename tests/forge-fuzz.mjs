@@ -6,8 +6,10 @@
 // Env: WALGIT_URL (https://walgit.localhost:8080), REPO (test/forge-demo, must not exist),
 // SEED (1), STEPS (300), WALGIT_CA (CA file for git; node reads NODE_EXTRA_CA_CERTS).
 // MODE=snapshot OUT=file writes every item (detail + timeline) as JSON, for comparing a cold
-// restart. The server needs token auth with these users (docs/FORGE.md "Fuzz"):
-//   alice-token, bob-token (write), carol-token (read only), maint-token (write, admin).
+// restart. The server needs token auth with these users (docs/FORGE.md "Fuzz"), each an account
+// (`walgit user create alice` …): alice-token, bob-token, carol-token, and maint-token (a site
+// admin: `admin = true`). maint creates the repository and grants (D51) alice and bob write,
+// carol read.
 //
 // Every step runs one action and checks its answer; every 25 steps and at the end, every item
 // on the server must equal the model. At the end the git side is checked too: a fresh clone
@@ -133,6 +135,9 @@ function seedRepository() {
   git("maint", dir("maint"), "commit", "-qm", "Initial project");
   for (let i = 0; i < 3; i++) edit("maint", i);
   git("maint", dir("maint"), "push", "-q", REMOTE, "main");
+  const roles = { alice: "write", bob: "write", carol: "read" };
+  const collaborators = Object.entries(roles).map(([login, role]) => ({ login, role }));
+  expect(await api("maint", "PUT", "/access", { visibility: "public", collaborators }), 200, "grant roles");
   git("maint", dir("maint"), "remote", "add", "origin", REMOTE);
   for (const u of DEVS) git(u, work, "clone", "-q", REMOTE, u);
 }

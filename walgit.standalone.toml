@@ -28,15 +28,15 @@ mode = "self_signed" # generated once under <cache.dir>/tls/, published at /serv
 # git pins the cert via the installer. Real certificate: mode = "files", cert, key.
 
 [server.auth]
-# Local play: everyone is `anon` with write. Nobody else can reach 127.0.0.1.
+# Local play: everyone is the local site admin `anon`; only direct requests from this machine.
 mode = "none"
 #
 # A shared machine — static tokens (bearer or the password of HTTP Basic):
 # mode = "token"
 # anonymous_read = false
 # tokens = [
-#   { principal = "alice", token_env = "WALGIT_TOKEN_ALICE", write = true },
-#   { principal = "ci",    token_env = "WALGIT_TOKEN_CI",    write = false },
+#   { user = "alice", token_env = "WALGIT_TOKEN_ALICE", write = true },   # walgit user create alice
+#   { user = "ci",    token_env = "WALGIT_TOKEN_CI",    write = false },
 # ]
 #
 # A team — any OpenID Connect issuer (Google, Entra, Okta, Auth0, Keycloak, Dex, GitLab…):

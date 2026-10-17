@@ -16,26 +16,18 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
+use crate::access::Role;
 use crate::error::ApiError;
 use crate::{AppState, RepoRoute};
 
-fn auth_err(e: crate::auth::AuthError) -> ApiError {
-    match e {
-        crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
-            ApiError::Unauthorized
-        }
-        _ => ApiError::Forbidden,
-    }
-}
-
-async fn open(st: &AppState, route: &RepoRoute) -> Result<Arc<walgit_wal::RepoHandle>, ApiError> {
-    st.registry.open(&route.id).await.map_err(|e| {
-        if matches!(e, walgit_wal::WalError::NotFound) {
-            ApiError::NotFound(format!("{}", route.id))
-        } else {
-            ApiError::Internal(format!("wal: {e}"))
-        }
-    })
+/// D51: the repository, revalidated and authorized for `need` (`access::authorize`).
+async fn open(
+    st: &AppState,
+    route: &RepoRoute,
+    headers: &HeaderMap,
+    need: Role,
+) -> Result<(Arc<walgit_wal::RepoHandle>, crate::access::Grant), ApiError> {
+    crate::access::request_repo(st, headers, &route.id, need).await
 }
 
 fn ts(t: Option<&prost_types::Timestamp>) -> Option<String> {
@@ -48,11 +40,7 @@ pub async fn http_get(
     route: &RepoRoute,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
-    let h = open(st, route).await?;
-    h.sync_refs()
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let (h, _) = open(st, route, headers, Role::Read).await?;
     let body = match h.settings() {
         None => json!({"revision": 0, "toml": "", "author": "", "updated_at": null, "message": ""}),
         Some(s) => {
@@ -72,11 +60,7 @@ pub async fn http_effective(
     route: &RepoRoute,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
-    let h = open(st, route).await?;
-    h.sync_refs()
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let (h, _) = open(st, route, headers, Role::Read).await?;
     let text = h
         .validated_effective_config()
         .map_err(|e| ApiError::Internal(e.to_string()))?
@@ -101,11 +85,7 @@ pub async fn http_history(
     route: &RepoRoute,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
-    let h = open(st, route).await?;
-    h.sync_refs()
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let (h, _) = open(st, route, headers, Role::Read).await?;
     let m = h.manifest();
     let entries = h
         .read_log(m.min_seq.max(1), None)
@@ -134,8 +114,7 @@ pub async fn http_put(
     query: &str,
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
-    let principal = st.auth.require_admin(headers).await.map_err(auth_err)?;
-    let h = open(st, route).await?;
+    let (h, grant) = open(st, route, headers, Role::Maintain).await?;
     let bytes = crate::collect_body(body).await?;
     if bytes.len() > walgit_config::SETTINGS_MAX_BYTES {
         return Err(ApiError::PayloadTooLarge);
@@ -148,7 +127,7 @@ pub async fn http_put(
         .find(|(k, _)| *k == "message")
         .map(|(_, v)| percent_decode(v))
         .unwrap_or_default();
-    publish(&h, text, &principal.name, &message).await
+    publish(&h, text, &grant.subject.name, &message).await
 }
 
 pub async fn http_delete(
@@ -156,9 +135,8 @@ pub async fn http_delete(
     route: &RepoRoute,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let principal = st.auth.require_admin(headers).await.map_err(auth_err)?;
-    let h = open(st, route).await?;
-    publish(&h, "", &principal.name, "clear").await
+    let (h, grant) = open(st, route, headers, Role::Maintain).await?;
+    publish(&h, "", &grant.subject.name, "clear").await
 }
 
 async fn publish(
@@ -227,11 +205,7 @@ pub async fn http_describe(
     route: &RepoRoute,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
-    let h = open(st, route).await?;
-    h.sync_refs()
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let (h, _) = open(st, route, headers, Role::Read).await?;
     let settings = h.settings();
     let effective = h
         .validated_effective_config()
@@ -320,8 +294,7 @@ pub async fn http_validate(
     headers: &HeaderMap,
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
-    let h = open(st, route).await?;
+    let (h, _) = open(st, route, headers, Role::Maintain).await?;
     let bytes = crate::collect_body(body).await?;
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| ApiError::BadRequest("settings must be UTF-8 TOML".into()))?;
@@ -356,8 +329,7 @@ pub async fn http_policy_validate(
     headers: &HeaderMap,
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
-    let _ = open(st, route).await?;
+    open(st, route, headers, Role::Read).await?;
     let bytes = crate::collect_body(body).await?;
     let out = match crate::policy::parse_document(&bytes) {
         Ok(p) => {
@@ -380,11 +352,7 @@ pub async fn http_policy_dry_run(
     query: &str,
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
-    let h = open(st, route).await?;
-    h.sync_refs()
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let (h, _) = open(st, route, headers, Role::Read).await?;
     let last: usize = query
         .split('&')
         .filter_map(|kv| kv.split_once('='))
@@ -431,7 +399,9 @@ pub async fn http_policy_dry_run(
                 }
             }
         }
-        let ev = crate::policy::evaluate(&policy, &principal, &txn, |u| forces.contains(&u.name));
+        let ev = crate::policy::evaluate(&policy, &[principal.as_str()], &txn, |u| {
+            forces.contains(&u.name)
+        });
         let refs: Vec<serde_json::Value> = ev
             .per_ref
             .iter()

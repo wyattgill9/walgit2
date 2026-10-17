@@ -38,21 +38,24 @@ mode = "off" # "off" (HTTP/1.1 + h2c) | "self_signed" (generated once under <cac
 
 [server.auth]
 mode = "none" # "none" | "token" | "oidc"
-#   none  — everyone is `anon` with write+admin; loopback listen only
+#   none  — no credentials: everyone is the local site admin `anon`; loopback only, and only direct
+#           local requests (no proxy, no forwarders, accel, CORS or broker — see docs/ACCOUNTS.md)
 #   token — static `tokens` below, as `Authorization: Bearer` or the password of HTTP Basic
 #   oidc  — any OpenID Connect issuer: browser sign-in through it, ID tokens as bearers,
 #           walgit-issued access tokens for git (/_auth/tokens), plus `tokens` for robots
 anonymous_read = true # must be false in oidc mode
-# tokens = [                      # token → principal; `token_env` reads the value from the environment at startup
-#   { principal = "alice", token_env = "WALGIT_TOKEN_ALICE", write = true, admin = true },
-#   { principal = "ci", token = "literal-secret", write = false },
+# tokens = [                      # token → account (`walgit user create <login>` first); `token_env` reads the value
+#                                 # from the environment at startup. `write` = may create repositories under its
+#                                 # own login; `admin` = site admin. Repository roles come from each repo's access.
+#   { user = "alice", token_env = "WALGIT_TOKEN_ALICE", write = true, admin = true },
+#   { user = "ci", token = "literal-secret", write = false },
 # ]
-# admin_emails = []                # oidc: emails that may delete repos or PUT/DELETE settings and policy.json
-# admin_domains = []               # oidc: email domains that may delete repos or PUT/DELETE settings and policy.json
+# admin_emails = []                # oidc: site admins (admin on every repository) by email
+# admin_domains = []               # oidc: site admins by email domain
 # issuer = "https://id.example.com"        # oidc: required, no default. Discovery at <issuer>/.well-known/openid-configuration
 # allowed_domains = ["example.com"]        # oidc: email domains admitted (email_verified required)
 # allowed_emails = []                      # oidc: individual identities admitted
-# write_domains = ["example.com"]          # oidc: omit to let every admitted identity write
+# write_domains = ["example.com"]          # oidc: who may create repositories; omit to let every admitted identity
 # oauth_client_id = ""                     # oidc: the client for browser sign-in; redirect URI <public_url>/_auth/callback
 # oauth_client_secret = ""                 #       (set both or neither; use WALGIT__SERVER__AUTH__OAUTH_CLIENT_SECRET)
 # session_secret = ""                      # oidc: HMAC key (>= 32 bytes) for the session cookie and issued tokens; shared by
@@ -61,7 +64,11 @@ anonymous_read = true # must be false in oidc mode
 # access_token_ttl = "90d"                 # lifetime of tokens minted at /_auth/tokens
 # audiences = []                           # oidc: `aud` values accepted on bearer ID tokens clients mint themselves;
 #                                          #       the configured web client is always accepted
-# trusted_forwarders = []                  # principals allowed to set X-Walgit-Principal (a front in front of a push broker)
+# passwords = "off"                       # D52: walgit's own password accounts: "off" | "admin" (site admins create
+#                                          #       them) | "open" (anyone may sign up at /_auth/signup). Needs
+#                                          #       session_secret (above, in token mode too); never mode = none
+# trusted_forwarders = []                  # token users allowed to forward an end user's account in X-Walgit-Principal
+#                                          # (a front in front of a push broker)
 
 [store]
 backend = "s3"                # "s3" (AWS, MinIO, rustfs, R2, Ceph, …) | "gcs" | "memory" (tests)
@@ -110,7 +117,7 @@ batch_window = "5ms" # coalesce concurrent publishes into one CAS
 max_batch = 64       # max pushes per batched index update
 # push_broker_url = ""            # forward receive-pack to a single-writer broker host (empty = publish locally)
 # push_broker_token = ""          # static token this host presents to the broker (or WALGIT_BROKER_TOKEN); the broker
-# lists it in server.auth.tokens and its principal in trusted_forwarders
+# lists it in server.auth.tokens and its `user` in trusted_forwarders
 push_broker_buffer_bytes = "64MiB" # largest receive-pack body kept replayable for broker → local fallback
 snapshot_every_entries = 256       # checkpoint (ref snapshot + pack inventory, log folded) every N entries …
 checkpoint_interval = "1h"         # … or when the last checkpoint is this old (0 = off) …

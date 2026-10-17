@@ -443,6 +443,8 @@ fn build_log_entry_at(
         meta: meta.clone(),
         settings: None,
         forge,
+        account: Vec::new(),
+        access: None,
     }
 }
 
@@ -569,12 +571,25 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
             let mut per_ref = verify_txn(&req.txn, &working_refs);
             let mut forge = req.forge.clone();
             let forge_after = crate::forge::ForgeState::number(&mut forge, forge_next);
+            // D51: an actor's role is judged at this attempt's basis, so access that changed
+            // before this CAS applies to it (docs/ACCOUNTS.md "Revocation").
+            let role = req.actor.as_ref().map(|a| a.role(manifest.access.as_ref()));
             let forge_error = match (&req.actor, forge.is_empty()) {
                 (_, true) => None,
-                (Some(actor), false) => handle.forge_read(|s| s.verify(actor, &forge)).err(),
+                (Some(actor), false) => handle
+                    .forge_read(|s| {
+                        s.verify(actor, role.unwrap_or(crate::access::Role::None), &forge)
+                    })
+                    .err(),
                 (None, false) => Some("forge events need an actor".into()),
             };
-            if let Some(msg) = &forge_error {
+            let refs_error = (role.is_some_and(|r| r < crate::access::Role::Write)
+                && !req.txn.updates.is_empty())
+            .then(|| {
+                "you don't have write access to this repository (permission changed during push)"
+                    .to_string()
+            });
+            if let Some(msg) = forge_error.as_ref().or(refs_error.as_ref()) {
                 for (_, r) in &mut per_ref {
                     *r = Err(RefError::Rejected(msg.clone()));
                 }
@@ -1150,6 +1165,8 @@ pub(crate) async fn publish_compact_classified(
             meta: HashMap::new(),
             settings: None,
             forge: Vec::new(),
+            account: Vec::new(),
+            access: None,
         };
 
         let slot = match claim_log_slot(&handle.store, manifest.head_seq, |seq| {
@@ -1453,36 +1470,98 @@ pub(crate) async fn publish_settings_impl(
     author: &str,
     message: &str,
 ) -> Result<u64, WalError> {
+    let (_, updated) = publish_one(handle, "settings", |manifest| {
+        let settings = walgit_proto::v1::RepoSettings {
+            toml: toml_text.to_string(),
+            revision: manifest.settings.as_ref().map_or(0, |s| s.revision) + 1,
+            author: author.to_string(),
+            updated_at: Some(time::now()),
+            message: message.to_string(),
+        };
+        let mut next = manifest.clone();
+        next.settings = Some(settings.clone());
+        let entry = LogEntry {
+            kind: EntryKind::Settings as i32,
+            meta: HashMap::from([
+                ("author".to_string(), author.to_string()),
+                ("message".to_string(), message.to_string()),
+            ]),
+            settings: Some(settings),
+            ..Default::default()
+        };
+        Ok((entry, next))
+    })
+    .await?;
+    *handle.effective.lock() = None;
+    Ok(updated.settings.map_or(0, |s| s.revision))
+}
+
+/// D51: publish a repository's access document — one ACCESS log entry (history) and the
+/// manifest's inline `access` (what every authorization reads). `if_revision` = the revision
+/// the caller edited, refused with `Invalid` when another change landed first. Returns the
+/// new revision. Round trips: log PUT + manifest CAS (2).
+pub(crate) async fn publish_access_impl(
+    handle: &RepoHandle,
+    mut access: walgit_proto::v1::RepoAccess,
+    if_revision: Option<u64>,
+) -> Result<u64, WalError> {
+    let (_, updated) = publish_one(handle, "access", |manifest| {
+        let current = manifest.access.as_ref().map_or(0, |a| a.revision);
+        if let Some(want) = if_revision
+            && want != current
+        {
+            return Err(WalError::Invalid(format!(
+                "access changed meanwhile (revision {current}, you edited {want}); reload"
+            )));
+        }
+        access.revision = current + 1;
+        access.updated_at = Some(time::now());
+        let mut next = manifest.clone();
+        next.access = Some(access.clone());
+        let entry = LogEntry {
+            kind: EntryKind::Access as i32,
+            meta: HashMap::from([
+                ("author".to_string(), access.author.clone()),
+                ("message".to_string(), access.message.clone()),
+            ]),
+            access: Some(access.clone()),
+            ..Default::default()
+        };
+        Ok((entry, next))
+    })
+    .await?;
+    Ok(updated.access.map_or(0, |a| a.revision))
+}
+
+/// One entry committed by the manifest CAS: the shape of every low-rate control write
+/// (settings, access, accounts). `prepare` sees each attempt's basis and returns the entry
+/// (its `seq`, time and writer are filled here) and the manifest it commits; an error from it
+/// refuses the write and publishes nothing. Returns the entry's seq and the manifest. Round
+/// trips on the happy path: log PUT + manifest CAS (2); the slot protocol handles contention
+/// like compaction does.
+pub(crate) async fn publish_one(
+    handle: &RepoHandle,
+    what: &'static str,
+    mut prepare: impl FnMut(&Manifest) -> Result<(LogEntry, Manifest), WalError>,
+) -> Result<(u64, Manifest), WalError> {
     let writer = crate::handle::instance_id();
     let max_retries = handle.cfg.wal.cas_max_retries;
     let mut attempts = 0u32;
     loop {
         handle.sync_impl_level(crate::sync::SyncLevel::Refs).await?;
         let (manifest, known_version) = handle.manifest_pair();
-        let revision = manifest.settings.as_ref().map_or(0, |s| s.revision) + 1;
-        let settings = walgit_proto::v1::RepoSettings {
-            toml: toml_text.to_string(),
-            revision,
-            author: author.to_string(),
-            updated_at: Some(time::now()),
-            message: message.to_string(),
-        };
+        // A loaded account fold is brought to at least this basis (a newer state only refuses
+        // what this CAS would lose anyway).
+        if handle.accounts.lock().is_some() {
+            handle.accounts_ensure().await?;
+        }
+        let (template, mut updated) = prepare(&manifest)?;
         let entry_time = time::now();
         let make_entry = |seq: u64| LogEntry {
             seq,
-            kind: EntryKind::Settings as i32,
-            pack: None,
-            txn: None,
-            supersedes: Vec::new(),
-            checkpoint: None,
             created_at: Some(entry_time),
             writer: writer.clone(),
-            meta: HashMap::from([
-                ("author".to_string(), author.to_string()),
-                ("message".to_string(), message.to_string()),
-            ]),
-            settings: Some(settings.clone()),
-            forge: Vec::new(),
+            ..template.clone()
         };
 
         let slot = match claim_log_slot(&handle.store, manifest.head_seq, |seq| {
@@ -1500,9 +1579,7 @@ pub(crate) async fn publish_settings_impl(
             }
         };
         let seq = slot.first_seq;
-        let mut updated: Manifest = (*manifest).clone();
         updated.head_seq = seq;
-        updated.settings = Some(settings);
         updated.log_segments.push(LogSegmentRef {
             key: slot.key.clone(),
             first_seq: seq,
@@ -1531,7 +1608,7 @@ pub(crate) async fn publish_settings_impl(
             Ok(meta) => {
                 let _sync = handle.sync_mutex.lock().await;
                 if !handle.adopt_manifest(Arc::new(updated.clone()), meta.version.clone()) {
-                    return Ok(revision);
+                    return Ok((seq, updated));
                 }
                 note_entry_time(handle, seq, &entry_time);
                 {
@@ -1547,10 +1624,10 @@ pub(crate) async fn publish_settings_impl(
                     }
                 }
                 crate::state::save_state(handle.local.path(), &handle.state.lock().clone())?;
-                *handle.effective.lock() = None;
+                handle.accounts_fold(manifest.head_seq, &[&make_entry(seq)]);
                 sweep_burned(&handle.store, &slot).await;
-                tracing::info!(repo = %handle.id, seq, revision, author, "settings published");
-                return Ok(revision);
+                tracing::info!(repo = %handle.id, seq, what, "published");
+                return Ok((seq, updated));
             }
             Err(StoreError::PreconditionFailed { .. }) => {
                 drop_own_slot(&handle.store, &slot).await;

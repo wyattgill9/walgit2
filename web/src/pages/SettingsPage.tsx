@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { api, type Overview, type PolicyDryRun, type PolicyValidation, type SettingsDescribe, type SettingsHistory, type SettingsValidation } from "../api";
+import { api, atLeast, ROLES, type Role, type Visibility, type Overview, type PolicyDryRun, type PolicyValidation, type SettingsDescribe, type SettingsHistory, type SettingsValidation } from "../api";
 import { invalidate, useData } from "../data";
 import { Box } from "../components/Layout";
 import { Maintainers } from "../components/Maintainers";
@@ -35,12 +35,13 @@ export function SettingsPage() {
   const { full } = useRepo();
   const d: SettingsDescribe = useData(`settings:${full}`, () => api.settings(full).describe(), 2_000);
   const o: Overview = useData(`overview:${full}`, () => api.overview(full), 2_000);
-  const [section, setSection] = useState<"tasks" | "policy" | "config">("tasks");
+  const [section, setSection] = useState<"access" | "tasks" | "policy" | "config">("access");
   return (
     <div className="settings">
       <nav className="subtabs" aria-label="Settings sections">
         {(
           [
+            ["access", "Access"],
             ["tasks", "Scheduled tasks"],
             ["policy", "Push policy"],
             ["config", "Effective config & history"],
@@ -51,10 +52,165 @@ export function SettingsPage() {
           </button>
         ))}
       </nav>
+      {section === "access" && <AccessEditor full={full} />}
       {section === "tasks" && <Tasks d={d} o={o} full={full} />}
       {section === "policy" && <PolicyEditor full={full} />}
       {section === "config" && <EffectiveConfig d={d} full={full} />}
     </div>
+  );
+}
+
+// ---- 0. access (D51) -----------------------------------------------------------
+
+/** Visibility and collaborators: visible to write, editable by admin. */
+function AccessEditor({ full }: { full: string }) {
+  const role = useData(`summary:${full}`, () => api.summary(full)).role;
+  if (!atLeast(role, "write")) {
+    return (
+      <Box title="Access">
+        <div className="pad muted small">Collaborators are shown to people with write access. Your role here: {role}.</div>
+      </Box>
+    );
+  }
+  return <AccessForm full={full} admin={atLeast(role, "admin")} />;
+}
+
+function AccessForm({ full, admin }: { full: string; admin: boolean }) {
+  const saved = useData(`access:${full}`, () => api.access(full).get(), 10_000);
+  const [visibility, setVisibility] = useState<Visibility>(saved.visibility);
+  const [rows, setRows] = useState(() => saved.collaborators.map((c) => ({ login: c.login, role: c.role })));
+  const [adding, setAdding] = useState("");
+  const [found, setFound] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const dirty = visibility !== saved.visibility || JSON.stringify(rows) !== JSON.stringify(saved.collaborators.map((c) => ({ login: c.login, role: c.role })));
+  const setRole = (login: string, role: Role) => setRows((r) => r.map((x) => (x.login === login ? { ...x, role } : x)));
+  const add = () => {
+    const login = adding.trim().toLowerCase();
+    if (login && !rows.some((r) => r.login === login)) setRows((r) => [...r, { login, role: "read" }]);
+    setAdding("");
+  };
+  const save = async () => {
+    setBusy(true);
+    setErr("");
+    try {
+      await api.access(full).put({ visibility, collaborators: rows, revision: saved.revision });
+      invalidate(`access:${full}`);
+      invalidate(`summary:${full}`);
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const owner = saved.owner;
+  return (
+    <Box title="Access">
+      <div className="pad">
+        <KV
+          rows={[
+            [
+              "Owner",
+              owner.kind === "org" ? (
+                <span key="o">
+                  org <strong>{owner.login}</strong> — owners: {owner.owners?.map((o) => o.login).join(", ") || "none"}
+                </span>
+              ) : owner.kind === "user" ? (
+                <strong key="o">{owner.login}</strong>
+              ) : (
+                <span key="o" className="muted">{owner.login}/ has no account: site admins administer it</span>
+              ),
+            ],
+            [
+              "Visibility",
+              <select key="v" value={visibility} disabled={!admin} onChange={(e) => setVisibility(e.target.value as Visibility)} aria-label="Visibility">
+                <option value="public">Public — anyone who can read this host</option>
+                <option value="internal">Internal — any signed-in account</option>
+                <option value="private">Private — collaborators only</option>
+              </select>,
+            ],
+          ]}
+        />
+        <table className="table small">
+          <thead>
+            <tr>
+              <th>Collaborator</th>
+              <th>Role</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {rows.length === 0 && (
+              <tr>
+                <td colSpan={3} className="muted">
+                  No collaborators: the owner and site admins administer this repository.
+                </td>
+              </tr>
+            )}
+            {rows.map((r) => (
+              <tr key={r.login}>
+                <td>{r.login}</td>
+                <td>
+                  <select value={r.role} disabled={!admin} onChange={(e) => setRole(r.login, e.target.value as Role)} aria-label={`Role of ${r.login}`}>
+                    {ROLES.map((x) => (
+                      <option key={x} value={x}>
+                        {x}
+                      </option>
+                    ))}
+                  </select>
+                </td>
+                <td>
+                  {admin && (
+                    <button type="button" className="btn link small danger-text" onClick={() => setRows((rs) => rs.filter((x) => x.login !== r.login))}>
+                      Remove
+                    </button>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {admin && (
+          <form
+            className="row gap"
+            onSubmit={(e) => {
+              e.preventDefault();
+              add();
+            }}
+          >
+            <input
+              value={adding}
+              list="access-users"
+              placeholder="Add a person by username…"
+              aria-label="Add a collaborator"
+              onChange={(e) => {
+                setAdding(e.target.value);
+                api
+                  .users(e.target.value.trim())
+                  .then((us) => setFound(us.map((u) => u.login)))
+                  .catch(() => setFound([]));
+              }}
+            />
+            <datalist id="access-users">
+              {found
+                .filter((l) => !rows.some((r) => r.login === l))
+                .map((l) => (
+                  <option key={l} value={l} />
+                ))}
+            </datalist>
+            <button type="submit" className="btn">
+              Add
+            </button>
+            <span className="spacer" />
+            <button type="button" className="btn primary" disabled={!dirty || busy} onClick={() => void save()}>
+              Save access
+            </button>
+          </form>
+        )}
+        {err && <div className="err small">{err}</div>}
+        {!admin && <div className="muted small">Only admins change access.</div>}
+      </div>
+    </Box>
   );
 }
 

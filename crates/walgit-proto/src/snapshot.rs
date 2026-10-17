@@ -87,6 +87,14 @@ pub fn forge_key(bytes: &[u8]) -> String {
     )
 }
 
+/// Content-addressed key of an encoded `AccountHistory` (D51).
+pub fn accounts_key(bytes: &[u8]) -> String {
+    format!(
+        "checkpoints/accounts/{}.pb",
+        hex::encode(Sha256::digest(bytes))
+    )
+}
+
 /// Verify exact canonical encoding as well as the content-addressed key.
 pub fn decode_verified(expected_key: &str, bytes: &[u8]) -> Result<RefSnapshot> {
     ensure!(key(bytes) == expected_key, "snapshot content key mismatch");

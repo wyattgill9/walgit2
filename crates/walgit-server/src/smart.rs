@@ -4,6 +4,7 @@
 //! * <https://git-scm.com/docs/http-protocol>
 //! * <https://git-scm.com/docs/protocol-v2>
 
+use crate::access::{Role, auth_err};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -39,33 +40,34 @@ pub async fn info_refs(
     let service_param = parse_query(query, "service").unwrap_or_default();
     // Auth: read for upload-pack, write for receive-pack advertisement.
     let is_receive = service_param == "git-receive-pack";
-    let auth_result = if is_receive {
-        st.auth.require_write(headers).await
-    } else {
-        st.auth.require_read(headers).await
-    };
-    if let Err(e) = auth_result {
-        // Git clients do not display 401/403 bodies, but they do print a pkt-line `ERR` message
-        // ("fatal: remote error: ..."). Tell humans how to authenticate instead of leaving them
-        // with "error 401" — but ONLY where a retry cannot help (the account is not allowed, the
-        // verifier is down). A credential that is merely invalid/expired MUST be a real 401: that is
-        // what makes git `erase` it from its credential helpers (the in-memory cache the installer
-        // puts in front of ours), ask them again (gcloud refreshes an expired token) and retry. The
-        // 200 + ERR answer made git keep — and re-`store` — a dead cached token for the cache's
-        // whole lifetime (rig, 2026-08-22: every clone failed for 50 minutes).
-        let has_creds = headers.contains_key(axum::http::header::AUTHORIZATION);
-        let retry_cannot_help = matches!(
-            e,
-            crate::auth::AuthError::Forbidden | crate::auth::AuthError::Unavailable
-        );
-        if is_git_client(headers) && !service_param.is_empty() && has_creds && retry_cannot_help {
-            return Ok(git_err_response(
-                &service_param,
-                &auth_help_message(st, headers, &e),
-            ));
+    let subject = match crate::access::authenticate(st, headers).await {
+        Ok(s) => s,
+        Err(e) => {
+            // Git clients do not display 401/403 bodies, but they do print a pkt-line `ERR` message
+            // ("fatal: remote error: ..."). Tell humans how to authenticate instead of leaving them
+            // with "error 401" — but ONLY where a retry cannot help (the account is not allowed, the
+            // verifier is down). A credential that is merely invalid/expired MUST be a real 401: that is
+            // what makes git `erase` it from its credential helpers (the in-memory cache the installer
+            // puts in front of ours), ask them again (gcloud refreshes an expired token) and retry. The
+            // 200 + ERR answer made git keep — and re-`store` — a dead cached token for the cache's
+            // whole lifetime (rig, 2026-08-22: every clone failed for 50 minutes).
+            let has_creds = headers.contains_key(axum::http::header::AUTHORIZATION);
+            let retry_cannot_help = matches!(
+                e,
+                crate::auth::AuthError::Forbidden
+                    | crate::auth::AuthError::Unavailable
+                    | crate::auth::AuthError::NoAccount(_)
+            );
+            if is_git_client(headers) && !service_param.is_empty() && has_creds && retry_cannot_help
+            {
+                return Ok(git_err_response(
+                    &service_param,
+                    &auth_help_message(st, headers, &e),
+                ));
+            }
+            return Err(auth_err(e));
         }
-        return Err(auth_err(e));
-    }
+    };
     if is_receive && let Some(msg) = push_url_must_be_git(st, route, headers) {
         return Ok(git_err_response("git-receive-pack", &msg));
     }
@@ -76,7 +78,16 @@ pub async fn info_refs(
         other => return Err(ApiError::BadRequest(format!("unknown service: {other}"))),
     };
 
-    let handle = open_repo(st, &route.id, is_receive).await?;
+    let need = if is_receive { Role::Write } else { Role::Read };
+    let handle = match git_repo(st, route, &subject, need).await {
+        Ok((h, _)) => h,
+        // A signed-in client that may see the repository but not do this: git prints a
+        // pkt-line ERR, never a 403 body.
+        Err(ApiError::Denied(msg)) if is_git_client(headers) => {
+            return Ok(git_err_response(&service_param, &format!("walgit: {msg}")));
+        }
+        Err(e) => return Err(e),
+    };
     // Advertisements need refs only: never wait for (or require) the pack set.
     let _guard = handle.sync_refs().await.map_err(wal_err)?;
 
@@ -168,9 +179,10 @@ pub async fn upload_pack(
     headers: &HeaderMap,
     body: Body,
 ) -> Result<Response, ApiError> {
-    st.auth.require_read(headers).await.map_err(auth_err)?;
-
-    let handle = open_repo(st, &route.id, false).await?;
+    let subject = crate::access::authenticate(st, headers)
+        .await
+        .map_err(auth_err)?;
+    let (handle, grant) = git_repo(st, route, &subject, Role::Read).await?;
 
     let protocol = walgit_git::pkt::Protocol::from_git_protocol_header(
         headers.get("git-protocol").and_then(|v| v.to_str().ok()),
@@ -184,7 +196,9 @@ pub async fn upload_pack(
     // sync() is deferred to each handler path so the ReadGuard lives for the
     // entire streaming response (packs must not be removed mid-clone).
     match protocol {
-        walgit_git::pkt::Protocol::V2 => upload_pack_v2(st, route, headers, &handle, reader).await,
+        walgit_git::pkt::Protocol::V2 => {
+            upload_pack_v2(st, route, headers, &handle, reader, &grant.subject.name).await
+        }
         walgit_git::pkt::Protocol::V0 => upload_pack_v0(st, route, headers, &handle, reader).await,
     }
 }
@@ -195,6 +209,7 @@ async fn upload_pack_v2(
     headers: &HeaderMap,
     handle: &Arc<walgit_wal::RepoHandle>,
     reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    who: &str,
 ) -> Result<Response, ApiError> {
     let (cmd, reader) = walgit_git::pkt::read_command(reader)
         .await
@@ -291,7 +306,7 @@ async fn upload_pack_v2(
             // progress → stream immediately and say what we are doing while
             // the local copy syncs, then hand over to upload-pack.
             if req.sideband_all && !req.no_progress {
-                return Ok(narrated_fetch(st, route, headers, handle, req).await);
+                return Ok(narrated_fetch(st, route, headers, handle, req, who).await);
             }
             // Objects are needed from here on. Surface "too big for this
             // instance" as a pkt-line ERR git prints verbatim (with the fix),
@@ -311,8 +326,9 @@ async fn upload_pack_v2(
             // not be removed mid-clone.
             let handle = handle.clone();
             let engine = st.cfg.git.upload_pack_engine;
-            let uri_base = anonymous_uri_base(st, route, headers);
-            tokio::spawn(async move {
+            let uri_base = anonymous_uri_base(st, route, headers, &handle);
+            let carry_id = handle.id().clone();
+            tokio::spawn(walgit_wal::carry_request_fresh(&carry_id, async move {
                 let guard = match handle.sync().await {
                     Ok(g) => g,
                     Err(e) => {
@@ -325,7 +341,7 @@ async fn upload_pack_v2(
                     tracing::warn!(error = ?e, "upload_pack v2 fetch failed");
                 }
                 drop(guard);
-            });
+            }));
             Ok(stream_response(
                 "application/x-git-upload-pack-result",
                 no_cache_headers(),
@@ -490,8 +506,15 @@ async fn warn_large_dynamic_clone<W: tokio::io::AsyncWrite + Unpin>(
     }
 }
 
-fn anonymous_uri_base(st: &AppState, route: &RepoRoute, headers: &HeaderMap) -> Option<String> {
-    (st.cfg.server.auth.mode == walgit_config::AuthMode::None || st.cfg.server.auth.anonymous_read)
+/// URL delivery needs a repository anyone may read: the client fetches those URLs without a
+/// credential (D46, D51).
+fn anonymous_uri_base(
+    st: &AppState,
+    route: &RepoRoute,
+    headers: &HeaderMap,
+    handle: &walgit_wal::RepoHandle,
+) -> Option<String> {
+    crate::access::world_readable(st, handle)
         .then(|| format!("{}/{}", request_base_url(st, headers), route.id))
 }
 
@@ -563,21 +586,18 @@ async fn narrated_fetch(
     headers: &HeaderMap,
     handle: &Arc<walgit_wal::RepoHandle>,
     req: walgit_git::UploadPackRequest,
+    who: &str,
 ) -> Response {
     let (mut writer, body) = write_body_pipe(256 * 1024);
     let handle = handle.clone();
     let repo = route.id.to_string();
-    let who = st
-        .auth
-        .require_read(headers)
-        .await
-        .ok()
-        .map_or_else(|| "anonymous".into(), |p| p.name);
+    let who = who.to_string();
     let cache_max = st.cfg.cache_budget_bytes();
     let engine = st.cfg.git.upload_pack_engine;
-    let uri_base = anonymous_uri_base(st, route, headers);
+    let uri_base = anonymous_uri_base(st, route, headers, &handle);
     let max_wants = st.cfg.git.max_wants;
-    tokio::spawn(async move {
+    let carry_id = handle.id().clone();
+    tokio::spawn(walgit_wal::carry_request_fresh(&carry_id, async move {
         use tokio::io::AsyncWriteExt;
         let t0 = std::time::Instant::now();
         if !say(
@@ -661,7 +681,7 @@ async fn narrated_fetch(
             tracing::warn!(error = ?e, "narrated upload_pack v2 fetch failed");
         }
         drop(guard);
-    });
+    }));
     stream_response(
         "application/x-git-upload-pack-result",
         no_cache_headers(),
@@ -700,7 +720,8 @@ async fn upload_pack_v0(
     // Move the Arc<RepoHandle> into the spawned task so the ReadGuard from
     // sync() lives for the entire streaming response.
     let handle = handle.clone();
-    tokio::spawn(async move {
+    let carry_id = handle.id().clone();
+    tokio::spawn(walgit_wal::carry_request_fresh(&carry_id, async move {
         let guard = match handle.sync().await {
             Ok(g) => g,
             Err(e) => {
@@ -717,7 +738,7 @@ async fn upload_pack_v0(
             tracing::warn!(error = ?e, "upload_pack v0 failed");
         }
         drop(guard);
-    });
+    }));
     Ok(stream_response(
         "application/x-git-upload-pack-result",
         no_cache_headers(),
@@ -743,7 +764,13 @@ pub async fn receive_pack(
     headers: &HeaderMap,
     mut body: Body,
 ) -> Result<Response, ApiError> {
-    let principal = st.auth.require_write(headers).await.map_err(auth_err)?;
+    let subject = crate::access::authenticate(st, headers)
+        .await
+        .map_err(auth_err)?;
+    // A push always needs an account: 401 makes git ask for one.
+    if subject.is_anonymous() {
+        return Err(ApiError::Unauthorized);
+    }
     if let Some(msg) = push_url_must_be_git(st, route, headers) {
         return refuse_push(body, headers, msg).await;
     }
@@ -847,7 +874,7 @@ pub async fn receive_pack(
             route,
             headers,
             forward_body,
-            &principal,
+            &subject,
             st.cfg.wal.push_broker_token.as_deref(),
         )
         .await
@@ -878,7 +905,15 @@ pub async fn receive_pack(
         }
     }
 
-    let handle = open_repo(st, &route.id, true).await?;
+    // D51: Write on this repository, decided before any pack byte is read; the publisher
+    // judges it again at its CAS basis (`publish_push_as`).
+    let (handle, grant) = match git_repo(st, route, &subject, Role::Write).await {
+        Ok(x) => x,
+        Err(ApiError::Denied(msg)) => {
+            return refuse_push(body, headers, format!("walgit: {msg}")).await;
+        }
+        Err(e) => return Err(e),
+    };
 
     let enc = headers
         .get(axum::http::header::CONTENT_ENCODING)
@@ -939,7 +974,7 @@ pub async fn receive_pack(
             txn,
             caps,
             pack_reader,
-            &principal,
+            &grant,
             request_id,
         )
         .await?;
@@ -953,13 +988,14 @@ pub async fn receive_pack(
     let handle = handle.clone();
     let st_arc = st.clone();
     let repo = route.id.to_string();
-    let who = principal.clone();
-    tokio::spawn(async move {
+    let who = grant.clone();
+    let carry_id = handle.id().clone();
+    tokio::spawn(walgit_wal::carry_request_fresh(&carry_id, async move {
         use tokio::io::AsyncWriteExt;
         let t0 = std::time::Instant::now();
         let _ = say(
             &mut writer,
-            &format!("walgit: {repo} — push by {}", who.name),
+            &format!("walgit: {repo} — push by {}", who.subject.name),
         )
         .await;
         let guard = match sync_narrated(&handle, &mut writer, t0).await {
@@ -1007,7 +1043,7 @@ pub async fn receive_pack(
         };
         let _ = writer.write_all(&report).await;
         let _ = writer.flush().await;
-    });
+    }));
     Ok(stream_response(
         "application/x-git-receive-pack-result",
         no_cache_headers(),
@@ -1024,7 +1060,7 @@ async fn receive_pack_process(
     txn: walgit_proto::v1::RefTransaction,
     caps: walgit_git::receive::ReceiveCaps,
     pack_reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
-    principal: &crate::auth::Principal,
+    grant: &crate::access::Grant,
     request_id: Option<String>,
 ) -> Result<Vec<u8>, ApiError> {
     let route_id = handle.id().clone();
@@ -1115,7 +1151,9 @@ async fn receive_pack_process(
             }
         }
     }
-    let ev = crate::policy::evaluate(&policy, &principal.name, &txn, |u| forces.contains(&u.name));
+    let ev = crate::policy::evaluate(&policy, &grant.subject.names(), &txn, |u| {
+        forces.contains(&u.name)
+    });
     if !ev.any_allowed() {
         let report = build_report(&caps, unpack_result, &ev.per_ref).await;
         return Ok(report);
@@ -1123,20 +1161,20 @@ async fn receive_pack_process(
     let mut txn = ev.publish;
     let mut per_ref_policy = ev.per_ref;
 
-    // Release the sync read guard before publishing. `publish_push_synced`
+    // Release the sync read guard before publishing. `publish_push_as`
     // reuses this request's freshness check while still syncing after CAS
     // conflicts.
     drop(_guard);
 
     // Writer-side peel: replicas advertise annotated tags without objects.
     local.fill_peeled(&mut txn);
-    let meta = push_meta(&caps, principal, &txn, &request_id);
+    let meta = push_meta(&caps, &grant.subject, &txn, &request_id);
     let pack_ref = match ingest {
         Ok(Some(p)) => Some(p),
         _ => None,
     };
     let publish = handle
-        .publish_push_synced(pack_ref, txn, meta)
+        .publish_push_as(grant.actor(), pack_ref, txn, meta)
         .instrument(tracing::info_span!("receive.publish"))
         .await;
     let (seq, per_ref_pub): (u64, Vec<(String, Result<(), String>)>) = match publish {
@@ -1242,13 +1280,13 @@ fn receive_response(report: Vec<u8>) -> Response {
 
 fn push_meta(
     caps: &walgit_git::receive::ReceiveCaps,
-    principal: &crate::auth::Principal,
+    subject: &crate::access::Subject,
     txn: &walgit_proto::v1::RefTransaction,
     request_id: &Option<String>,
 ) -> HashMap<String, String> {
     let mut m = HashMap::new();
     m.insert("agent".to_string(), caps.agent.clone().unwrap_or_default());
-    m.insert("principal".to_string(), principal.name.clone());
+    m.insert("principal".to_string(), subject.name.clone());
     m.insert("push_options".to_string(), txn.push_options.join("\n"));
     if let Some(rid) = request_id {
         m.insert("request_id".to_string(), rid.clone());
@@ -1344,25 +1382,29 @@ async fn parse_fetch_request(
 
 // ---- helpers ----
 
-pub(crate) async fn open_repo(
+/// D51: the repository a git request works on, authorized for `need`. A push to a repository
+/// that doesn't exist yet creates it (`server.auto_create_on_push`) when the subject may
+/// create there (`access::authorize_create`).
+async fn git_repo(
     st: &AppState,
-    id: &walgit_git::RepoId,
-    write: bool,
-) -> Result<Arc<walgit_wal::RepoHandle>, ApiError> {
-    if write && st.cfg.server.auto_create_on_push {
-        let format = walgit_git::ObjectFormat::from(st.cfg.git.object_format);
-        Ok(st
-            .registry
-            .open_or_create(id, format)
-            .await
-            .map_err(wal_err)?)
-    } else {
-        match st.registry.open(id).await {
-            Ok(h) => Ok(h),
-            Err(walgit_wal::WalError::NotFound) => Err(ApiError::NotFound(id.to_string())),
-            Err(e) => Err(wal_err(e)),
+    route: &RepoRoute,
+    subject: &crate::access::Subject,
+    need: Role,
+) -> Result<(Arc<walgit_wal::RepoHandle>, crate::access::Grant), ApiError> {
+    let create = need == Role::Write && st.cfg.server.auto_create_on_push;
+    let handle = match crate::access::open(st, &route.id, subject).await {
+        Err(ApiError::NotFound(_)) if create => {
+            crate::access::authorize_create(st, &route.id, subject).await?;
+            let format = walgit_git::ObjectFormat::from(st.cfg.git.object_format);
+            st.registry
+                .open_or_create(&route.id, format)
+                .await
+                .map_err(wal_err)?
         }
-    }
+        r => r?,
+    };
+    let grant = crate::access::authorize(st, &handle, subject, need).await?;
+    Ok((handle, grant))
 }
 
 fn text_response(
@@ -1464,6 +1506,7 @@ pub(crate) fn auth_help_message(
         crate::auth::AuthError::Unavailable => {
             "the token verifier is temporarily unavailable; retry"
         }
+        crate::auth::AuthError::NoAccount(why) => return format!("walgit: {why}"),
         _ => "a valid bearer token is required; refresh or replace an expired token",
     };
     format!(
@@ -1559,17 +1602,6 @@ fn git_err_response(service: &str, msg: &str) -> Response {
     )
 }
 
-pub(crate) fn auth_err(e: crate::auth::AuthError) -> ApiError {
-    match e {
-        crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
-            ApiError::Unauthorized
-        }
-        crate::auth::AuthError::Forbidden => ApiError::Forbidden,
-        crate::auth::AuthError::Unavailable => {
-            ApiError::ServiceUnavailable("auth provider unavailable".into())
-        }
-    }
-}
 fn git_err(e: walgit_git::GitError) -> ApiError {
     ApiError::Internal(format!("git: {e}"))
 }

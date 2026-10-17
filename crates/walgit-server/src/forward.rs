@@ -8,8 +8,8 @@
 //!
 //! The hop authenticates with `wal.push_broker_token` (or `WALGIT_BROKER_TOKEN`):
 //! a static token the broker lists under `server.auth.tokens` with `write = true`
-//! and whose principal is in its `trusted_forwarders`, so the end user's identity
-//! travels in `X-Walgit-Principal`. A loopback broker needs no token.
+//! and whose `user` is in its `trusted_forwarders`, so the end user's account (`user_id`)
+//! travels in `X-Walgit-Principal` and the broker authorizes it (D51).
 
 use std::time::Instant;
 
@@ -20,7 +20,7 @@ use axum::{
 };
 use futures::StreamExt;
 
-use crate::{auth::Principal, repo::RepoRoute};
+use crate::{access::Subject, repo::RepoRoute};
 
 /// The result of trying to forward one receive-pack body.
 pub enum ForwardOutcome {
@@ -40,7 +40,7 @@ pub async fn receive_pack(
     route: &RepoRoute,
     headers: &HeaderMap,
     body: Body,
-    principal: &Principal,
+    subject: &Subject,
     broker_token: Option<&str>,
 ) -> ForwardOutcome {
     let started = Instant::now();
@@ -77,24 +77,28 @@ pub async fn receive_pack(
         }
     }
     request = request.header("X-Walgit-Forwarded", "1");
-    if let Ok(value) = HeaderValue::try_from(principal.name.as_str()) {
+    if let Some(value) = subject
+        .user_id
+        .as_deref()
+        .and_then(|id| HeaderValue::try_from(id).ok())
+    {
         request = request.header("X-Walgit-Principal", value);
     }
 
-    if !is_local_broker(broker_url) {
-        let token = std::env::var("WALGIT_BROKER_TOKEN")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .or_else(|| broker_token.map(str::to_string).filter(|v| !v.is_empty()));
-        if let Some(token) = token {
-            request = request.bearer_auth(token);
-        } else {
-            tracing::warn!(
-                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                "push broker token unset (wal.push_broker_token / WALGIT_BROKER_TOKEN); falling back"
-            );
-            return ForwardOutcome::Fallback;
-        }
+    // D51: the broker authorizes the forwarded account only for a trusted token, loopback or
+    // not; without one the push is handled here.
+    let token = std::env::var("WALGIT_BROKER_TOKEN")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| broker_token.map(str::to_string).filter(|v| !v.is_empty()));
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    } else {
+        tracing::warn!(
+            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "push broker token unset (wal.push_broker_token / WALGIT_BROKER_TOKEN); falling back"
+        );
+        return ForwardOutcome::Fallback;
     }
 
     let response = match request.send().await {
@@ -137,11 +141,4 @@ pub async fn receive_pack(
         "push broker response streamed"
     );
     ForwardOutcome::Response(output)
-}
-
-fn is_local_broker(url: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(url) else {
-        return false;
-    };
-    matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
 }

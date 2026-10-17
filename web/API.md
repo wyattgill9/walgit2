@@ -41,7 +41,21 @@ Every request authenticates (§1.3 of AGENTS.md); a missing/expired browser
 session answers `401` and the SDK opens **`/api-browser/v1/authenticate`** in a popup —
 walgit's own sign-in (`/_auth/login`) runs before the application page `postMessage`s
 `{type: "repos:authenticated"}` to its opener and closes — then retries once.
-`GET /api/v1/me` → `{principal, write, anonymous}` (`no-store`).
+`GET /api/v1/me` → the account and its host flags (`no-store`). What it may do on a repository is that
+repository's `role` (`GET /{o}/{r}/api`). D51: [docs/ACCOUNTS.md](../docs/ACCOUNTS.md) is the model.
+
+**Accounts (D52).** Site admins: `POST /api/v1/users` `{login, email?, name?, password?}` (201),
+`PUT /api/v1/users/{login}/password` `{password}` (204). `GET /api/v1/me` also carries `orgs` (owned) and
+`sign_in: {available, passwords, oidc, tokens}`. Browser pages: `/_auth/login` (password form),
+`/_auth/signup`, `/_auth/password`.
+
+**Access (D51).** `GET /{o}/{r}/api[-browser]/access` (write) → `{visibility, revision, owner: {kind, login,
+owners?}, collaborators: [{login, name?, avatar_url?, role}], role}`; `PUT` (admin) with `{visibility,
+collaborators: [{login, role}], revision?, message?}` replaces it (unknown login 400, a moved `revision` 409).
+`GET /api[-browser]/v1/users?q=&n=` (any account) → `[{login, name?, avatar_url?}]` for pickers.
+`GET /api/v1/orgs/{login}`, `POST /api/v1/orgs` `{login, owners: [login]}` (site admin),
+`PUT /api/v1/orgs/{login}/owners` `{owners}` (site admin or an owner). A repository you may not read answers
+like one that doesn't exist: 401 anonymous, 404 signed in.
 
 CORS: origins listed in `server.cors_origins` (exact, or one leading `*.`,
 e.g. `https://*.docs.example.com`) get `Access-Control-Allow-Origin: <origin>`
@@ -62,7 +76,7 @@ lane segment (e.g. `/{owner}/{repo}/api2/…`) without infrastructure work.
 | API base | **`/{owner}/{repo}/api`** (bearer / same-origin cookie) and **`/{owner}/{repo}/api-browser`** (cross-origin browser), D15/D26/D27: one path prefix per repository, so the edge routes e.g. `acme/monorepo` to its host. Non-repo: `/api/v1` (discovery, `me`, `authenticate`, `owners`), `/services/api/owners*`, `/services/api/instance`. The bundled UI fetches same-origin with the session cookie and `Accept: application/json, text/event-stream`. No aliases or application sessions. |
 | Public lane | **`/services/public/*`** — the one open prefix besides health and the SDK (nginx skips `auth_request` there; the app never authenticates here and never reads repo data). Today exactly `/services/public/install.sh[?repo=owner/name]` (`text/x-shellscript`, `Cache-Control: public, max-age=300`); plus `/services/public/ca.pem` (the certificate this process presents when it terminates TLS itself, `application/x-pem-file`, D39; 404 behind an edge); anything else under it is 404. |
 | Setup | `/services/setup.json[?repo=owner/name]` — the clone/setup recipes (`setup::Recipes`: `token_url`, `install`, `install_url`, `plain_clone`, `blobless_clone`, `manual_clone`, `setup_text`, and `ca_url` + `trust` when the host terminates self-signed TLS itself — D39), `no-cache`; `/services/public/install.sh[?repo=]` — the one-time installer (open lane, AGENTS §1.3) (POSIX sh). The Clone menu and the API page render these, never their own copies. |
-| Auth | `/_auth/login?next=`, `/_auth/callback`, `/_auth/logout`, `/_auth/me`, `/_auth/check` (an `auth_request` target for an edge), `/_auth/tokens` (GET: the token page; POST: mint a walgit access token for the signed-in principal, `{token, principal, write, expires_at}`, same-origin only) — in-app OIDC sign-in + session cookie. Off until `session_secret` + the OAuth client are set. |
+| Auth | `/_auth/login?next=`, `/_auth/callback`, `/_auth/logout`, `/_auth/me`, `/_auth/check` (an `auth_request` target for an edge), `/_auth/tokens` (GET: the token page; POST: mint a walgit access token for the signed-in account, `{token, login, can_create, expires_at}`, same-origin only), `/_auth/welcome` (a first sign-in chooses its username; D51) — in-app OIDC sign-in + session cookie. Off until `session_secret` + the OAuth client are set. |
 | SDK | `/repos.js` (IIFE, registers `window.repos`) and `/repos.mjs` (ESM), built from `web/sdk/repos.ts` into `web/dist/` by `pnpm run build`; `no-cache` + strong ETag, precompressed. These data-free routes are open at the application. |
 | Dev | `vite dev` proxies `/api/`, `/api-browser/`, `/services/api/` and `/{owner}/{repo}/api[-browser]/…` (plus git paths) to `$WALGIT_URL` (default `http://127.0.0.1:8080`). |
 
@@ -243,10 +257,13 @@ Sorted, `[]` for an unknown/empty owner (200, not 404). Cache: SWR.
 ### `GET /api/v1/me`
 
 ```json
-{ "principal": "jane@example.com", "write": true, "anonymous": false }
+{ "login": "jane", "user_id": "4f0c…", "name": "Jane", "email": "jane@example.com", "avatar_url": null,
+  "can_create": true, "site_admin": false, "anonymous": false, "auth_mode": "oidc" }
 ```
 
-`401` without credentials. `Cache-Control: no-store`.
+Anonymous callers (when `anonymous_read`) get `anonymous: true` and no `user_id`.
+
+`401` without credentials (unless `anonymous_read`). `Cache-Control: no-store`.
 
 ### `GET /{owner}/{repo}/api`
 
@@ -642,10 +659,10 @@ redelivers). Never cached, never served to the SPA.
 
 ```
 GET /api/v1                                     → 200 {name, version:1, base, browser_base=/api-browser/v1, sdk, docs, auth, endpoints}
-GET /api/v1/me                                  → 200 {principal,write,anonymous} | 401; no-store
+GET /api/v1/me                                  → 200 {login,user_id,name,email,avatar_url,can_create,site_admin,anonymous,auth_mode} | 401; no-store
 GET /api/v1/owners                              → 200 [..]   ([] when empty)
 GET /api/v1/owners/nobody/repos                 → 200 []
-GET /o/r/api                                    → 200 {owner,name,full_name,head,branches,tags,clone_url,html_url,api_url}; SWR + ETag "<head sha>"
+GET /o/r/api                                    → 200 {owner,name,full_name,head,branches,tags,clone_url,html_url,api_url,visibility,role}; SWR + ETag "<head sha>.<access revision>.<role>"
 GET /o/r/api-browser/refs                           → same handlers (browser lane)
 OPTIONS /api/v1/… (Origin ∈ cors_origins)       → 204 + Access-Control-Allow-{Origin,Credentials,Methods,Headers}
 GET /api/v1/… (Origin ∉ cors_origins)           → 200, no CORS headers; DELETE/PUT/POST → 403

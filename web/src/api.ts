@@ -43,7 +43,12 @@ export type {
   Mergeability,
   MergeMethod,
   Label,
+  Role,
+  Visibility,
+  Person,
+  RepoAccessDoc,
 } from "../sdk/repos";
+export { atLeast, ROLES } from "../sdk/repos";
 import type { RefInfo, OpEvent, OpSpec, OpRecord, Tasks, BranchQuery } from "../sdk/repos";
 export type { SettingsDescribe, SettingsValidation, SettingsHistory, SettingsField, Policy, PolicyValidation, PolicyDryRun, RepoSettings } from "../sdk/repos";
 
@@ -116,8 +121,12 @@ export const api = {
   overview: (repo: string) => authRedirect(client.repo(repo).overview() as unknown as Promise<Overview>),
   /** What is happening to this repo on the instance that answers (API.md §2c). Never cached. */
   tasks: (repo: string): Promise<Tasks> => client.repo(repo).tasks(),
-  /** Who this browser is signed in as (decides which write controls show). */
+  /** Who this browser is signed in as. What it may do on a repository is that summary's `role`. */
   me: () => authRedirect(client.me()),
+  /** D51: the user directory (pickers). */
+  users: (q: string) => client.users(q),
+  /** D51: visibility and collaborators (Settings → Access). */
+  access: (repo: string) => client.repo(repo).access,
   forgeSummary: (repo: string) => authRedirect(client.repo(repo).forgeSummary()),
   labelList: (repo: string) => authRedirect(client.repo(repo).labels.list()),
   labels: (repo: string) => client.repo(repo).labels,

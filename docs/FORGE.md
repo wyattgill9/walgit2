@@ -47,12 +47,14 @@ WALGIT_TEST_S3_EMULATE_CAS=1 WALGIT_TEST_S3_ENDPOINT=http://127.0.0.1:3900 \
 
 ## Behavior worth knowing
 
-- **Permissions** come from the existing principal.
-  - Anyone signed in may open issues, comment, and edit or close what they authored.
-  - `write` may do everything, including labels and assignees.
-  - Anonymous readers can't write.
-  - The publisher checks every rule again on each CAS attempt. A refused request publishes
-    nothing and answers 400 with the reason.
+- **Permissions** are the repository role (D51, [ACCOUNTS.md](ACCOUNTS.md)).
+  - Any account that may read opens issues and pull requests, comments, and edits or closes what it
+    authored (authorship is the `user_id`, `ForgeEvent.actor_id`; events from before D51 compare logins).
+  - Triage: labels, assignees (existing accounts only), closing and reopening others' items. Write: editing
+    others' text and merging.
+  - Anonymous readers never write, not even on a public repository.
+  - The publisher derives the role from the CAS basis and checks every rule again on each attempt. A
+    refused request publishes nothing and answers 400 with the reason.
 - **Reviews** anchor their line comments to the head they saw. A comment on another head shows
   as outdated in the conversation and is left out of the diff; there is no line remapping yet.
   A pending review lives in the page until it is submitted, and is lost on reload; GitHub keeps
@@ -148,8 +150,9 @@ At the end, a fresh clone must pass `git fsck`, every merge commit must be on ma
 parent count, and deleted branches must be gone. `MODE=snapshot` dumps every item, to compare
 across a cold restart.
 
-It needs token users `alice`/`bob` (write), `carol` (read only) and `maint` (write, admin);
-see the header of the script. Use a fresh repository or `store.prefix`.
+It needs token users (each an account, `walgit user create`) `alice`, `bob`, `carol` and `maint` (a site
+admin); maint creates the repository and grants alice and bob write, carol read (D51). See the header
+of the script. Use a fresh repository or `store.prefix`.
 
 Results on Garage, 2026-10-16:
 - Eight seeds, 2,150 steps, four of them running in parallel on separate repositories. The

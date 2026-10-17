@@ -333,19 +333,43 @@ async fn ref_list_sse_streams_events() -> Result<()> {
 /// config the bytes still stream from here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accel_redirect_offloads_static_objects_to_the_edge() -> Result<()> {
-    let server = Server::start_with_tweak(|c| c.server.accel_redirect = true).await?;
+    // D51: an edge in front means real credentials (`mode = none` refuses accel_redirect);
+    // anonymous readers make the repository world-readable, so its bytes cache publicly.
+    let server = Server::start_with_tweak(|c| {
+        c.server.accel_redirect = true;
+        c.server.auth.mode = walgit_config::AuthMode::Token;
+        c.server.auth.anonymous_read = true;
+        c.server.auth.tokens = vec![walgit_config::StaticToken {
+            user: "root".into(),
+            token: "root-token".into(),
+            token_env: None,
+            write: true,
+            admin: true,
+        }];
+    })
+    .await?;
+    server.create_users(&["root"]).await?;
     server
         .store
         .fake_object_urls
         .store(true, std::sync::atomic::Ordering::Relaxed);
-    server.put_repo("o", "r").await?;
     let client = reqwest::Client::new();
+    assert!(
+        client
+            .put(format!("{}/o/r", server.base_url))
+            .bearer_auth("root-token")
+            .send()
+            .await?
+            .status()
+            .is_success()
+    );
     let body: Vec<u8> = (0..5_000u32).map(|i| (i % 13) as u8).collect();
     let oid = hex::encode(Sha256::digest(&body));
     let url = format!("{}/o/r.git/info/lfs/objects/{oid}", server.base_url);
     assert!(
         client
             .put(&url)
+            .bearer_auth("root-token")
             .body(body.clone())
             .send()
             .await?
@@ -428,7 +452,18 @@ async fn accel_redirect_offloads_static_objects_to_the_edge() -> Result<()> {
 
     // Config off: the header is ignored.
     let plain = server
-        .start_sibling_with(|c| c.server.accel_redirect = false)
+        .start_sibling_with(|c| {
+            c.server.accel_redirect = false;
+            c.server.auth.mode = walgit_config::AuthMode::Token;
+            c.server.auth.anonymous_read = true;
+            c.server.auth.tokens = vec![walgit_config::StaticToken {
+                user: "root".into(),
+                token: "root-token".into(),
+                token_env: None,
+                write: true,
+                admin: true,
+            }];
+        })
         .await?;
     let r = client
         .get(format!("{}/o/r.git/info/lfs/objects/{oid}", plain.base_url))

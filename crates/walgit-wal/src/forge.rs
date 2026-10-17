@@ -14,14 +14,41 @@ use walgit_proto::v1::{
 };
 use walgit_store::ObjectStoreExt;
 
+use crate::access::Role;
 use crate::error::WalError;
 use crate::handle::RepoHandle;
 
-/// Who asks for a forge change. `write` = the principal may push (triage, merge, edit others').
+/// Who asks for a forge change (D51). The role it holds is derived by the publisher from the
+/// repository's access at each CAS attempt (`crate::access::role`).
 #[derive(Debug, Clone)]
 pub struct Actor {
-    pub name: String,
-    pub write: bool,
+    /// The account's login: what the forge shows as the actor.
+    pub login: String,
+    /// The account. Empty = none, and such an actor can't publish forge events.
+    pub user_id: String,
+    /// Site admin or the namespace's owner, resolved when the request started.
+    pub owner_admin: bool,
+}
+
+impl Actor {
+    /// The role this actor holds under `access` (the CAS basis' manifest).
+    pub fn role(&self, access: Option<&walgit_proto::v1::RepoAccess>) -> Role {
+        let who = crate::access::Asker {
+            user_id: Some(self.user_id.as_str()).filter(|s| !s.is_empty()),
+            owner_admin: self.owner_admin,
+        };
+        crate::access::role(access, who, false)
+    }
+
+    /// Whether this actor wrote what `(id, name)` recorded: by account when the record has one
+    /// (D51), else by name (events written before D51).
+    fn is(&self, id: &str, name: &str) -> bool {
+        if id.is_empty() {
+            name == self.login
+        } else {
+            id == self.user_id
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -34,6 +61,9 @@ pub struct Item {
     /// The body was changed after opening.
     pub edited: bool,
     pub author: String,
+    /// D51: the author's account (empty on items opened before D51).
+    #[serde(skip)]
+    pub author_id: String,
     /// "open" | "closed"
     pub state: &'static str,
     /// Closing reason: `completed` | `not_planned`; empty while open.
@@ -84,6 +114,9 @@ pub struct LineComment {
 pub struct TimelineItem {
     pub id: u64,
     pub actor: String,
+    /// D51: the actor's account (empty before D51).
+    #[serde(skip)]
+    pub actor_id: String,
     pub at: String,
     #[serde(flatten)]
     pub event: Timeline,
@@ -282,6 +315,7 @@ impl ForgeState {
                 item.timeline.push(TimelineItem {
                     id,
                     actor: ev.actor.clone(),
+                    actor_id: ev.actor_id.clone(),
                     at: at.to_owned(),
                     event: Timeline::Referenced { source },
                 });
@@ -324,6 +358,7 @@ impl ForgeState {
                     body: o.body.clone(),
                     edited: false,
                     author: ev.actor.clone(),
+                    author_id: ev.actor_id.clone(),
                     state: "open",
                     state_reason: String::new(),
                     labels: o.labels.iter().cloned().collect(),
@@ -476,24 +511,40 @@ impl ForgeState {
         item.timeline.push(TimelineItem {
             id,
             actor: ev.actor.clone(),
+            actor_id: ev.actor_id.clone(),
             at: at.to_owned(),
             event,
         });
     }
 
     /// Preconditions of one request against this state, checked by the publisher on every CAS
-    /// attempt. Events carry `actor` already.
-    pub(crate) fn verify(&self, actor: &Actor, events: &[ForgeEvent]) -> Result<(), String> {
+    /// attempt with `role`, the actor's role at that attempt's basis (D51). Taking part needs an
+    /// account and Read; labels, assignees and closing others' items need Triage; editing
+    /// others' text and merging need Write. Events carry `actor` already.
+    pub(crate) fn verify(
+        &self,
+        actor: &Actor,
+        role: Role,
+        events: &[ForgeEvent],
+    ) -> Result<(), String> {
         use forge_event::Body;
         if events.is_empty() {
             return Err("no forge events".into());
         }
+        if actor.user_id.is_empty() {
+            return Err("sign in to take part".into());
+        }
+        if role < Role::Read {
+            return Err("you don't have access to this repository".into());
+        }
+        let triage = role >= Role::Triage;
+        let write = role >= Role::Write;
         for ev in events {
             let Some(body) = &ev.body else {
                 return Err("empty forge event".into());
             };
             if let Body::Label(l) = body {
-                if !actor.write {
+                if !triage {
                     return Err("only collaborators can manage labels".into());
                 }
                 if l.name.trim().is_empty() || l.name.len() > 50 {
@@ -515,7 +566,7 @@ impl ForgeState {
                 if o.title.trim().is_empty() {
                     return Err("title can't be blank".into());
                 }
-                if !actor.write && (!o.labels.is_empty() || !o.assignees.is_empty()) {
+                if !triage && (!o.labels.is_empty() || !o.assignees.is_empty()) {
                     return Err("only collaborators can set labels and assignees".into());
                 }
                 if o.kind() == ForgeKind::Pull {
@@ -538,7 +589,7 @@ impl ForgeState {
                 .items
                 .get(&ev.number)
                 .ok_or_else(|| format!("#{} does not exist", ev.number))?;
-            let own_or_write = actor.write || item.author == actor.name;
+            let own = actor.is(&item.author_id, &item.author);
             match body {
                 Body::Opened(_) | Body::Label(_) => {}
                 Body::Comment(c) => {
@@ -547,7 +598,7 @@ impl ForgeState {
                     }
                 }
                 Body::Edit(e) if e.comment_id == 0 => {
-                    if !own_or_write {
+                    if !own && !write {
                         return Err("only the author or a collaborator can edit this".into());
                     }
                     match &e.change {
@@ -559,15 +610,13 @@ impl ForgeState {
                     }
                 }
                 Body::Edit(e) => {
-                    let author = item.timeline.iter().find_map(|t| match &t.event {
-                        Timeline::Comment { deleted: false, .. } if t.id == e.comment_id => {
-                            Some(t.actor.as_str())
-                        }
-                        _ => None,
+                    let author = item.timeline.iter().find(|t| {
+                        t.id == e.comment_id
+                            && matches!(t.event, Timeline::Comment { deleted: false, .. })
                     });
                     let author =
                         author.ok_or_else(|| format!("comment {} does not exist", e.comment_id))?;
-                    if !actor.write && author != actor.name {
+                    if !write && !actor.is(&author.actor_id, &author.actor) {
                         return Err(
                             "only the author or a collaborator can edit this comment".into()
                         );
@@ -577,7 +626,7 @@ impl ForgeState {
                     if !s.closed && item.merged {
                         return Err(format!("#{} was merged; it can't be reopened", item.number));
                     }
-                    if !own_or_write {
+                    if !own && !triage {
                         return Err(
                             "only the author or a collaborator can close or reopen this".into()
                         );
@@ -590,7 +639,7 @@ impl ForgeState {
                     }
                 }
                 Body::Labels(_) | Body::Assignees(_) => {
-                    if !actor.write {
+                    if !triage {
                         return Err("only collaborators can change labels and assignees".into());
                     }
                 }
@@ -599,7 +648,7 @@ impl ForgeState {
                     if item.kind != "pull" || item.state != "open" {
                         return Err(format!("#{} is not an open pull request", item.number));
                     }
-                    if !own_or_write {
+                    if !own && !write {
                         return Err("only the author or a collaborator can change this".into());
                     }
                     if d.draft == item.draft {
@@ -623,7 +672,7 @@ impl ForgeState {
                             "a draft pull request can't be merged; mark it ready for review".into(),
                         );
                     }
-                    if !actor.write {
+                    if !write {
                         return Err("only collaborators can merge".into());
                     }
                     if !matches!(m.method.as_str(), "merge" | "squash" | "rebase") {
@@ -744,7 +793,7 @@ fn verify_review(
         return Err(format!("#{} is closed", item.number));
     }
     match r.state.as_str() {
-        "approved" | "changes_requested" if item.author == actor.name => {
+        "approved" | "changes_requested" if actor.is(&item.author_id, &item.author) => {
             return Err("you can't approve or request changes on your own pull request".into());
         }
         "changes_requested" | "commented" if r.body.trim().is_empty() && r.comments.is_empty() => {
@@ -908,7 +957,8 @@ impl RepoHandle {
         txn: walgit_proto::v1::RefTransaction,
     ) -> Result<crate::PublishResult, WalError> {
         for ev in &mut events {
-            ev.actor.clone_from(&actor.name);
+            ev.actor.clone_from(&actor.login);
+            ev.actor_id.clone_from(&actor.user_id);
         }
         self.enqueue_forge(actor, events, pack, txn).await
     }
@@ -944,11 +994,21 @@ mod tests {
     use super::*;
     use walgit_proto::v1::{ForgeComment, ForgeEdit, ForgeOpened, ForgeStateChange};
 
+    /// Tests name accounts by login and give them the same user id.
     fn ev(number: u64, actor: &str, body: forge_event::Body) -> ForgeEvent {
         ForgeEvent {
             number,
             actor: actor.into(),
+            actor_id: actor.into(),
             body: Some(body),
+        }
+    }
+
+    fn user(login: &str) -> Actor {
+        Actor {
+            login: login.into(),
+            user_id: login.into(),
+            owner_admin: false,
         }
     }
 
@@ -970,20 +1030,15 @@ mod tests {
 
     #[test]
     fn fold_verify_search_and_history_round_trip() {
-        let alice = Actor {
-            name: "alice".into(),
-            write: false,
-        };
-        let bob = Actor {
-            name: "bob".into(),
-            write: false,
-        };
+        let alice = user("alice");
+        let bob = user("bob");
+        let read = Role::Read;
         let mut s = ForgeState::default();
         let mut first = vec![
             ev(0, "alice", opened("Crash on push")),
             ev(0, "alice", opened("Docs typo")),
         ];
-        assert!(s.verify(&alice, &first).is_ok());
+        assert!(s.verify(&alice, read, &first).is_ok());
         assert_eq!(ForgeState::number(&mut first, 1), 3);
         let comment = ev(
             1,
@@ -1015,10 +1070,11 @@ mod tests {
                 }),
             )
         };
-        assert!(s.verify(&bob, &[close(1)]).is_err());
-        assert!(s.verify(&alice, &[close(1)]).is_ok());
+        assert!(s.verify(&bob, read, &[close(1)]).is_err());
+        assert!(s.verify(&bob, Role::Triage, &[close(1)]).is_ok());
+        assert!(s.verify(&alice, read, &[close(1)]).is_ok());
         s.fold_entries(3, &[entry(4, vec![close(1)])]);
-        assert!(s.verify(&alice, &[close(1)]).is_err());
+        assert!(s.verify(&alice, read, &[close(1)]).is_err());
 
         // bob edits his own comment but not alice's title.
         let cid = 3 << 10;
@@ -1026,12 +1082,36 @@ mod tests {
             comment_id: cid,
             change: Some(forge_edit::Change::Body("+1".into())),
         });
-        assert!(s.verify(&bob, &[ev(1, "bob", edit.clone())]).is_ok());
+        assert!(s.verify(&bob, read, &[ev(1, "bob", edit.clone())]).is_ok());
         let retitle = forge_event::Body::Edit(ForgeEdit {
             comment_id: 0,
             change: Some(forge_edit::Change::Title("t".into())),
         });
-        assert!(s.verify(&bob, &[ev(1, "bob", retitle)]).is_err());
+        assert!(
+            s.verify(&bob, read, &[ev(1, "bob", retitle.clone())])
+                .is_err()
+        );
+        // Triage doesn't edit others' text; Write does.
+        assert!(
+            s.verify(&bob, Role::Triage, &[ev(1, "bob", retitle.clone())])
+                .is_err()
+        );
+        assert!(
+            s.verify(&bob, Role::Write, &[ev(1, "bob", retitle)])
+                .is_ok()
+        );
+
+        // Authorship is the account, not the login: a renamed "alice" with another id is not
+        // the author.
+        let impostor = Actor {
+            login: "alice".into(),
+            user_id: "someone-else".into(),
+            owner_admin: false,
+        };
+        assert!(
+            s.verify(&impostor, read, &[ev(2, "alice", close(2).body.unwrap())])
+                .is_err()
+        );
 
         // Entries after a later bound than the state's are refused: it missed some.
         s.fold_entries(5, &[entry(6, vec![ev(1, "bob", edit.clone())])]);
@@ -1063,6 +1143,57 @@ mod tests {
         assert_eq!(again.items[&1].timeline.len(), s.items[&1].timeline.len());
     }
 
+    /// D51 security 2: taking part needs an account and Read; labels need Triage; merging
+    /// needs Write.
+    #[test]
+    fn participation_needs_an_account_and_a_role() {
+        let mut s = ForgeState::default();
+        let open = vec![ev(0, "alice", opened("t"))];
+        let nobody = Actor {
+            login: "anonymous".into(),
+            user_id: String::new(),
+            owner_admin: false,
+        };
+        // Even an owner flag can't stand in for an account.
+        let owner_without_account = Actor {
+            owner_admin: true,
+            ..nobody.clone()
+        };
+        assert!(s.verify(&nobody, Role::Read, &open).is_err());
+        assert!(
+            s.verify(&owner_without_account, Role::Admin, &open)
+                .is_err()
+        );
+        assert!(s.verify(&user("dave"), Role::None, &open).is_err());
+        assert!(s.verify(&user("dave"), Role::Read, &open).is_ok());
+        s.fold_entries(0, &[entry(1, vec![ev(1, "alice", opened("t"))])]);
+        let label = forge_event::Body::Labels(ForgeSetChange {
+            add: vec!["bug".into()],
+            remove: Vec::new(),
+        });
+        let tina = user("tina");
+        assert!(
+            s.verify(&tina, Role::Read, &[ev(1, "tina", label.clone())])
+                .is_err()
+        );
+        assert!(
+            s.verify(&tina, Role::Triage, &[ev(1, "tina", label)])
+                .is_ok()
+        );
+        // The role at the basis decides: an owner flag on the actor is Admin.
+        let alice = Actor {
+            owner_admin: true,
+            ..user("alice")
+        };
+        let private = walgit_proto::v1::RepoAccess {
+            visibility: walgit_proto::v1::Visibility::Private as i32,
+            ..Default::default()
+        };
+        assert_eq!(alice.role(Some(&private)), Role::Admin);
+        assert_eq!(user("dave").role(Some(&private)), Role::None);
+        assert_eq!(user("dave").role(None), Role::Read);
+    }
+
     /// Each reviewer's latest deciding review counts; a change request wins; a later comment
     /// review leaves a decision alone; reviews need an open pull request.
     #[test]
@@ -1088,12 +1219,20 @@ mod tests {
         });
         let mut s = ForgeState::default();
         s.fold_entries(0, &[entry(1, vec![ev(1, "alice", pr)])]);
-        let bob = Actor {
-            name: "bob".into(),
-            write: false,
-        };
-        assert!(s.verify(&bob, &[review("bob", "approved")]).is_ok());
-        assert!(s.verify(&bob, &[review("bob", "merged")]).is_err());
+        let bob = user("bob");
+        assert!(
+            s.verify(&bob, Role::Read, &[review("bob", "approved")])
+                .is_ok()
+        );
+        assert!(
+            s.verify(&bob, Role::Read, &[review("bob", "merged")])
+                .is_err()
+        );
+        let alice = user("alice");
+        assert!(
+            s.verify(&alice, Role::Admin, &[review("alice", "approved")])
+                .is_err()
+        );
         let decision = |s: &ForgeState| s.items[&1].review_decision.clone();
         s.fold_entries(1, &[entry(2, vec![review("bob", "approved")])]);
         assert_eq!(decision(&s), "approved");

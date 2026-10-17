@@ -18,11 +18,12 @@ use walgit_proto::v1::{
     ForgeOpened, ForgeReview, ForgeSetChange, ForgeStateChange, forge_edit, forge_event::Body,
 };
 use walgit_wal::RepoHandle;
-use walgit_wal::forge::{Actor, Item, SearchPage, TimelineItem};
+use walgit_wal::forge::{Item, SearchPage, TimelineItem};
 
 use crate::AppState;
+use crate::access::{Role, auth_err};
 use crate::error::ApiError;
-use crate::web::api::{REPO_API_BASES, auth_err, json_swr};
+use crate::web::api::{REPO_API_BASES, json_swr};
 
 pub fn router(state: Arc<AppState>) -> Router {
     let mut r = Router::new();
@@ -162,19 +163,17 @@ const fn kind_name(pull: bool) -> &'static str {
     if pull { "pull" } else { "issue" }
 }
 
+/// The repository, revalidated and authorized for `need` (D51).
 pub(super) async fn open(
     st: &AppState,
     headers: &HeaderMap,
     owner: &str,
     name: &str,
-) -> Result<Arc<RepoHandle>, ApiError> {
-    st.auth.require_read(headers).await.map_err(auth_err)?;
+    need: Role,
+) -> Result<(Arc<RepoHandle>, crate::access::Grant), ApiError> {
     let id = walgit_git::RepoId::new(owner, name)
         .map_err(|_| ApiError::NotFound("repository".into()))?;
-    st.registry.open(&id).await.map_err(|e| match e {
-        walgit_wal::WalError::NotFound => ApiError::NotFound("repository".into()),
-        e => crate::smart::wal_err(e),
-    })
+    crate::access::request_repo(st, headers, &id, need).await
 }
 
 /// Refs-level sync + the forge fold: every read sees every acknowledged write (principle IV).
@@ -184,7 +183,7 @@ pub(super) async fn synced(
     owner: &str,
     name: &str,
 ) -> Result<Arc<RepoHandle>, ApiError> {
-    let handle = open(st, headers, owner, name).await?;
+    let (handle, _) = open(st, headers, owner, name, Role::Read).await?;
     drop(handle.sync_refs().await.map_err(crate::smart::wal_err)?);
     handle.forge_ensure().await.map_err(crate::smart::wal_err)?;
     Ok(handle)
@@ -256,7 +255,9 @@ async fn detail<const PULL: bool>(
     Ok(json_swr(&detail_of(&handle, number, PULL)?, None).into_response(&headers))
 }
 
-/// Publishes `events` as the signed-in principal; anonymous readers can't write.
+/// Publishes `events` as the signed-in account (D51 security 2: reading a public repository
+/// anonymously is not taking part). The publisher re-derives the role at its CAS basis and
+/// applies the forge rules to it (`ForgeState::verify`).
 async fn publish(
     st: &AppState,
     headers: &HeaderMap,
@@ -264,17 +265,26 @@ async fn publish(
     name: &str,
     events: Vec<ForgeEvent>,
 ) -> Result<(Arc<RepoHandle>, u64), ApiError> {
-    let principal = st.auth.require_read(headers).await.map_err(auth_err)?;
-    if principal.anonymous && !principal.write {
+    let subject = crate::access::authenticate(st, headers)
+        .await
+        .map_err(auth_err)?;
+    if subject.is_anonymous() {
         return Err(ApiError::Unauthorized);
     }
-    let handle = open(st, headers, owner, name).await?;
-    let actor = Actor {
-        name: principal.name,
-        write: principal.write,
-    };
+    let id = walgit_git::RepoId::new(owner, name)
+        .map_err(|_| ApiError::NotFound("repository".into()))?;
+    let (handle, grant) = crate::access::repo(st, &id, &subject, Role::Read).await?;
+    let assigned: Vec<String> = events
+        .iter()
+        .flat_map(|ev| match &ev.body {
+            Some(Body::Opened(o)) => o.assignees.clone(),
+            Some(Body::Assignees(c)) => c.add.clone(),
+            _ => Vec::new(),
+        })
+        .collect();
+    require_users(st, &assigned).await?;
     let seq = handle
-        .publish_forge(actor, events)
+        .publish_forge(grant.actor(), events)
         .await
         .map_err(|e| match e {
             walgit_wal::WalError::Invalid(msg) => ApiError::BadRequest(msg),
@@ -288,6 +298,7 @@ pub(super) fn event(number: u64, body: Body) -> ForgeEvent {
     ForgeEvent {
         number,
         actor: String::new(),
+        actor_id: String::new(),
         body: Some(body),
     }
 }
@@ -335,6 +346,34 @@ async fn closing<const PULL: bool>(
             head_oid,
         }),
     ))
+}
+
+/// D51: assignees are accounts — every login must name one (the directory as last synced,
+/// revalidated once before refusing).
+async fn require_users(st: &AppState, logins: &[String]) -> Result<(), ApiError> {
+    let missing = |s: &walgit_wal::accounts::AccountsState| {
+        logins
+            .iter()
+            .find(|l| s.user_by_login(l).is_none())
+            .cloned()
+    };
+    let unavailable =
+        |e: walgit_wal::WalError| ApiError::ServiceUnavailable(format!("account log: {e}"));
+    if logins.is_empty()
+        || st
+            .accounts
+            .cached(missing)
+            .await
+            .map_err(unavailable)?
+            .is_none()
+    {
+        return Ok(());
+    }
+    let dir = st.accounts.synced().await.map_err(unavailable)?;
+    match dir.accounts_read(missing) {
+        Some(login) => Err(ApiError::BadRequest(format!("no user {login:?} to assign"))),
+        None => Ok(()),
+    }
 }
 
 async fn create_issue(

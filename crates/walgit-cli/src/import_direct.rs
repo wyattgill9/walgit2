@@ -246,6 +246,10 @@ pub fn decide_resume(
 
 pub async fn run(opts: DirectOptions, cfg: &Arc<Config>, force: bool) -> Result<()> {
     let store = open_store(cfg).await?;
+    let (owner, _) = parse_repo_id(&opts.repo)?;
+    std::fs::create_dir_all(&cfg.cache.dir).ok();
+    let registry = walgit_wal::Registry::new(store.clone(), cfg.clone());
+    crate::accounts_cmd::reserve_namespace(&registry, &owner).await?;
     let report = run_with_store(opts, store, force).await?;
     println!(
         "import: seq {}, {} object(s) uploaded, {} skipped, {} manifest write(s){}{}",
@@ -787,6 +791,7 @@ pub async fn run_with_store(
         first_state_at,
         as_of: Some(created_at),
         forge_key: String::new(),
+        accounts_key: String::new(),
     });
     manifest.log_segments.clear();
     manifest.packs = pack_refs;
