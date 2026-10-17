@@ -636,12 +636,14 @@ async fn browser_localhost_redirects_to_walgit_localhost() -> TestResult {
 async fn issues_api() -> TestResult {
     use reqwest::Method as M;
     use serde_json::json;
-    let token = |principal: &str, write: bool| walgit_config::StaticToken {
-        principal: principal.into(),
-        token: format!("{principal}-token"),
+    // D51: `maint` is a site admin (Admin on `o/r`, an unowned namespace); alice and bob
+    // read the public repository.
+    let token = |user: &str, admin: bool| walgit_config::StaticToken {
+        user: user.into(),
+        token: format!("{user}-token"),
         token_env: None,
-        write,
-        admin: false,
+        write: admin,
+        admin,
     };
     let server = Server::start_with_tweak(|c| {
         c.server.auth.mode = walgit_config::AuthMode::Token;
@@ -653,6 +655,7 @@ async fn issues_api() -> TestResult {
         ];
     })
     .await?;
+    server.create_users(&["alice", "bob", "maint"]).await?;
     let call = |method: reqwest::Method, path: &str, who: Option<&str>, body: Option<Value>| {
         let mut req = reqwest::Client::new().request(method, format!("{}{path}", server.base_url));
         if let Some(who) = who {

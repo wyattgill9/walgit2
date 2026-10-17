@@ -94,6 +94,7 @@ pub async fn run(
     std::fs::create_dir_all(&cfg.cache.dir).ok();
     let registry = Registry::new(store, cfg.clone());
 
+    crate::accounts_cmd::reserve_namespace(&registry, id.owner()).await?;
     let handle = registry.open_or_create(&id, format).await?;
     // Ensure a newly-created repo is materialized before ingesting, then
     // release the read guard. Keeping it across publish would deadlock WAL's

@@ -96,11 +96,24 @@ fn fixture(server: &Server) -> anyhow::Result<String> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v1_surface_and_browser_lane() -> TestResult {
-    let server = Server::start_with_tweak(|c| {
-        c.server.cors_origins = vec!["https://*.docs.example.com".into()];
-    })
-    .await?;
+    let server = Server::start().await?;
     server.put_repo("o", "r").await?;
+    // D51: CORS implies other origins, never `mode = none`: a token-mode sibling with
+    // anonymous read serves the cross-origin checks below.
+    let cors = server
+        .start_sibling_with(|c| {
+            c.server.cors_origins = vec!["https://*.docs.example.com".into()];
+            c.server.auth.mode = walgit_config::AuthMode::Token;
+            c.server.auth.anonymous_read = true;
+            c.server.auth.tokens = vec![walgit_config::StaticToken {
+                user: "nobody".into(),
+                token: "unused".into(),
+                token_env: None,
+                write: false,
+                admin: false,
+            }];
+        })
+        .await?;
     let head = fixture(&server)?;
 
     // discovery
@@ -158,13 +171,17 @@ async fn v1_surface_and_browser_lane() -> TestResult {
     assert_eq!(s["tags"], 1);
     assert!(s["clone_url"].as_str().unwrap().ends_with("/o/r.git"));
     assert!(s["api_url"].as_str().unwrap().ends_with("/o/r/api"));
-    assert_eq!(hdr(&h, "etag"), format!("\"{head}\""));
+    // D51: the ETag covers the head, the access revision and the caller's role.
+    assert_eq!(s["visibility"], "public");
+    assert_eq!(s["role"], "admin", "mode = none: the local site admin");
+    let etag = hdr(&h, "etag");
+    assert_eq!(etag, format!("\"{head}.0.admin\""));
     assert!(hdr(&h, "cache-control").contains("stale-while-revalidate"));
     let (st, _, _) = req(
         &server,
         reqwest::Method::GET,
         "/o/r/api",
-        &[("If-None-Match", &format!("\"{head}\""))],
+        &[("If-None-Match", &etag)],
     )
     .await?;
     assert_eq!(st, 304);
@@ -220,7 +237,7 @@ async fn v1_surface_and_browser_lane() -> TestResult {
 
     // CORS: allowed wildcard origin gets credentials; foreign origin gets nothing; preflight is open.
     let (st, _, h) = req(
-        &server,
+        &cors,
         reqwest::Method::GET,
         "/o/r/api/refs",
         &[("Origin", "https://wiki.docs.example.com")],
@@ -239,7 +256,7 @@ async fn v1_surface_and_browser_lane() -> TestResult {
             .any(|v| v.to_str().unwrap().contains("Origin"))
     );
     let (st, _, h) = req(
-        &server,
+        &cors,
         reqwest::Method::GET,
         "/o/r/api/refs",
         &[("Origin", "https://evil.example")],
@@ -248,7 +265,7 @@ async fn v1_surface_and_browser_lane() -> TestResult {
     assert_eq!(st, 200);
     assert_eq!(hdr(&h, "access-control-allow-origin"), "");
     let (st, _, h) = req(
-        &server,
+        &cors,
         reqwest::Method::OPTIONS,
         "/o/r/api-browser/refs",
         &[
@@ -267,7 +284,7 @@ async fn v1_surface_and_browser_lane() -> TestResult {
     );
     // a state-changing call from a foreign origin is refused before it reaches a handler
     let (st, _, _) = req(
-        &server,
+        &cors,
         reqwest::Method::DELETE,
         "/o/r/api/policy",
         &[("Origin", "https://evil.example")],
@@ -276,7 +293,7 @@ async fn v1_surface_and_browser_lane() -> TestResult {
     assert_eq!(st, 403);
     // non-API paths never get CORS headers
     let (_, _, h) = req(
-        &server,
+        &cors,
         reqwest::Method::GET,
         "/o/r.git/info/refs?service=git-upload-pack",
         &[("Origin", "https://x.docs.example.com")],
@@ -285,7 +302,7 @@ async fn v1_surface_and_browser_lane() -> TestResult {
     assert_eq!(hdr(&h, "access-control-allow-origin"), "");
     // the browser lane is the same surface under /api-browser (D27)
     let (st, _, h) = req(
-        &server,
+        &cors,
         reqwest::Method::GET,
         "/o/r/api-browser/refs",
         &[("Origin", "https://x.docs.example.com")],
@@ -484,40 +501,74 @@ async fn d26_prefix_form_matches_v1_alias() -> TestResult {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn repository_delete_requires_admin() -> TestResult {
+/// D51: a token server where `root` is a site admin and `writer` may create repositories
+/// under its own login only.
+async fn writer_and_admin() -> anyhow::Result<Server> {
+    let token = |user: &str, admin: bool| walgit_config::StaticToken {
+        user: user.into(),
+        token: format!("{user}-token"),
+        token_env: None,
+        write: true,
+        admin,
+    };
     let server = Server::start_with_tweak(|c| {
         c.server.auth.mode = walgit_config::AuthMode::Token;
         c.server.auth.anonymous_read = false;
-        c.server.auth.tokens = vec![
-            walgit_config::StaticToken {
-                principal: "writer".into(),
-                token: "writer-token".into(),
-                token_env: None,
-                write: true,
-                admin: false,
-            },
-            walgit_config::StaticToken {
-                principal: "admin".into(),
-                token: "admin-token".into(),
-                token_env: None,
-                write: true,
-                admin: true,
-            },
-        ];
+        c.server.auth.tokens = vec![token("writer", false), token("root", true)];
     })
     .await?;
+    server.create_users(&["writer", "root"]).await?;
+    Ok(server)
+}
 
+/// Grant `writer` `role` on `repo` (as the site admin).
+async fn grant_writer(server: &Server, repo: &str, role: &str) -> anyhow::Result<()> {
+    let r = reqwest::Client::new()
+        .put(format!("{}/{repo}/api/access", server.base_url))
+        .bearer_auth("root-token")
+        .json(&serde_json::json!({
+            "visibility": "private",
+            "collaborators": [{"login": "writer", "role": role}],
+        }))
+        .send()
+        .await?;
+    anyhow::ensure!(
+        r.status() == 200,
+        "grant: {} {}",
+        r.status(),
+        r.text().await?
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repository_delete_requires_admin() -> TestResult {
+    let server = writer_and_admin().await?;
     let writer = [("Authorization", "Bearer writer-token")];
-    let admin = [("Authorization", "Bearer admin-token")];
+    let admin = [("Authorization", "Bearer root-token")];
 
+    // D51: host `write` creates under your own login; an unowned namespace is a site admin's.
     assert_eq!(
-        req(&server, reqwest::Method::PUT, "/secure/delete/api", &writer,)
+        req(&server, reqwest::Method::PUT, "/writer/mine/api", &writer)
             .await?
             .0,
         201,
-        "write permission still creates repositories"
+        "write permission creates repositories under your own login"
     );
+    assert_eq!(
+        req(&server, reqwest::Method::PUT, "/secure/delete/api", &writer)
+            .await?
+            .0,
+        403,
+        "but not in someone else's namespace"
+    );
+    assert_eq!(
+        req(&server, reqwest::Method::PUT, "/secure/delete/api", &admin)
+            .await?
+            .0,
+        201
+    );
+    grant_writer(&server, "secure/delete", "maintain").await?;
 
     for path in [
         "/secure/delete",
@@ -533,7 +584,7 @@ async fn repository_delete_requires_admin() -> TestResult {
         );
     }
     assert_eq!(
-        req(&server, reqwest::Method::GET, "/secure/delete/api", &writer,)
+        req(&server, reqwest::Method::GET, "/secure/delete/api", &writer)
             .await?
             .0,
         200,
@@ -545,72 +596,83 @@ async fn repository_delete_requires_admin() -> TestResult {
             &server,
             reqwest::Method::DELETE,
             "/secure/delete/api",
-            &admin,
+            &admin
         )
         .await?
         .0,
         204
     );
     assert_eq!(
-        req(&server, reqwest::Method::GET, "/secure/delete/api", &admin,)
+        req(&server, reqwest::Method::GET, "/secure/delete/api", &admin)
             .await?
             .0,
         404
     );
+    // The owner of a namespace administers its repositories.
+    assert_eq!(
+        req(
+            &server,
+            reqwest::Method::DELETE,
+            "/writer/mine/api",
+            &writer
+        )
+        .await?
+        .0,
+        204
+    );
     Ok(())
 }
 
-/// D24 and API.md §5: on the JSON surface a write token creates repositories,
-/// but the policy and settings documents move only with admin.
+/// D51 and API.md §5: settings move with Maintain, `policy.json` only with Admin.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn policy_and_settings_writes_require_admin() -> TestResult {
+async fn policy_and_settings_writes_require_their_roles() -> TestResult {
     const POLICY: &str = r#"{"version":1,"groups":[],"rules":[]}"#;
     const SETTINGS: &str = "[packs]\nfold_when_fresh_packs_reach = 3\n";
-    let server = Server::start_with_tweak(|c| {
-        c.server.auth.mode = walgit_config::AuthMode::Token;
-        c.server.auth.anonymous_read = false;
-        c.server.auth.tokens = vec![
-            walgit_config::StaticToken {
-                principal: "writer".into(),
-                token: "writer-token".into(),
-                token_env: None,
-                write: true,
-                admin: false,
-            },
-            walgit_config::StaticToken {
-                principal: "admin".into(),
-                token: "admin-token".into(),
-                token_env: None,
-                write: true,
-                admin: true,
-            },
-        ];
-    })
-    .await?;
+    let server = writer_and_admin().await?;
     let writer = [("Authorization", "Bearer writer-token")];
-    let admin = [("Authorization", "Bearer admin-token")];
+    let admin = [("Authorization", "Bearer root-token")];
     assert_eq!(
-        req(&server, reqwest::Method::PUT, "/gates/repo/api", &writer)
+        req(&server, reqwest::Method::PUT, "/gates/repo/api", &admin)
             .await?
             .0,
-        201,
-        "write permission creates the repository"
+        201
     );
+    grant_writer(&server, "gates/repo", "write").await?;
 
     for (path, body) in [
         ("/gates/repo/api/policy", POLICY),
         ("/gates/repo/api/settings", SETTINGS),
     ] {
         let (st, text) = req_body(&server, reqwest::Method::PUT, path, &writer, body).await?;
-        assert_eq!(st, 403, "a write token must not PUT {path}: {text}");
+        assert_eq!(st, 403, "Write must not PUT {path}: {text}");
         assert_eq!(
             req(&server, reqwest::Method::DELETE, path, &writer)
                 .await?
                 .0,
             403,
-            "a write token must not DELETE {path}"
+            "Write must not DELETE {path}"
         );
     }
+    // Maintain moves settings, not the policy.
+    grant_writer(&server, "gates/repo", "maintain").await?;
+    let (st, text) = req_body(
+        &server,
+        reqwest::Method::PUT,
+        "/gates/repo/api/settings",
+        &writer,
+        SETTINGS,
+    )
+    .await?;
+    assert_eq!(st, 200, "{text}");
+    let (st, text) = req_body(
+        &server,
+        reqwest::Method::PUT,
+        "/gates/repo/api/policy",
+        &writer,
+        POLICY,
+    )
+    .await?;
+    assert_eq!(st, 403, "{text}");
     let (st, text) = req_body(
         &server,
         reqwest::Method::PUT,
@@ -620,14 +682,5 @@ async fn policy_and_settings_writes_require_admin() -> TestResult {
     )
     .await?;
     assert_eq!(st, 204, "{text}");
-    let (st, text) = req_body(
-        &server,
-        reqwest::Method::PUT,
-        "/gates/repo/api/settings",
-        &admin,
-        SETTINGS,
-    )
-    .await?;
-    assert_eq!(st, 200, "{text}");
     Ok(())
 }

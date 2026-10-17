@@ -30,6 +30,7 @@
     clippy::used_underscore_binding
 )]
 
+pub mod access;
 pub mod admin;
 pub mod auth;
 pub mod bridge;
@@ -48,6 +49,7 @@ pub mod middleware;
 pub mod ops;
 pub mod pack_lifecycle;
 pub mod packfile_uri;
+pub mod passwords;
 pub mod pktline;
 pub mod policy;
 pub mod prewarm;
@@ -84,7 +86,11 @@ pub struct AppState {
     pub cfg: Arc<walgit_config::Config>,
     pub store: DynStore,
     pub registry: Arc<walgit_wal::Registry>,
+    /// D51: the account log (user directory), opened on first use.
+    pub accounts: Arc<walgit_wal::accounts::Accounts>,
     pub auth: Arc<auth::Authenticator>,
+    /// D52: failed password sign-ins (in memory, per instance).
+    pub throttle: passwords::Throttle,
     pub semaphores: middleware::RepoSemaphores,
     /// HTTP requests in flight (counted until the response body is done); on the watchdog line.
     pub inflight: Arc<middleware::Inflight>,
@@ -120,8 +126,10 @@ impl AppState {
         Ok(Arc::new(Self {
             cfg: cfg.clone(),
             store,
+            accounts: walgit_wal::accounts::Accounts::new(registry.clone()),
             registry,
             auth: auth::Authenticator::new(&cfg),
+            throttle: passwords::Throttle::default(),
             semaphores: middleware::RepoSemaphores::new(cfg.server.max_concurrent_per_repo),
             inflight: Arc::new(middleware::Inflight::default()),
             caches: cache::ServerCaches::new(&cfg),
@@ -149,8 +157,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .quality(tower_http::CompressionLevel::Fastest);
     // Nothing with content is public: the SPA shell/assets, installer, credential
     // helper and metrics all sit behind `web::require_auth` (identity from a
-    // bearer token or a session cookie). The JSON API and git
-    // endpoints do their own `require_read`/`require_write`; `/_auth/*` is the
+    // bearer token or a session cookie). Every repository route (JSON API, git, LFS,
+    // forge) is authorized by `access::authorize` (D51); `/_auth/*` is the
     // login flow itself; `/services/public/*` is the installer a not-yet-signed-in
     // user needs.
     // `/healthz` and `/readyz` stay open: a startup probe carries no
@@ -211,6 +219,13 @@ pub fn router(state: Arc<AppState>) -> Router {
             ),
         )
         .fallback(dispatch)
+        // D51: one revalidation per repository per request (`access::authorize` syncs; the
+        // handler's own sync reuses it).
+        .layer(axum::middleware::from_fn(
+            |req: Request<Body>, next: axum::middleware::Next| {
+                walgit_wal::request_scope(next.run(req))
+            },
+        ))
         // Sliding browser sessions: re-issue a session cookie older than ttl/4.
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -238,6 +253,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
             axum::http::HeaderName::from_static("x-walgit-server"),
             axum::http::HeaderValue::from_static(instance::server_header(&state.cfg)),
+        ))
+        // D51 security 3: `mode = none` answers only direct local requests (inside the
+        // `Host` normalization below, so HTTP/2 is judged by its `:authority`).
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            access::local_only,
         ))
         // HTTP/2 carries the host in `:authority`, not `Host`; normalize so every
         // handler can build public URLs from `Host`.
@@ -599,12 +620,16 @@ pub async fn serve(
     };
     let serving = async move {
         if let Some(t) = tls {
+            use axum::serve::ListenerExt;
+            // `tap_io` (a no-op here) is what gives a custom listener's peer address to
+            // `ConnectInfo` — `access::local_only` and the accel loopback check need it.
             axum::serve(
                 tls::TlsListener {
                     tcp: listener,
                     acceptor: t.acceptor.clone(),
-                },
-                app,
+                }
+                .tap_io(|_| {}),
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
             .with_graceful_shutdown(graceful)
             .await

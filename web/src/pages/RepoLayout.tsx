@@ -56,6 +56,25 @@ function TabCount({ full, which }: { full: string; which: "open_issues" | "open_
   return n > 0 ? <span className="tab-count">{n}</span> : null;
 }
 
+/** D51: "Private" / "Internal" beside the name (nothing for public); quiet like `TabCount`. */
+function VisibilityBadge({ full }: { full: string }) {
+  const [v, setV] = useState("public");
+  useEffect(() => {
+    let live = true;
+    client
+      .repo(full)
+      .get()
+      .then(
+        (s) => live && setV(s.visibility),
+        () => {},
+      );
+    return () => {
+      live = false;
+    };
+  }, [full]);
+  return v === "public" ? null : <span className="visibility-badge">{v === "private" ? "Private" : "Internal"}</span>;
+}
+
 export interface RepoCtx {
   owner: string;
   name: string;
@@ -105,6 +124,7 @@ export function RepoLayout() {
           <Link to={`/${full}`} className="strong">
             {repo}
           </Link>
+          <VisibilityBadge full={full} />
         </h1>
         <CloneMenu full={full} />
         <nav className="tabs">

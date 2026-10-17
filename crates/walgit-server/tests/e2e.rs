@@ -2122,7 +2122,7 @@ async fn public_lane_serves_only_the_installer_without_auth() -> TestResult {
         c.server.auth.mode = walgit_config::AuthMode::Token;
         c.server.auth.anonymous_read = false;
         c.server.auth.tokens = vec![walgit_config::StaticToken {
-            principal: "dev@example.com".into(),
+            user: "dev".into(),
             token: "dev".into(),
             token_env: None,
             write: true,
@@ -2130,6 +2130,7 @@ async fn public_lane_serves_only_the_installer_without_auth() -> TestResult {
         }];
     })
     .await?;
+    server.create_users(&["dev"]).await?;
     let c = reqwest::Client::new();
     let r = c
         .get(format!(
@@ -2182,14 +2183,16 @@ async fn stale_cached_credential_is_erased_by_the_401_and_replaced_on_the_next_c
         c.server.auth.mode = walgit_config::AuthMode::Token;
         c.server.auth.anonymous_read = false;
         c.server.auth.tokens = vec![walgit_config::StaticToken {
-            principal: "dev@example.com".into(),
+            user: "dev".into(),
             token: "fresh".into(),
             token_env: None,
             write: true,
-            admin: false,
+            // Site admin: this test is about credentials, not where it may create.
+            admin: true,
         }];
     })
     .await?;
+    server.create_users(&["dev"]).await?;
     let r = reqwest::Client::new()
         .put(format!("{}/t/stale.git", server.base_url))
         .header("Authorization", "Bearer fresh")

@@ -1,6 +1,8 @@
 //! WAL: index (`manifest.pb`), immutable entries, linearizable publish via CAS,
 //! catch-up/materialize of local repos, ref snapshots. See AGENTS.md §2 and AGENTS.md §2.
 
+pub mod access;
+pub mod accounts;
 mod checkpoint;
 mod classification;
 mod closure;
@@ -23,7 +25,7 @@ pub mod tasks;
 pub use checkpoint::{CheckpointTrigger, checkpoint_due};
 pub use classification::PackClassification;
 pub use error::{CoordError, RefError, WalError};
-pub use handle::{ObjectAccess, RepoHandle};
+pub use handle::{ObjectAccess, RepoHandle, carry_request_fresh, request_scope};
 pub use progress::{Progress, Reporter};
 pub use publish::PublishResult;
 pub use registry::{EvictReport, Registry};

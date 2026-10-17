@@ -861,6 +861,8 @@ async fn test_orphan_log_invisible_and_cleaned() {
         meta: HashMap::new(),
         settings: None,
         forge: Vec::new(),
+        account: Vec::new(),
+        access: None,
     };
     let orphan_bytes = walgit_proto::frame::encode_entries(std::iter::once(&orphan_entry));
     let orphan_key = walgit_proto::keys::log_segment_key(99);
@@ -2999,6 +3001,7 @@ fn forge_ev(
     walgit_proto::v1::ForgeEvent {
         number,
         actor: String::new(),
+        actor_id: String::new(),
         body: Some(body),
     }
 }
@@ -3052,14 +3055,13 @@ async fn test_forge_numbers_preconditions_and_checkpoint_cold_start() {
     let id = repo_id("test", "forge");
     let a = registry_a.create(&id, ObjectFormat::Sha1).await.unwrap();
     let b = registry_b.open(&id).await.unwrap();
-    let alice = Actor {
-        name: "alice".into(),
-        write: false,
+    let user = |login: &str| Actor {
+        login: login.into(),
+        user_id: login.into(),
+        owner_admin: false,
     };
-    let bob = Actor {
-        name: "bob".into(),
-        write: false,
-    };
+    let alice = user("alice");
+    let bob = user("bob");
 
     let opens = |h: Arc<walgit_wal::RepoHandle>| {
         let alice = alice.clone();
@@ -3147,8 +3149,9 @@ async fn test_forge_push_is_all_or_nothing() {
         .await
         .unwrap();
     let writer = Actor {
-        name: "w".into(),
-        write: true,
+        login: "w".into(),
+        user_id: "w".into(),
+        owner_admin: true,
     };
     handle
         .publish_forge(writer.clone(), vec![forge_issue("tracked")])
@@ -3187,4 +3190,251 @@ async fn test_forge_push_is_all_or_nothing() {
     assert!(r.seq == 0 && r.per_ref.iter().any(|(_, x)| x.is_err()));
     handle.forge_ensure().await.unwrap();
     assert_eq!(handle.forge_read(|s| s.items[&1].state), "open");
+}
+
+// ---- D51 accounts and access ----
+
+fn sign_up(user_id: &str, login: &str) -> Vec<walgit_proto::v1::AccountEvent> {
+    use walgit_proto::v1::{AccountEvent, IdentityLinked, UserCreated, account_event::Body};
+    vec![
+        AccountEvent {
+            body: Some(Body::UserCreated(UserCreated {
+                user_id: user_id.into(),
+                login: login.into(),
+                ..Default::default()
+            })),
+        },
+        AccountEvent {
+            body: Some(Body::IdentityLinked(IdentityLinked {
+                user_id: user_id.into(),
+                issuer: "https://id.test".into(),
+                subject: format!("sub-{user_id}"),
+            })),
+        },
+    ]
+}
+
+/// Two instances race for the genesis entry and for one username: one genesis, exactly one
+/// owner of the name, namespaces that held repositories stay reserved, and a third instance
+/// cold-starts the same directory from the account log's checkpoint + tail.
+#[tokio::test]
+async fn test_accounts_signup_race_reservation_and_cold_start() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let registry = |dir: &str| {
+        Registry::new(
+            store.clone(),
+            Arc::new(make_config(&cache.path().join(dir), 0)),
+        )
+    };
+    let (ra, rb) = (registry("a"), registry("b"));
+    // A repository from before accounts existed: its namespace must end up reserved.
+    ra.create(&repo_id("examples", "old"), ObjectFormat::Sha1)
+        .await
+        .unwrap();
+    let (a, b) = (
+        walgit_wal::accounts::Accounts::new(ra.clone()),
+        walgit_wal::accounts::Accounts::new(rb.clone()),
+    );
+    let (ha, hb) = tokio::join!(a.synced(), b.synced());
+    let (ha, hb) = (ha.unwrap(), hb.unwrap());
+
+    let attempts = (0..8).map(|i| {
+        let h = if i % 2 == 0 { ha.clone() } else { hb.clone() };
+        async move {
+            h.publish_accounts(sign_up(&format!("u{i}"), "racer"), "test")
+                .await
+        }
+    });
+    let results = futures::future::join_all(attempts).await;
+    let won = results.iter().filter(|r| r.is_ok()).count();
+    assert_eq!(won, 1, "exactly one sign-up owns the name: {results:?}");
+    assert!(
+        results
+            .iter()
+            .all(|r| r.is_ok() || matches!(r, Err(walgit_wal::WalError::Invalid(_)))),
+        "the losers are refused cleanly: {results:?}"
+    );
+    // Security 1: the pre-existing namespace is reserved for an org, never a sign-up.
+    let r = hb.publish_accounts(sign_up("u9", "examples"), "test").await;
+    assert!(matches!(r, Err(walgit_wal::WalError::Invalid(_))), "{r:?}");
+
+    // Security 1, the race between a sign-up and a site admin's repository: exactly one wins.
+    let (reserve, signup) = tokio::join!(
+        a.reserve("racens", "admin"),
+        hb.publish_accounts(sign_up("u10", "racens"), "test")
+    );
+    assert!(
+        reserve.is_ok() != signup.is_ok(),
+        "reserve {reserve:?} xor sign-up {signup:?}"
+    );
+
+    // Cold start from a checkpoint of the account log.
+    ha.write_checkpoint().await.unwrap();
+    let cp = ha.manifest().checkpoint.clone().unwrap();
+    assert!(
+        !cp.accounts_key.is_empty(),
+        "the checkpoint carries the directory"
+    );
+    hb.publish_accounts(sign_up("u11", "after"), "test")
+        .await
+        .unwrap();
+    let c = walgit_wal::accounts::Accounts::new(registry("c"));
+    let hc = c.synced().await.unwrap();
+    let logins = |h: &walgit_wal::RepoHandle| {
+        h.accounts_read(|s| {
+            s.users
+                .values()
+                .map(|u| u.login.clone())
+                .collect::<Vec<_>>()
+        })
+    };
+    hb.accounts_ensure().await.unwrap();
+    let mut want = logins(&hb);
+    let mut got = logins(&hc);
+    want.sort();
+    got.sort();
+    assert_eq!(got, want);
+    assert!(got.contains(&"racer".to_string()) && got.contains(&"after".to_string()));
+    hc.accounts_read(|s| {
+        assert_eq!(
+            s.namespace("examples"),
+            walgit_wal::accounts::Namespace::Reserved
+        );
+        assert_eq!(
+            s.user_by_identity("https://id.test", "sub-u11")
+                .map(|u| u.login.as_str()),
+            Some("after")
+        );
+    });
+}
+
+/// Security 4: a push or a forge write is judged by the access at its CAS basis. Access
+/// revoked before the CAS refuses it (nothing published); revoked after, the write stands.
+#[tokio::test]
+async fn test_access_revoked_before_the_cas_refuses_the_write() {
+    use walgit_proto::v1::{AccessRole, RepoAccess, Visibility};
+    use walgit_wal::forge::Actor;
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let ra = Registry::new(
+        store.clone(),
+        Arc::new(make_config(&cache.path().join("a"), 0)),
+    );
+    let rb = Registry::new(
+        store.clone(),
+        Arc::new(make_config(&cache.path().join("b"), 0)),
+    );
+    let access = |bob: Option<AccessRole>| RepoAccess {
+        visibility: Visibility::Private as i32,
+        collaborators: bob
+            .map(|r| ("bob".to_string(), r as i32))
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let id = repo_id("alice", "secret");
+    let a = ra
+        .create_with_access(
+            &id,
+            ObjectFormat::Sha1,
+            Some(access(Some(AccessRole::Write))),
+        )
+        .await
+        .unwrap();
+    let b = rb.open(&id).await.unwrap();
+    let bob = Actor {
+        login: "bob".into(),
+        user_id: "bob".into(),
+        owner_admin: false,
+    };
+    let work = WorkRepo::new();
+    let c1 = work.commit("one", "1");
+    let pack = ingest_pack_data(&a, work.create_pack()).await;
+    let r = a
+        .publish_push_as(
+            bob.clone(),
+            pack,
+            make_txn(vec![("refs/heads/main", "", &c1)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    assert!(r.seq > 0, "bob can write");
+    a.publish_forge(bob.clone(), vec![forge_issue("tracked")])
+        .await
+        .unwrap();
+
+    // Another instance revokes bob. `a` hasn't seen it: the push's first attempt uses its
+    // stale basis, loses the CAS, and the retry's basis refuses it.
+    drop(b.sync_refs().await.unwrap());
+    b.publish_access(access(None), None).await.unwrap();
+    let c2 = work.commit("two", "2");
+    let pack = ingest_pack_data(&a, work.create_pack()).await;
+    let r = a
+        .publish_push_as(
+            bob.clone(),
+            pack,
+            make_txn(vec![("refs/heads/main", &c1, &c2)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.seq, 0, "nothing published");
+    assert!(
+        r.per_ref.iter().all(|(_, x)| matches!(
+            x,
+            Err(walgit_wal::RefError::Rejected(m)) if m.contains("permission changed")
+        )),
+        "{:?}",
+        r.per_ref
+            .iter()
+            .map(|(n, x)| format!("{n}: {x:?}"))
+            .collect::<Vec<_>>()
+    );
+    let r = a
+        .publish_forge(bob.clone(), vec![forge_comment(1, "hi")])
+        .await;
+    assert!(matches!(r, Err(walgit_wal::WalError::Invalid(_))), "{r:?}");
+    drop(b.sync_refs().await.unwrap());
+    assert_eq!(
+        b.local().ref_view().unwrap().get("refs/heads/main"),
+        Some(c1.clone())
+    );
+
+    // Granted again, bob's push lands; a revocation after it leaves it standing.
+    b.publish_access(access(Some(AccessRole::Write)), None)
+        .await
+        .unwrap();
+    // `publish_push_as` is called right after the request's sync (receive-pack's contract).
+    drop(a.sync_refs().await.unwrap());
+    let pack = ingest_pack_data(&a, work.create_pack()).await;
+    let r = a
+        .publish_push_as(
+            bob.clone(),
+            pack,
+            make_txn(vec![("refs/heads/main", &c1, &c2)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        r.seq > 0,
+        "{:?}",
+        r.per_ref
+            .iter()
+            .map(|(_, x)| format!("{x:?}"))
+            .collect::<Vec<_>>()
+    );
+    b.publish_access(access(None), None).await.unwrap();
+    drop(b.sync_refs().await.unwrap());
+    assert_eq!(
+        b.local().ref_view().unwrap().get("refs/heads/main"),
+        Some(c2)
+    );
+    // The access history: revision 1 at creation's first publish, then each change.
+    assert_eq!(b.access().map(|x| x.revision), Some(3));
+    // A stale edit is refused.
+    let r = b.publish_access(access(None), Some(1)).await;
+    assert!(matches!(r, Err(walgit_wal::WalError::Invalid(_))), "{r:?}");
 }

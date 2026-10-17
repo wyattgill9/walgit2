@@ -1,5 +1,5 @@
-//! Authentication: `none` / `token` / `oidc`. Resolves a request to a
-//! [`Principal`] (name + write bit).
+//! Authentication: `none` / `token` / `oidc`. Resolves a request to a [`Credential`]:
+//! what it proved. `crate::access` turns that into an account and decides what it may do.
 //!
 //! * **`token`** — static tokens from the config, presented as `Authorization:
 //!   Bearer <token>` or as the password of HTTP Basic (any user name).
@@ -50,26 +50,48 @@ fn unix_now() -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
-/// A resolved principal. `write` is false for anonymous read.
+/// What a request proved about who sent it (D51). `crate::access::authenticate` resolves it
+/// against the account log into a `Subject`: the account plus the host's flags.
 #[derive(Debug, Clone)]
-pub struct Principal {
-    pub name: String,
-    pub write: bool,
-    /// Repository deletion and PUT/DELETE settings and `policy.json`.
-    /// Independent of `write` (push and repository creation).
-    pub admin: bool,
-    pub anonymous: bool,
+pub enum Credential {
+    Anonymous,
+    /// `mode = none`: the one implicit local user, site admin (loopback only, D51).
+    Local,
+    /// A static token from the config, bound to the account with login `user`. Its flags are
+    /// the token's own (a read-only token of a writer stays read-only).
+    Token {
+        user: String,
+        write: bool,
+        admin: bool,
+    },
+    /// A walgit session cookie or access token, or an end user a trusted front forwarded:
+    /// the account itself.
+    Account {
+        user_id: String,
+    },
+    /// A verified ID token: a bearer, or the one the sign-in callback received.
+    Identity(Identity),
 }
 
-impl Principal {
-    pub fn anonymous() -> Self {
-        Self {
-            name: "anonymous".to_string(),
-            write: false,
-            admin: false,
-            anonymous: true,
-        }
-    }
+/// A verified sign-in identity: `(issuer, subject)` is what links it to an account.
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+pub struct Identity {
+    pub issuer: String,
+    pub subject: String,
+    pub email: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub picture: String,
+}
+
+/// Host flags an email earns under the oidc policy.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EmailFlags {
+    /// May create repositories (`write_domains`; all allowed emails when unset).
+    pub can_create: bool,
+    /// Site admin (`admin_emails` / `admin_domains`).
+    pub site_admin: bool,
 }
 
 /// A JWKS public key: RSA or EC P-256.
@@ -379,6 +401,7 @@ pub struct Authenticator {
     access_token_ttl: Duration,
     oauth_client_id: Option<String>,
     oauth_client_secret: Option<String>,
+    passwords: walgit_config::PasswordAccounts,
 }
 
 impl Authenticator {
@@ -456,6 +479,7 @@ impl Authenticator {
             access_token_ttl: auth.access_token_ttl,
             oauth_client_id,
             oauth_client_secret: auth.oauth_client_secret.clone().filter(|s| !s.is_empty()),
+            passwords: auth.passwords,
         })
     }
 
@@ -468,16 +492,27 @@ impl Authenticator {
         self.mode
     }
 
-    /// Browser sign-in is available when an OAuth client and a session secret exist.
-    pub fn browser_login_enabled(&self) -> bool {
+    /// Browser sign-in through the identity provider: an OAuth client and a session secret.
+    pub fn oidc_login_enabled(&self) -> bool {
         self.mode == AuthMode::Oidc
             && self.session_secret.is_some()
             && self.oauth_client_id.is_some()
             && self.oauth_client_secret.is_some()
     }
-    /// walgit-issued access tokens can be minted (and verified) on this host.
+    /// D52: who creates password accounts (`off` = none).
+    pub fn passwords(&self) -> walgit_config::PasswordAccounts {
+        self.passwords
+    }
+    /// A browser can sign in here: through the identity provider, or with a password (D52).
+    pub fn browser_login_enabled(&self) -> bool {
+        self.oidc_login_enabled()
+            || (self.passwords != walgit_config::PasswordAccounts::Off
+                && self.session_secret.is_some())
+    }
+    /// walgit-issued access tokens can be minted (and verified) on this host: any mode with
+    /// accounts and a session secret.
     pub fn issued_tokens_enabled(&self) -> bool {
-        self.mode == AuthMode::Oidc && self.session_secret.is_some()
+        self.mode != AuthMode::None && self.session_secret.is_some()
     }
     pub fn oauth_client(&self) -> Option<(&str, &str)> {
         Some((
@@ -532,14 +567,15 @@ impl Authenticator {
         Some(payload)
     }
 
-    /// `kind\nexp\niat\nemail`, signed. Shared shape of the cookie (`session`) and of issued
-    /// tokens (`token`); the kind keeps them apart so a cookie value never works as a bearer.
-    fn mint(&self, email: &str, ttl: Duration, kind: &str) -> Option<String> {
+    /// `kind\nexp\niat\nvalue`, signed. Shared shape of the cookie (`session`), of issued
+    /// tokens (`token`) and of the pending sign-up (`pending`); the kind keeps them apart so
+    /// a cookie value never works as a bearer.
+    fn mint(&self, value: &str, ttl: Duration, kind: &str) -> Option<String> {
         let now = unix_now()?;
         let exp = now + ttl.as_secs();
-        self.sign(format!("{kind}\n{exp}\n{now}\n{email}").as_bytes())
+        self.sign(format!("{kind}\n{exp}\n{now}\n{value}").as_bytes())
     }
-    /// `(exp, iat, email)` of a valid, unexpired signed value of `kind`.
+    /// `(exp, iat, value)` of a valid, unexpired signed value of `kind`.
     fn claims_of(&self, value: &str, kind: &str) -> Option<(u64, u64, String)> {
         let payload = self.verify_signed(value)?;
         let payload = String::from_utf8(payload).ok()?;
@@ -549,33 +585,34 @@ impl Authenticator {
         }
         let exp: u64 = parts.next()?.parse().ok()?;
         let iat: u64 = parts.next()?.parse().ok()?;
-        let email = parts.next()?.to_string();
+        let value = parts.next()?.to_string();
         if unix_now()? >= exp {
             return None;
         }
-        Some((exp, iat, email))
+        Some((exp, iat, value))
     }
 
-    /// Mint a session cookie value for `email`.
-    pub fn session_cookie_value(&self, email: &str) -> Option<String> {
-        self.mint(email, self.session_ttl, "session")
+    /// Mint a session cookie value for the account `user_id`.
+    pub fn session_cookie_value(&self, user_id: &str) -> Option<String> {
+        self.mint(user_id, self.session_ttl, "session")
     }
 
-    /// Mint a walgit access token for `email` (`wgt_…`), valid `access_token_ttl`.
-    pub fn access_token(&self, email: &str) -> Option<String> {
+    /// Mint a walgit access token for the account `user_id` (`wgt_…`), valid
+    /// `access_token_ttl`.
+    pub fn access_token(&self, user_id: &str) -> Option<String> {
         if !self.issued_tokens_enabled() {
             return None;
         }
         Some(format!(
             "{ACCESS_TOKEN_PREFIX}{}",
-            self.mint(email, self.access_token_ttl, "token")?
+            self.mint(user_id, self.access_token_ttl, "token")?
         ))
     }
-    /// `(exp, email)` of a valid access token.
+    /// `(exp, user_id)` of a valid access token.
     pub fn access_token_claims(&self, token: &str) -> Option<(u64, String)> {
         let raw = token.strip_prefix(ACCESS_TOKEN_PREFIX)?;
-        let (exp, _, email) = self.claims_of(raw, "token")?;
-        Some((exp, email))
+        let (exp, _, user_id) = self.claims_of(raw, "token")?;
+        Some((exp, user_id))
     }
 
     fn session_claims(&self, headers: &HeaderMap) -> Option<(u64, u64, String)> {
@@ -583,45 +620,42 @@ impl Authenticator {
         self.claims_of(&raw, "session")
     }
 
-    /// Principal from a valid, unexpired session cookie (policy re-applied).
-    fn authenticate_cookie(&self, headers: &HeaderMap) -> Option<Principal> {
-        let (_, _, email) = self.session_claims(headers)?;
-        self.principal_for_email(email).ok()
-    }
-
-    /// Sliding sessions: a fresh cookie value when the request carries a valid
-    /// session older than a quarter of `session_ttl` whose principal still
-    /// passes policy — `None` otherwise.
+    /// Sliding sessions: a fresh cookie value when the request carries a valid session older
+    /// than a quarter of `session_ttl`. Policy is not decided here: every use resolves the
+    /// account and re-applies it (`access::authenticate`).
     pub fn session_refresh_value(&self, headers: &HeaderMap) -> Option<String> {
-        let (_, iat, email) = self.session_claims(headers)?;
+        let (_, iat, user_id) = self.session_claims(headers)?;
         if unix_now()?.saturating_sub(iat) < self.session_ttl.as_secs() / 4 {
             return None;
         }
-        let principal = self.principal_for_email(email).ok()?;
-        self.session_cookie_value(&principal.name)
+        self.session_cookie_value(&user_id)
+    }
+
+    /// The pending sign-up (D51): a verified identity with no account yet, carried from the
+    /// callback to the choose-a-username page for `PENDING_TTL`. Signed, so only the issuer's
+    /// verified identity can become an account.
+    pub fn pending_value(&self, identity: &Identity) -> Option<String> {
+        let json = serde_json::to_string(identity).ok()?;
+        self.mint(&json, PENDING_TTL, "pending")
+    }
+
+    /// The identity of a valid, unexpired pending sign-up value.
+    pub fn pending_identity(&self, value: &str) -> Option<Identity> {
+        let (_, _, json) = self.claims_of(value, "pending")?;
+        serde_json::from_str(&json).ok()
     }
 
     /// Verify an ID token obtained by the server itself (OAuth callback):
     /// signature, issuer, expiry, `aud == oauth_client_id`, then the domain policy.
-    pub async fn verify_login_id_token(&self, token: &str) -> Result<Principal, AuthError> {
+    pub async fn verify_login_id_token(&self, token: &str) -> Result<Identity, AuthError> {
         let (client_id, _) = self.oauth_client().ok_or(AuthError::Unavailable)?;
         self.verify_id_token(token, &[client_id]).await
     }
 
-    /// Resolve the principal from request headers, applying a forwarded end-user
-    /// identity only after authenticating the forwarding caller.
-    pub async fn authenticate(&self, headers: &HeaderMap) -> Result<Principal, AuthError> {
-        let p = self.authenticate_with_forwarding(headers).await?;
-        // Attach the user to the enclosing `http.request` span so every log
-        // line of this request (store.get, wal.sync, git.*) carries it.
-        tracing::Span::current().record("principal", p.name.as_str());
-        Ok(p)
-    }
-
-    async fn authenticate_with_forwarding(
-        &self,
-        headers: &HeaderMap,
-    ) -> Result<Principal, AuthError> {
+    /// What the request's credentials prove, applying a forwarded end user only after
+    /// authenticating the forwarding caller. Use `crate::access::authenticate`, which
+    /// resolves the account; this is the credential check alone.
+    pub(crate) async fn credential(&self, headers: &HeaderMap) -> Result<Credential, AuthError> {
         let caller = self.authenticate_inner(headers).await?;
         let Some(forwarded) = headers
             .get("x-walgit-principal")
@@ -631,134 +665,95 @@ impl Authenticator {
         else {
             return Ok(caller);
         };
-        if self.mode == AuthMode::None
-            || (caller.write
-                && self
-                    .trusted_forwarders
-                    .iter()
-                    .any(|f| f.eq_ignore_ascii_case(&caller.name)))
+        // A front forwarding a push presents its own token (write) and names the end user's
+        // account; anyone else's header is ignored.
+        if let Credential::Token { user, write, .. } = &caller
+            && *write
+            && self
+                .trusted_forwarders
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(user))
         {
-            return Ok(Principal {
-                name: forwarded.to_string(),
-                write: caller.write,
-                admin: self.is_admin(forwarded),
-                anonymous: false,
+            return Ok(Credential::Account {
+                user_id: forwarded.to_string(),
             });
         }
         Ok(caller)
     }
 
     /// A static token or an issued access token, from a bearer or a Basic password.
-    fn opaque_token_principal(&self, tok: &str) -> Option<Result<Principal, AuthError>> {
+    fn opaque_token(&self, tok: &str) -> Option<Result<Credential, AuthError>> {
         if let Some(st) = self.tokens.iter().find(|t| t.token == tok) {
-            return Some(Ok(Principal {
-                name: st.principal.clone(),
+            return Some(Ok(Credential::Token {
+                user: st.user.clone(),
                 write: st.write,
                 admin: st.admin,
-                anonymous: false,
             }));
         }
         if tok.starts_with(ACCESS_TOKEN_PREFIX) {
             return Some(match self.access_token_claims(tok) {
-                Some((_, email)) => self.principal_for_email(email),
+                Some((_, user_id)) => Ok(Credential::Account { user_id }),
                 None => Err(AuthError::Invalid),
             });
         }
         None
     }
 
-    async fn authenticate_inner(&self, headers: &HeaderMap) -> Result<Principal, AuthError> {
+    async fn authenticate_inner(&self, headers: &HeaderMap) -> Result<Credential, AuthError> {
         match self.mode {
-            AuthMode::None => Ok(Principal {
-                name: "anon".to_string(),
-                write: true,
-                admin: true,
-                anonymous: false,
-            }),
+            AuthMode::None => Ok(Credential::Local),
             AuthMode::Token => {
                 let presented =
                     bearer_token(headers).or_else(|| basic_credentials(headers).map(|(_, p)| p));
                 match presented {
-                    Some(tok) => self
-                        .opaque_token_principal(&tok)
-                        .unwrap_or(Err(AuthError::Invalid)),
-                    None => Ok(Principal::anonymous()),
+                    Some(tok) => self.opaque_token(&tok).unwrap_or(Err(AuthError::Invalid)),
+                    // D52: a password account's browser session.
+                    None => Ok(match self.session_claims(headers) {
+                        Some((_, _, user_id)) => Credential::Account { user_id },
+                        None => Credential::Anonymous,
+                    }),
                 }
             }
             AuthMode::Oidc => {
                 if let Some(tok) = bearer_token(headers) {
-                    if let Some(r) = self.opaque_token_principal(&tok) {
+                    if let Some(r) = self.opaque_token(&tok) {
                         return r;
                     }
-                    return self.verify_id_token(&tok, &[]).await;
+                    return self
+                        .verify_id_token(&tok, &[])
+                        .await
+                        .map(Credential::Identity);
                 }
                 if let Some((_, pass)) = basic_credentials(headers) {
-                    return self
-                        .opaque_token_principal(&pass)
-                        .unwrap_or(Err(AuthError::Invalid));
+                    return self.opaque_token(&pass).unwrap_or(Err(AuthError::Invalid));
                 }
-                // No credentials at all → a browser session cookie may carry identity.
-                self.authenticate_cookie(headers)
-                    .ok_or(AuthError::Unauthorized)
+                // No credentials at all → a browser session cookie may carry the account.
+                Ok(match self.session_claims(headers) {
+                    Some((_, _, user_id)) => Credential::Account { user_id },
+                    None => Credential::Anonymous,
+                })
             }
         }
     }
 
-    /// Require a principal with `write` for git push / LFS upload / repo create.
-    pub async fn require_write(&self, headers: &HeaderMap) -> Result<Principal, AuthError> {
-        let p = self.authenticate(headers).await?;
-        if p.write {
-            Ok(p)
-        } else {
-            Err(AuthError::Forbidden)
-        }
-    }
-
-    /// Require a principal that may delete repositories or mutate settings and `policy.json`.
-    pub async fn require_admin(&self, headers: &HeaderMap) -> Result<Principal, AuthError> {
-        let p = self.authenticate(headers).await?;
-        if p.admin {
-            Ok(p)
-        } else {
-            Err(AuthError::Forbidden)
-        }
-    }
-
-    fn is_admin(&self, name: &str) -> bool {
-        if self.mode == AuthMode::None {
-            return true;
-        }
-        let lower = name.to_ascii_lowercase();
-        if self.admin_emails.iter().any(|e| e == &lower) {
-            return true;
-        }
-        if let Some((_, domain)) = lower.rsplit_once('@')
-            && self.admin_domains.iter().any(|d| d == domain)
-        {
-            return true;
-        }
-        self.tokens
+    /// The host flags of every static token bound to the account `login` (an account's own
+    /// flags when it signs in some other way).
+    pub fn token_flags(&self, login: &str) -> EmailFlags {
+        let mut f = EmailFlags::default();
+        for t in self
+            .tokens
             .iter()
-            .any(|t| t.admin && t.principal.eq_ignore_ascii_case(name))
-    }
-
-    /// Require read access: anonymous read only when `anonymous_read` allows it.
-    pub async fn require_read(&self, headers: &HeaderMap) -> Result<Principal, AuthError> {
-        let p = self.authenticate(headers).await?;
-        if !p.anonymous || self.anonymous_read {
-            Ok(p)
-        } else {
-            Err(AuthError::Unauthorized)
+            .filter(|t| t.user.eq_ignore_ascii_case(login))
+        {
+            f.can_create |= t.write;
+            f.site_admin |= t.admin;
         }
+        f
     }
 
     /// Verify an ID token against the issuer's JWKS. `only_aud` empty = the configured
     /// `audiences`; otherwise exactly `only_aud` (the login callback's own client).
-    async fn verify_id_token(
-        &self,
-        token: &str,
-        only_aud: &[&str],
-    ) -> Result<Principal, AuthError> {
+    async fn verify_id_token(&self, token: &str, only_aud: &[&str]) -> Result<Identity, AuthError> {
         let header = decode_header(token).map_err(|e| {
             tracing::debug!(error = %e, token_len = token.len(), "ID token header decode failed");
             AuthError::Invalid
@@ -797,11 +792,25 @@ impl Authenticator {
             return Err(AuthError::Invalid);
         }
         tracing::debug!(iss = %claims.iss, aud = ?claims.aud, email = %claims.email, "ID token validated");
-        self.principal_for_email(claims.email)
+        self.email_flags(&claims.email)?;
+        if claims.sub.is_empty() {
+            tracing::debug!(email = %claims.email, "ID token has no subject");
+            return Err(AuthError::Invalid);
+        }
+        Ok(Identity {
+            // The configured form: `iss` may be Google's bare-host variant of the same issuer.
+            issuer: self.issuer.clone(),
+            subject: claims.sub,
+            email: claims.email,
+            name: claims.name,
+            picture: claims.picture,
+        })
     }
 
-    /// Apply the domain/email allowlist and `write_domains` policy to a verified email.
-    fn principal_for_email(&self, email: String) -> Result<Principal, AuthError> {
+    /// The oidc policy for a verified email: `Forbidden` outside `allowed_domains` /
+    /// `allowed_emails`, else whether it may create repositories (`write_domains`) and is a
+    /// site admin (`admin_emails` / `admin_domains`). Re-applied on every request.
+    pub fn email_flags(&self, email: &str) -> Result<EmailFlags, AuthError> {
         let Some((_, domain)) = email.rsplit_once('@') else {
             return Err(AuthError::Invalid);
         };
@@ -812,18 +821,19 @@ impl Authenticator {
         if !allowed {
             return Err(AuthError::Forbidden);
         }
-        let write = match &self.write_domains {
-            None => allowed,
-            Some(domains) => domains.iter().any(|d| d == &domain_lower),
-        };
-        Ok(Principal {
-            name: email.clone(),
-            write,
-            admin: self.is_admin(&email),
-            anonymous: false,
+        Ok(EmailFlags {
+            can_create: match &self.write_domains {
+                None => true,
+                Some(domains) => domains.iter().any(|d| d == &domain_lower),
+            },
+            site_admin: self.admin_emails.iter().any(|e| e == &email_lower)
+                || self.admin_domains.iter().any(|d| d == &domain_lower),
         })
     }
 }
+
+/// Lifetime of a pending sign-up: long enough to choose a username.
+const PENDING_TTL: Duration = Duration::from_mins(15);
 
 /// Some issuers (Google) put `iss` both with and without the scheme; accept the bare host
 /// form for any issuer.
@@ -839,10 +849,16 @@ fn issuer_forms(issuer: &str) -> Vec<String> {
 struct IdClaims {
     iss: String,
     #[serde(default)]
+    sub: String,
+    #[serde(default)]
     aud: Option<serde_json::Value>,
     email: String,
     #[serde(default)]
     email_verified: bool,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    picture: String,
 }
 
 #[derive(Debug)]
@@ -851,13 +867,16 @@ pub enum AuthError {
     Unauthorized,
     Forbidden,
     Unavailable,
+    /// A valid credential with no walgit account behind it (D51): what to do about it.
+    /// Retrying the same credential can't help, so git shows it in-band.
+    NoAccount(String),
 }
 
 impl AuthError {
     pub fn status(&self) -> StatusCode {
         match self {
             AuthError::Invalid | AuthError::Unauthorized => StatusCode::UNAUTHORIZED,
-            AuthError::Forbidden => StatusCode::FORBIDDEN,
+            AuthError::Forbidden | AuthError::NoAccount(_) => StatusCode::FORBIDDEN,
             AuthError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
@@ -977,7 +996,7 @@ fn resolve_tokens(tokens: &[StaticToken]) -> Vec<StaticToken> {
                 .and_then(|v| std::env::var(v).ok())
                 .unwrap_or_else(|| t.token.clone());
             StaticToken {
-                principal: t.principal.clone(),
+                user: t.user.clone(),
                 token,
                 token_env: None,
                 write: t.write,
@@ -1061,6 +1080,7 @@ mod tests {
     #[derive(Serialize)]
     struct TestClaims<'a> {
         iss: &'a str,
+        sub: &'a str,
         aud: &'a str,
         exp: usize,
         email: &'a str,
@@ -1127,6 +1147,8 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
     fn token(email: &str, iss: &str, aud: &str, exp: usize, verified: bool) -> String {
         let claims = TestClaims {
             iss,
+            // The subject is the identity: tests use one per email.
+            sub: email,
             aud,
             exp,
             email,
@@ -1156,13 +1178,24 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         })
     }
 
-    fn static_token(principal: &str, token: &str, write: bool) -> StaticToken {
+    fn static_token(user: &str, token: &str, write: bool) -> StaticToken {
         StaticToken {
-            principal: principal.into(),
+            user: user.into(),
             token: token.into(),
             token_env: None,
             write,
             admin: false,
+        }
+    }
+
+    /// The account a credential names: a token's login, an account id, an identity's email.
+    fn who(c: &Credential) -> String {
+        match c {
+            Credential::Anonymous => "anonymous".into(),
+            Credential::Local => "local".into(),
+            Credential::Token { user, .. } => user.clone(),
+            Credential::Account { user_id } => user_id.clone(),
+            Credential::Identity(id) => id.email.clone(),
         }
     }
 
@@ -1176,44 +1209,43 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             static_token("ci", "r0bot", false),
         ];
         let auth = Authenticator::new(&cfg);
-        let p = auth.authenticate(&bearer("s3cret")).await.unwrap();
-        assert_eq!((p.name.as_str(), p.write), ("alice", true));
-        let p = auth
-            .authenticate(&basic("anything", "r0bot"))
-            .await
-            .unwrap();
-        assert_eq!((p.name.as_str(), p.write), ("ci", false));
+        let c = auth.credential(&bearer("s3cret")).await.unwrap();
+        assert!(matches!(c, Credential::Token { ref user, write: true, .. } if user == "alice"));
+        let c = auth.credential(&basic("anything", "r0bot")).await.unwrap();
+        assert!(matches!(c, Credential::Token { ref user, write: false, .. } if user == "ci"));
         assert!(matches!(
-            auth.authenticate(&bearer("nope")).await,
+            auth.credential(&bearer("nope")).await,
             Err(AuthError::Invalid)
         ));
         assert!(matches!(
-            auth.require_read(&HeaderMap::new()).await,
-            Err(AuthError::Unauthorized)
+            auth.credential(&HeaderMap::new()).await,
+            Ok(Credential::Anonymous)
         ));
-        assert!(matches!(
-            auth.require_write(&basic("x", "r0bot")).await,
-            Err(AuthError::Forbidden)
-        ));
+        assert!(auth.token_flags("Alice").can_create && !auth.token_flags("ci").can_create);
     }
 
+    /// The front forwards the end user's account id, honoured only from a trusted token.
     #[tokio::test]
-    async fn forwarded_principal_requires_trusted_caller() {
+    async fn forwarded_account_requires_trusted_caller() {
         let mut cfg = walgit_config::Config::default();
         cfg.server.auth.mode = AuthMode::Token;
-        cfg.server.auth.tokens = vec![static_token("front", "secret", true)];
-        cfg.server.auth.trusted_forwarders = vec!["front".into()];
+        cfg.server.auth.tokens = vec![
+            static_token("front", "secret", true),
+            static_token("ro-front", "ro", false),
+        ];
+        cfg.server.auth.trusted_forwarders = vec!["front".into(), "ro-front".into()];
         let auth = Authenticator::new(&cfg);
         let mut headers = bearer("secret");
-        headers.insert("x-walgit-principal", "user@example.com".parse().unwrap());
-        assert_eq!(
-            auth.authenticate(&headers).await.unwrap().name,
-            "user@example.com"
-        );
+        headers.insert("x-walgit-principal", "user-123".parse().unwrap());
+        assert_eq!(who(&auth.credential(&headers).await.unwrap()), "user-123");
+        // A trusted name without write can't forward.
+        let mut ro = bearer("ro");
+        ro.insert("x-walgit-principal", "user-123".parse().unwrap());
+        assert_eq!(who(&auth.credential(&ro).await.unwrap()), "ro-front");
 
         cfg.server.auth.trusted_forwarders.clear();
         let auth = Authenticator::new(&cfg);
-        assert_eq!(auth.authenticate(&headers).await.unwrap().name, "front");
+        assert_eq!(who(&auth.credential(&headers).await.unwrap()), "front");
     }
 
     #[tokio::test]
@@ -1221,10 +1253,15 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         let source = source();
         let auth = Authenticator::with_key_source(&config(), source.clone());
         let h = bearer(&token("dev@example.com", ISSUER, AUD, 4_000_000_000, true));
-        let principal = auth.authenticate(&h).await.unwrap();
-        assert_eq!(principal.name, "dev@example.com");
-        assert!(principal.write);
-        auth.authenticate(&h).await.unwrap();
+        let Credential::Identity(id) = auth.credential(&h).await.unwrap() else {
+            panic!("an ID token is an identity");
+        };
+        assert_eq!(
+            (id.issuer.as_str(), id.subject.as_str(), id.email.as_str()),
+            (ISSUER, "dev@example.com", "dev@example.com")
+        );
+        assert!(auth.email_flags(&id.email).unwrap().can_create);
+        auth.credential(&h).await.unwrap();
         assert_eq!(source.calls.load(Ordering::Relaxed), 1, "JWKS cached");
 
         for (iss, email, verified, aud) in [
@@ -1235,16 +1272,16 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         ] {
             let h = bearer(&token(email, iss, aud, 4_000_000_000, verified));
             assert!(matches!(
-                auth.authenticate(&h).await,
+                auth.credential(&h).await,
                 Err(AuthError::Invalid | AuthError::Forbidden)
             ));
         }
         let expired = bearer(&token("dev@example.com", ISSUER, AUD, 1, true));
         assert!(matches!(
-            auth.authenticate(&expired).await,
+            auth.credential(&expired).await,
             Err(AuthError::Invalid)
         ));
-        // Google's bare-host issuer form is accepted.
+        // Google's bare-host issuer form is accepted, and names the configured issuer.
         let bare = bearer(&token(
             "dev@example.com",
             "accounts.google.com",
@@ -1252,7 +1289,10 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             4_000_000_000,
             true,
         ));
-        assert!(auth.authenticate(&bare).await.is_ok());
+        let Ok(Credential::Identity(id)) = auth.credential(&bare).await else {
+            panic!("bare-host issuer");
+        };
+        assert_eq!(id.issuer, ISSUER);
     }
 
     #[tokio::test]
@@ -1265,21 +1305,18 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         let auth = Authenticator::with_key_source(&cfg, source());
         for aud in ["a", "b", "web-client"] {
             let h = bearer(&token("dev@example.com", ISSUER, aud, 4_000_000_000, true));
-            assert!(auth.authenticate(&h).await.is_ok(), "aud {aud}");
+            assert!(auth.credential(&h).await.is_ok(), "aud {aud}");
         }
         let h = bearer(&token("dev@example.com", ISSUER, "c", 4_000_000_000, true));
-        assert!(matches!(
-            auth.authenticate(&h).await,
-            Err(AuthError::Invalid)
-        ));
+        assert!(matches!(auth.credential(&h).await, Err(AuthError::Invalid)));
     }
 
     #[tokio::test]
     async fn missing_token_and_jwks_failure() {
         let auth = Authenticator::with_key_source(&config(), source());
         assert!(matches!(
-            auth.authenticate(&HeaderMap::new()).await,
-            Err(AuthError::Unauthorized)
+            auth.credential(&HeaderMap::new()).await,
+            Ok(Credential::Anonymous)
         ));
         let failing = Arc::new(MockSource {
             calls: AtomicUsize::new(0),
@@ -1288,23 +1325,31 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         let auth = Authenticator::with_key_source(&config(), failing);
         let h = bearer(&token("dev@example.com", ISSUER, AUD, 4_000_000_000, true));
         assert!(matches!(
-            auth.authenticate(&h).await,
+            auth.credential(&h).await,
             Err(AuthError::Unavailable)
         ));
     }
 
     #[tokio::test]
-    async fn email_allowlist_and_write_domains() {
+    async fn email_allowlist_write_domains_and_site_admins() {
         let mut cfg = config();
         cfg.server.auth.allowed_domains.clear();
-        cfg.server.auth.allowed_emails = vec!["svc@other.com".into()];
-        cfg.server.auth.write_domains = Some(vec!["other.com".into()]);
+        cfg.server.auth.allowed_emails = vec!["svc@other.com".into(), "boss@other.com".into()];
+        cfg.server.auth.write_domains = Some(vec!["nowhere.com".into()]);
+        cfg.server.auth.admin_emails = vec!["boss@other.com".into()];
         let auth = Authenticator::with_key_source(&cfg, source());
         let h = bearer(&token("svc@other.com", ISSUER, AUD, 4_000_000_000, true));
-        assert!(auth.authenticate(&h).await.unwrap().write);
+        assert!(auth.credential(&h).await.is_ok());
+        let f = auth.email_flags("svc@other.com").unwrap();
+        assert!(!f.can_create && !f.site_admin);
+        assert!(auth.email_flags("Boss@other.com").unwrap().site_admin);
         let h = bearer(&token("else@other.com", ISSUER, AUD, 4_000_000_000, true));
         assert!(matches!(
-            auth.authenticate(&h).await,
+            auth.credential(&h).await,
+            Err(AuthError::Forbidden)
+        ));
+        assert!(matches!(
+            auth.email_flags("else@other.com"),
             Err(AuthError::Forbidden)
         ));
     }
@@ -1315,9 +1360,9 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         source.response.lock().await.as_mut().unwrap().max_age = Duration::ZERO;
         let auth = Authenticator::with_key_source(&config(), source.clone());
         let h = bearer(&token("dev@example.com", ISSUER, AUD, 4_000_000_000, true));
-        assert!(auth.authenticate(&h).await.is_ok());
+        assert!(auth.credential(&h).await.is_ok());
         *source.response.lock().await = Err("offline".into());
-        assert!(auth.authenticate(&h).await.is_ok());
+        assert!(auth.credential(&h).await.is_ok());
     }
 
     #[tokio::test]
@@ -1326,14 +1371,11 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         cfg.server.auth.tokens = vec![static_token("deploy-bot", "r0bot", true)];
         let auth = Authenticator::with_key_source(&cfg, source());
         assert_eq!(
-            auth.authenticate(&bearer("r0bot")).await.unwrap().name,
+            who(&auth.credential(&bearer("r0bot")).await.unwrap()),
             "deploy-bot"
         );
         assert_eq!(
-            auth.authenticate(&basic("git", "r0bot"))
-                .await
-                .unwrap()
-                .name,
+            who(&auth.credential(&basic("git", "r0bot")).await.unwrap()),
             "deploy-bot"
         );
     }
@@ -1344,36 +1386,36 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         cfg.server.auth.session_secret = Some(SECRET.into());
         cfg.server.auth.access_token_ttl = Duration::from_hours(1);
         let auth = Authenticator::with_key_source(&cfg, source());
-        let tok = auth.access_token("dev@example.com").unwrap();
+        let tok = auth.access_token("user-1").unwrap();
         assert!(tok.starts_with(ACCESS_TOKEN_PREFIX));
-        let (exp, email) = auth.access_token_claims(&tok).unwrap();
-        assert_eq!(email, "dev@example.com");
+        let (exp, user_id) = auth.access_token_claims(&tok).unwrap();
+        assert_eq!(user_id, "user-1");
         assert!(exp.abs_diff(unix_now().unwrap() + 3600) <= 2);
         assert_eq!(
-            auth.authenticate(&bearer(&tok)).await.unwrap().name,
-            "dev@example.com"
+            who(&auth.credential(&bearer(&tok)).await.unwrap()),
+            "user-1"
         );
         assert_eq!(
-            auth.authenticate(&basic("x-access-token", &tok))
+            who(&auth
+                .credential(&basic("x-access-token", &tok))
                 .await
-                .unwrap()
-                .name,
-            "dev@example.com"
+                .unwrap()),
+            "user-1"
         );
 
         // Tampered / foreign-secret / wrong kind tokens are Invalid (a real 401: git erases them).
         let mut bad = tok.clone();
         bad.pop();
         assert!(matches!(
-            auth.authenticate(&bearer(&bad)).await,
+            auth.credential(&bearer(&bad)).await,
             Err(AuthError::Invalid)
         ));
         let cookie_as_bearer = format!(
             "{ACCESS_TOKEN_PREFIX}{}",
-            auth.session_cookie_value("dev@example.com").unwrap()
+            auth.session_cookie_value("user-1").unwrap()
         );
         assert!(matches!(
-            auth.authenticate(&bearer(&cookie_as_bearer)).await,
+            auth.credential(&bearer(&cookie_as_bearer)).await,
             Err(AuthError::Invalid)
         ));
         let mut h = HeaderMap::new();
@@ -1387,24 +1429,33 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             .unwrap(),
         );
         assert!(
-            matches!(auth.authenticate(&h).await, Err(AuthError::Unauthorized)),
+            matches!(auth.credential(&h).await, Ok(Credential::Anonymous)),
             "a token is not a session"
         );
-
-        // Policy is re-applied at use: a principal that lost its domain is Forbidden.
-        cfg.server.auth.allowed_domains = vec!["elsewhere.org".into()];
-        let stricter = Authenticator::with_key_source(&cfg, source());
+        // A pending sign-up is neither.
+        let pending = auth
+            .pending_value(&Identity {
+                issuer: ISSUER.into(),
+                subject: "s".into(),
+                email: "dev@example.com".into(),
+                name: String::new(),
+                picture: String::new(),
+            })
+            .unwrap();
         assert!(matches!(
-            stricter.authenticate(&bearer(&tok)).await,
-            Err(AuthError::Forbidden)
+            auth.credential(&bearer(&format!("{ACCESS_TOKEN_PREFIX}{pending}")))
+                .await,
+            Err(AuthError::Invalid)
         ));
+        assert_eq!(auth.pending_identity(&pending).unwrap().subject, "s");
+        assert!(auth.pending_identity(&tok).is_none());
 
         // Without a session secret nothing is minted and every wgt_ token is Invalid.
         cfg.server.auth.session_secret = None;
         let none = Authenticator::with_key_source(&cfg, source());
-        assert!(none.access_token("dev@example.com").is_none());
+        assert!(none.access_token("user-1").is_none());
         assert!(matches!(
-            none.authenticate(&bearer(&tok)).await,
+            none.credential(&bearer(&tok)).await,
             Err(AuthError::Invalid)
         ));
     }
@@ -1433,20 +1484,20 @@ mod session_tests {
         h
     }
 
-    fn session(auth: &Authenticator, exp: u64, iat: u64, email: &str) -> String {
-        auth.sign(format!("session\n{exp}\n{iat}\n{email}").as_bytes())
+    fn session(auth: &Authenticator, exp: u64, iat: u64, user_id: &str) -> String {
+        auth.sign(format!("session\n{exp}\n{iat}\n{user_id}").as_bytes())
             .unwrap()
     }
 
     #[test]
     fn cookie_is_minted_with_exp_and_iat() {
         let auth = auth_with_ttl(30 * 86400);
-        let value = auth.session_cookie_value("u@example.com").unwrap();
+        let value = auth.session_cookie_value("user-1").unwrap();
         let payload = String::from_utf8(auth.verify_signed(&value).unwrap()).unwrap();
         let parts: Vec<&str> = payload.split('\n').collect();
         assert_eq!(parts[0], "session");
         let (exp, iat): (u64, u64) = (parts[1].parse().unwrap(), parts[2].parse().unwrap());
-        assert_eq!(parts[3], "u@example.com");
+        assert_eq!(parts[3], "user-1");
         assert_eq!(exp - iat, 30 * 86400);
         assert!(unix_now().unwrap().abs_diff(iat) <= 2);
         assert_eq!(
@@ -1455,18 +1506,23 @@ mod session_tests {
         );
     }
 
-    #[test]
-    fn sessions_slide_after_a_quarter_of_the_ttl_and_policy_still_rules() {
+    /// Policy is decided at use (`access::authenticate`), so sliding only needs a valid,
+    /// unexpired session.
+    #[tokio::test]
+    async fn sessions_slide_after_a_quarter_of_the_ttl() {
         let auth = auth_with_ttl(400);
         let now = unix_now().unwrap();
-        let young = session(&auth, now + 400, now, "u@example.com");
+        let young = session(&auth, now + 400, now, "user-1");
         assert!(
             auth.session_refresh_value(&headers_with(&young)).is_none(),
             "younger than ttl/4: no refresh"
         );
-        assert!(auth.authenticate_cookie(&headers_with(&young)).is_some());
+        assert!(matches!(
+            auth.credential(&headers_with(&young)).await,
+            Ok(Credential::Account { ref user_id }) if user_id == "user-1"
+        ));
 
-        let old = session(&auth, now + 299, now - 101, "u@example.com");
+        let old = session(&auth, now + 299, now - 101, "user-1");
         let fresh = auth
             .session_refresh_value(&headers_with(&old))
             .expect("older than ttl/4: refreshed");
@@ -1478,29 +1534,21 @@ mod session_tests {
             now + 299
         );
 
-        let expired = session(&auth, now - 1, now - 401, "u@example.com");
-        assert!(auth.authenticate_cookie(&headers_with(&expired)).is_none());
+        let expired = session(&auth, now - 1, now - 401, "user-1");
+        assert!(matches!(
+            auth.credential(&headers_with(&expired)).await,
+            Ok(Credential::Anonymous)
+        ));
         assert!(
             auth.session_refresh_value(&headers_with(&expired))
                 .is_none()
-        );
-
-        let revoked = session(&auth, now + 299, now - 101, "u@elsewhere.org");
-        assert!(
-            auth.authenticate_cookie(&headers_with(&revoked)).is_none(),
-            "policy re-applied"
-        );
-        assert!(
-            auth.session_refresh_value(&headers_with(&revoked))
-                .is_none(),
-            "no refresh for a revoked principal"
         );
     }
 
     #[tokio::test]
     async fn a_junk_bearer_is_invalid_and_only_no_credential_falls_back_to_the_cookie() {
         let auth = auth_with_ttl(3600);
-        let cookie = auth.session_cookie_value("dev@example.com").unwrap();
+        let cookie = auth.session_cookie_value("user-1").unwrap();
         let mut h = HeaderMap::new();
         h.insert(
             "cookie",
@@ -1508,17 +1556,23 @@ mod session_tests {
         );
         h.insert("authorization", "Bearer not-a-jwt".parse().unwrap());
         assert!(matches!(
-            auth.authenticate(&h).await.unwrap_err(),
+            auth.credential(&h).await.unwrap_err(),
             AuthError::Invalid
         ));
         h.insert(FORWARDED_AUTHORIZATION_HEADER, "".parse().unwrap());
         assert!(matches!(
-            auth.authenticate(&h).await.unwrap_err(),
+            auth.credential(&h).await.unwrap_err(),
             AuthError::Invalid
         ));
         h.remove("authorization");
         h.remove(FORWARDED_AUTHORIZATION_HEADER);
-        assert_eq!(auth.authenticate(&h).await.unwrap().name, "dev@example.com");
-        assert!(auth.authenticate(&HeaderMap::new()).await.is_err());
+        assert!(matches!(
+            auth.credential(&h).await,
+            Ok(Credential::Account { ref user_id }) if user_id == "user-1"
+        ));
+        assert!(matches!(
+            auth.credential(&HeaderMap::new()).await,
+            Ok(Credential::Anonymous)
+        ));
     }
 }

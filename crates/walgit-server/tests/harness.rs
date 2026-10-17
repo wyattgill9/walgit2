@@ -140,6 +140,31 @@ impl Server {
         })
     }
 
+    /// D51: create accounts on the account log (a static token's `user` must name one).
+    /// Returns their `user_id`s, in order.
+    pub async fn create_users(&self, logins: &[&str]) -> Result<Vec<String>> {
+        use walgit_proto::v1::{AccountEvent, UserCreated, account_event::Body};
+        let log = self.state.accounts.synced().await?;
+        let mut ids = Vec::new();
+        for login in logins {
+            let user_id = format!("id-{login}");
+            log.publish_accounts(
+                vec![AccountEvent {
+                    body: Some(Body::UserCreated(UserCreated {
+                        user_id: user_id.clone(),
+                        login: (*login).to_string(),
+                        email: format!("{login}@example.com"),
+                        ..Default::default()
+                    })),
+                }],
+                "test",
+            )
+            .await?;
+            ids.push(user_id);
+        }
+        Ok(ids)
+    }
+
     /// Two instances sharing one `MemoryStore`, different cache dirs.
     pub async fn start_pair() -> Result<(Self, Self)> {
         let mut store = MemoryStore::shared();

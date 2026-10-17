@@ -33,6 +33,7 @@ pub async fn run(action: RepoAction, cfg: &Arc<Config>) -> Result<()> {
                 "sha256" => ObjectFormat::Sha256,
                 other => bail!("unknown object format `{other}` (expected sha1 or sha256)"),
             };
+            crate::accounts_cmd::reserve_namespace(&registry, id.owner()).await?;
             let handle = registry.create(&id, format).await?;
             let manifest = handle.manifest();
             println_kv("repo", &id);

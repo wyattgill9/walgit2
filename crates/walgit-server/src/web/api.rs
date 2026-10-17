@@ -16,6 +16,7 @@
 //! accepts it: notices + progress from the repo's task channel, then
 //! `result`/`error`.
 
+use crate::access::auth_err;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -33,7 +34,7 @@ use walgit_wal::{ObjectAccess, RepoHandle, Reporter};
 
 use crate::sse::Rendered;
 use crate::web::objects::{CommitMeta, Remote};
-use crate::{AppState, auth::AuthError, cache::RefIndex, error::ApiError};
+use crate::{AppState, cache::RefIndex, error::ApiError};
 
 const MAX_BLOB: usize = 2 * 1024 * 1024;
 const IMMUTABLE: &str = "private, max-age=31536000, immutable";
@@ -226,13 +227,6 @@ pub fn router(state: Arc<AppState>) -> Router {
 /// *after* the repository prefix. No lane-first forms, no aliases (banner).
 pub const REPO_API_BASES: [&str; 2] = ["/{owner}/{repo}/api", "/{owner}/{repo}/api-browser"];
 
-pub(crate) fn auth_err(e: AuthError) -> ApiError {
-    match e {
-        AuthError::Invalid | AuthError::Unauthorized => ApiError::Unauthorized,
-        AuthError::Forbidden => ApiError::Forbidden,
-        AuthError::Unavailable => ApiError::ServiceUnavailable("auth provider unavailable".into()),
-    }
-}
 fn not_found(msg: impl Into<String>) -> ApiError {
     ApiError::NotFound(msg.into())
 }
@@ -253,8 +247,25 @@ pub struct Repo {
     reporter: Reporter,
     /// Shared render cache (object store) — set for remotely served repos.
     shared: Option<Prefixed>,
+    /// D51: the caller's role on this repository (at least Read).
+    pub(crate) role: crate::access::Role,
 }
 impl Repo {
+    /// D51: `public` | `internal` | `private`, as of this request's sync.
+    pub(crate) fn visibility(&self) -> &'static str {
+        walgit_wal::access::visibility_str(
+            self.handle
+                .access()
+                .map_or(walgit_proto::v1::Visibility::Public, |a| a.visibility()),
+        )
+    }
+
+    /// What an `ETag` over the caller's permissions must cover: the access revision and role.
+    pub(crate) fn access_tag(&self) -> String {
+        let rev = self.handle.access().map_or(0, |a| a.revision);
+        format!("{rev}.{}", self.role.as_str())
+    }
+
     fn remote(&self) -> Option<Remote> {
         match &self.access {
             ObjectAccess::Remote(r) if self.objects => Some(Remote::new(
@@ -295,23 +306,23 @@ fn shared_cache(st: &AppState, handle: &RepoHandle, access: &ObjectAccess) -> Op
     (st.cfg.cache.shared_render_cache && access.is_remote()).then(|| handle.store().clone())
 }
 
+/// The repository, revalidated and authorized for Read (D51) before anything else, the
+/// immutable caches included: a cached answer is only ever served to someone who may read it.
 async fn open(
     st: &AppState,
     headers: &HeaderMap,
     owner: &str,
     name: &str,
-) -> Result<Arc<RepoHandle>, ApiError> {
-    st.auth.require_read(headers).await.map_err(auth_err)?;
+) -> Result<(Arc<RepoHandle>, crate::access::Role), ApiError> {
     let id = walgit_git::RepoId::new(owner, name).map_err(|_| not_found("repository"))?;
-    st.registry.open(&id).await.map_err(|e| match e {
-        walgit_wal::WalError::NotFound => not_found("repository"),
-        _ => internal(e),
-    })
+    let (handle, grant) =
+        crate::access::request_repo(st, headers, &id, crate::access::Role::Read).await?;
+    Ok((handle, grant.role))
 }
 
 async fn view(
     st: &AppState,
-    handle: Arc<RepoHandle>,
+    (handle, role): (Arc<RepoHandle>, crate::access::Role),
     need: Need,
     reporter: Reporter,
 ) -> Result<Repo, ApiError> {
@@ -352,6 +363,7 @@ async fn view(
         objects,
         reporter,
         shared,
+        role,
     })
 }
 
@@ -377,7 +389,7 @@ where
     F: FnOnce(Repo) -> Fut + Send + 'static,
     Fut: Future<Output = Result<Rendered, ApiError>> + Send + 'static,
 {
-    let handle = open(st, headers, owner, name).await?;
+    let (handle, role) = open(st, headers, owner, name).await?;
     let slow = need == Need::Objects && !handle.packs_ready();
     if let Some(key) = &immutable_key {
         if let Some(hit) = st.caches.api_immutable.get(key) {
@@ -401,13 +413,14 @@ where
         let (tx, rx) = tokio::sync::broadcast::channel(256);
         let sources = vec![handle.subscribe_progress(), rx];
         let st2 = st.clone();
-        let fut = async move {
-            let repo = view(&st2, handle, need, Reporter::for_repo(tx)).await?;
+        let id = handle.id().clone();
+        let fut = walgit_wal::carry_request_fresh(&id, async move {
+            let repo = view(&st2, (handle, role), need, Reporter::for_repo(tx)).await?;
             work(repo).await
-        };
+        });
         return Ok(crate::sse::envelope(sources, fut));
     }
-    let repo = view(st, handle, need, Reporter::none()).await?;
+    let repo = view(st, (handle, role), need, Reporter::none()).await?;
     Ok(work(repo).await?.into_response(headers))
 }
 
@@ -466,7 +479,9 @@ async fn instance_info(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    st.auth.require_read(&headers).await.map_err(auth_err)?;
+    crate::access::signed_in(&st, &headers)
+        .await
+        .map_err(auth_err)?;
     let mut r = axum::Json(crate::instance::info(&st.cfg)).into_response();
     r.headers_mut()
         .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
@@ -479,8 +494,11 @@ pub(crate) async fn owners(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    st.auth.require_read(&headers).await.map_err(auth_err)?;
+    let subject = crate::access::signed_in(&st, &headers)
+        .await
+        .map_err(auth_err)?;
     let repos = st.registry.list().await.map_err(internal)?;
+    let repos = crate::access::readable(&st, &subject, repos).await;
     let mut out: Vec<String> = repos.into_iter().map(|r| r.owner().to_string()).collect();
     out.sort();
     out.dedup();
@@ -491,11 +509,14 @@ pub(crate) async fn owner_repos(
     headers: HeaderMap,
     Path(owner): Path<String>,
 ) -> Result<Response, ApiError> {
-    st.auth.require_read(&headers).await.map_err(auth_err)?;
+    let subject = crate::access::signed_in(&st, &headers)
+        .await
+        .map_err(auth_err)?;
     let repos = st.registry.list().await.map_err(internal)?;
-    let mut out: Vec<String> = repos
+    let ours = repos.into_iter().filter(|r| r.owner() == owner).collect();
+    let mut out: Vec<String> = crate::access::readable(&st, &subject, ours)
+        .await
         .into_iter()
-        .filter(|r| r.owner() == owner)
         .map(|r| r.name().to_string())
         .collect();
     out.sort();
@@ -533,8 +554,8 @@ async fn ref_list(
     Query(q): Query<RefListQuery>,
 ) -> Result<Response, ApiError> {
     let wants_sse = crate::sse::wants_sse(&headers);
-    let handle = open(&st, &headers, &owner, &repo_name).await?;
-    let r = view(&st, handle, Need::Refs, Reporter::none()).await?;
+    let opened = open(&st, &headers, &owner, &repo_name).await?;
+    let r = view(&st, opened, Need::Refs, Reporter::none()).await?;
     let list = match kind.as_str() {
         "branches" => &r.index.branches,
         "tags" => &r.index.tags,
@@ -993,8 +1014,8 @@ async fn resolve_impl(
 ) -> Result<Response, ApiError> {
     // Branch/tag names resolve from the index; a raw revision falls back to
     // object access. Refs-only first so huge repos still answer for named refs.
-    let handle = open(st, headers, owner, repo_name).await?;
-    let mut r = view(st, handle, Need::Refs, Reporter::none()).await?;
+    let opened = open(st, headers, owner, repo_name).await?;
+    let mut r = view(st, opened, Need::Refs, Reporter::none()).await?;
     let res = match resolve_rest(&r, rest).await {
         Ok(res) => res,
         Err(ApiError::NotFound(_)) if !r.objects => {

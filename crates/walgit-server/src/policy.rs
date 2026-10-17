@@ -398,7 +398,7 @@ pub fn pattern_list_matches(patterns: &[String], text: &str) -> bool {
 
 fn principal_matches(
     spec: &str,
-    principal: &str,
+    principal: &[&str],
     groups: &HashMap<&str, &Group>,
     seen: &mut HashSet<String>,
 ) -> bool {
@@ -418,12 +418,12 @@ fn principal_matches(
         // Tags are bound by the edge. We do not have a tag set yet.
         return false;
     }
-    spec.eq_ignore_ascii_case(principal)
+    principal.iter().any(|p| spec.eq_ignore_ascii_case(p))
 }
 
 fn actor_list_matches(
     patterns: &[String],
-    principal: &str,
+    principal: &[&str],
     groups: &HashMap<&str, &Group>,
 ) -> bool {
     // Same inclusion/exclusion as globs, but each non-^ entry is an actor spec.
@@ -491,7 +491,7 @@ impl Eval {
 /// Tag retargets are treated as force regardless.
 pub fn evaluate(
     policy: &RepoPolicy,
-    principal: &str,
+    principal: &[&str],
     txn: &RefTransaction,
     is_force: impl Fn(&RefUpdate) -> bool,
 ) -> Eval {
@@ -531,7 +531,7 @@ pub fn evaluate(
 fn deny_reason(
     policy: &RepoPolicy,
     groups: &HashMap<&str, &Group>,
-    principal: &str,
+    principal: &[&str],
     u: &RefUpdate,
     is_force: &impl Fn(&RefUpdate) -> bool,
 ) -> Option<String> {
@@ -570,7 +570,7 @@ fn deny_reason(
 fn rule_matches(
     m: &Match,
     ref_name: &str,
-    principal: &str,
+    principal: &[&str],
     groups: &HashMap<&str, &Group>,
 ) -> bool {
     if !m.refs.is_empty() && !pattern_list_matches(&m.refs, ref_name) {
@@ -583,7 +583,7 @@ fn rule_matches(
     true
 }
 
-fn bypasses(p: &ProtectEffect, principal: &str, groups: &HashMap<&str, &Group>) -> bool {
+fn bypasses(p: &ProtectEffect, principal: &[&str], groups: &HashMap<&str, &Group>) -> bool {
     if p.bypass.is_empty() {
         return false;
     }
@@ -657,8 +657,7 @@ pub async fn http_get(
     route: &RepoRoute,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
-    ensure_repo(st, route).await?;
+    crate::access::request_repo(st, headers, &route.id, crate::access::Role::Read).await?;
     let policy = load(&st.store, &route.id).await.map_err(store_err)?;
     let body = serde_json::to_vec_pretty(&policy)
         .map_err(|e| ApiError::Internal(format!("encode policy: {e}")))?;
@@ -679,8 +678,7 @@ pub async fn http_put(
     headers: &HeaderMap,
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_admin(headers).await.map_err(auth_err)?;
-    ensure_repo(st, route).await?;
+    crate::access::request_repo(st, headers, &route.id, crate::access::Role::Admin).await?;
     let bytes = crate::collect_body(body).await?;
     let policy = parse_bytes(&bytes).map_err(store_err)?;
     save(&st.store, &route.id, &policy)
@@ -694,32 +692,9 @@ pub async fn http_delete(
     route: &RepoRoute,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_admin(headers).await.map_err(auth_err)?;
-    ensure_repo(st, route).await?;
+    crate::access::request_repo(st, headers, &route.id, crate::access::Role::Admin).await?;
     clear(&st.store, &route.id).await.map_err(store_err)?;
     Ok((StatusCode::NO_CONTENT, "").into_response())
-}
-
-async fn ensure_repo(st: &AppState, route: &RepoRoute) -> Result<(), ApiError> {
-    st.registry.open(&route.id).await.map(|_| ()).map_err(|e| {
-        if matches!(e, walgit_wal::WalError::NotFound) {
-            ApiError::NotFound(format!("{}", route.id))
-        } else {
-            ApiError::Internal(format!("wal: {e}"))
-        }
-    })
-}
-
-fn auth_err(e: crate::auth::AuthError) -> ApiError {
-    match e {
-        crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
-            ApiError::Unauthorized
-        }
-        crate::auth::AuthError::Forbidden => ApiError::Forbidden,
-        crate::auth::AuthError::Unavailable => {
-            ApiError::ServiceUnavailable("auth provider unavailable".into())
-        }
-    }
 }
 
 fn store_err(e: StoreError) -> ApiError {
@@ -815,7 +790,7 @@ mod tests {
             ],
             false,
         );
-        let ev = evaluate(&p, "bob@example.com", &t, |_| true);
+        let ev = evaluate(&p, &["bob@example.com"], &t, |_| true);
         assert!(ev.per_ref.iter().all(|(_, r)| r.is_ok()));
         assert_eq!(ev.publish.updates.len(), 2);
     }
@@ -830,7 +805,7 @@ mod tests {
             ],
             false,
         );
-        let ev = evaluate(&p, "bob@example.com", &t, |_| true);
+        let ev = evaluate(&p, &["bob@example.com"], &t, |_| true);
         assert!(
             ev.per_ref[0]
                 .1
@@ -842,7 +817,7 @@ mod tests {
         assert_eq!(ev.publish.updates.len(), 1);
 
         let del = txn(vec![upd("refs/heads/main", "aaa", "")], false);
-        let ev = evaluate(&p, "bob@example.com", &del, |_| false);
+        let ev = evaluate(&p, &["bob@example.com"], &del, |_| false);
         assert!(ev.per_ref[0].1.as_ref().unwrap_err().contains("lock-main"));
         assert!(!ev.any_allowed());
     }
@@ -851,7 +826,7 @@ mod tests {
     fn ff_update_allowed() {
         let p = lock_main();
         let t = txn(vec![upd("refs/heads/main", "aaa", "bbb")], false);
-        let ev = evaluate(&p, "bob@example.com", &t, |_| false);
+        let ev = evaluate(&p, &["bob@example.com"], &t, |_| false);
         assert!(ev.per_ref[0].1.is_ok());
     }
 
@@ -859,7 +834,7 @@ mod tests {
     fn group_bypass() {
         let p = lock_main();
         let t = txn(vec![upd("refs/heads/main", "aaa", "bbb")], false);
-        let ev = evaluate(&p, "Alice@example.com", &t, |_| true);
+        let ev = evaluate(&p, &["Alice@example.com"], &t, |_| true);
         assert!(ev.per_ref[0].1.is_ok());
     }
 
@@ -867,7 +842,7 @@ mod tests {
     fn create_allowed_when_not_restricted() {
         let p = lock_main();
         let t = txn(vec![upd("refs/heads/main", "", "aaa")], false);
-        let ev = evaluate(&p, "bob@example.com", &t, |_| true);
+        let ev = evaluate(&p, &["bob@example.com"], &t, |_| true);
         assert!(ev.per_ref[0].1.is_ok());
     }
 
@@ -881,7 +856,7 @@ mod tests {
             ],
             true,
         );
-        let ev = evaluate(&p, "bob@example.com", &t, |_| true);
+        let ev = evaluate(&p, &["bob@example.com"], &t, |_| true);
         assert!(ev.any_denied());
         assert!(!ev.any_allowed());
         assert_eq!(ev.per_ref.len(), 2);
@@ -900,7 +875,7 @@ mod tests {
         let p = parse_bytes(json.as_bytes()).unwrap();
         let t = txn(vec![upd("refs/tags/v1", "aaa", "bbb")], false);
         // even if merge-base would say ff
-        let ev = evaluate(&p, "bob@example.com", &t, |_| false);
+        let ev = evaluate(&p, &["bob@example.com"], &t, |_| false);
         assert!(ev.per_ref[0].1.is_err());
     }
 

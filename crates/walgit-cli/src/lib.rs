@@ -29,6 +29,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod accounts_cmd;
 mod cli;
 mod config_cmd;
 mod settings_cmd;
@@ -216,6 +217,55 @@ enum Command {
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+    /// D51: user accounts on the account log (static tokens bind to these; people signing in
+    /// through the identity provider create their own).
+    User {
+        #[command(subcommand)]
+        action: UserAction,
+    },
+    /// D51: minimal orgs — a namespace and its owners. Claims a namespace that holds
+    /// repositories but has no account.
+    Org {
+        #[command(subcommand)]
+        action: OrgAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum UserAction {
+    /// Create an account (for a robot or a static token's `user`).
+    Create {
+        /// The username: its `<owner>` namespace.
+        login: String,
+        #[arg(long)]
+        email: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+        /// D52: also set a password (from `$WALGIT_PASSWORD`, else the first line of stdin).
+        #[arg(long)]
+        password: bool,
+    },
+    /// D52: set an account's password (from `$WALGIT_PASSWORD`, else the first line of stdin).
+    Password { login: String },
+    /// List every account: login, user id, email.
+    #[command(alias = "ls")]
+    List,
+}
+
+#[derive(Subcommand)]
+enum OrgAction {
+    /// Create an org owned by existing users (repeat `--owner`).
+    Create {
+        login: String,
+        #[arg(long = "owner", required = true)]
+        owners: Vec<String>,
+    },
+    /// Replace an org's owners.
+    Owners {
+        login: String,
+        #[arg(long = "owner", required = true)]
+        owners: Vec<String>,
     },
 }
 
@@ -470,6 +520,8 @@ async fn dispatch(command: Command, cfg: Config) -> Result<()> {
             base,
         } => compact::run(repo, all, once, base, &cfg).await,
         Command::Repo { action } => repo::run(action, &cfg).await,
+        Command::User { action } => accounts_cmd::run_user(action, &cfg).await,
+        Command::Org { action } => accounts_cmd::run_org(action, &cfg).await,
         Command::Wal { action } => wal_cmd::run(action, &cfg).await,
         Command::Mirror {
             from,

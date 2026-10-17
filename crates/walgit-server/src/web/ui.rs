@@ -1,3 +1,4 @@
+use crate::access::Role;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -534,10 +535,9 @@ async fn overview(
     AxumPath((owner, repo)): AxumPath<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    state.auth.require_read(&headers).await.map_err(auth_err)?;
     let id =
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
-    let handle = state.registry.open(&id).await.map_err(wal_err)?;
+    let (handle, _) = crate::access::request_repo(&state, &headers, &id, Role::Read).await?;
     // read_log performs its own freshness check; acquire the read guard only
     // after it has completed because read_log may need the write lock.
     let entries = handle.read_log(1, None).await.map_err(wal_err)?;
@@ -895,9 +895,9 @@ async fn ops_list(
     AxumPath((owner, repo)): AxumPath<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    state.auth.require_read(&headers).await.map_err(auth_err)?;
     let id =
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
+    crate::access::request_repo(&state, &headers, &id, Role::Read).await?;
     let body = OpsInfo {
         available: crate::ops::OPS.to_vec(),
         recent: state.registry.tasks().recent(&id.to_string()),
@@ -914,7 +914,7 @@ async fn ops_list(
 
 /// `POST …/ops/{op}?<params>` — run a maintenance op on this instance as a
 /// background task and stream it (SSE envelope: `task`, `notice`, `progress`,
-/// then `result` `{"task","value"}` or `error`). Write permission required.
+/// then `result` `{"task","value"}` or `error`). Maintain on the repository required.
 /// If the same op is already running here the response attaches to that task
 /// instead (same stream shape; its `task.id` tells you which).
 async fn ops_start(
@@ -923,12 +923,11 @@ async fn ops_start(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let principal = state.auth.require_write(&headers).await.map_err(auth_err)?;
     let id =
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
-    // Make sure the repo exists before spawning anything.
-    state.registry.open(&id).await.map_err(wal_err)?;
-    tracing::info!(repo = %id, op = %op, by = %principal.name, ?params, "ops.start");
+    // The repository exists and the caller may maintain it, before anything is spawned.
+    let (_, grant) = crate::access::request_repo(&state, &headers, &id, Role::Maintain).await?;
+    tracing::info!(repo = %id, op = %op, by = %grant.subject.name, ?params, "ops.start");
     let task = match crate::ops::start(state.clone(), id, &op, params).await {
         Ok(t) => t,
         Err(crate::ops::StartError::UnknownOp) => {
@@ -947,9 +946,9 @@ async fn tasks_list(
     AxumPath((owner, repo)): AxumPath<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    state.auth.require_read(&headers).await.map_err(auth_err)?;
     let id =
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
+    crate::access::request_repo(&state, &headers, &id, Role::Read).await?;
     let tasks = state.registry.tasks();
     let body = serde_json::json!({
         "hostname": walgit_store::coord::instance_id(),
@@ -974,9 +973,9 @@ async fn task_stream(
     AxumPath((owner, repo, task_id)): AxumPath<(String, String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    state.auth.require_read(&headers).await.map_err(auth_err)?;
     let id =
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
+    crate::access::request_repo(&state, &headers, &id, Role::Read).await?;
     let task = state
         .registry
         .tasks()
@@ -1031,17 +1030,5 @@ fn wal_err(error: walgit_wal::WalError) -> ApiError {
     match error {
         walgit_wal::WalError::NotFound => ApiError::NotFound("repository not found".into()),
         other => ApiError::Internal(format!("wal: {other}")),
-    }
-}
-
-fn auth_err(error: crate::auth::AuthError) -> ApiError {
-    match error {
-        crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
-            ApiError::Unauthorized
-        }
-        crate::auth::AuthError::Forbidden => ApiError::Forbidden,
-        crate::auth::AuthError::Unavailable => {
-            ApiError::ServiceUnavailable("auth provider unavailable".into())
-        }
     }
 }

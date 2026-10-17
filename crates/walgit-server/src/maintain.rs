@@ -226,6 +226,30 @@ pub async fn next_unit(state: &Arc<AppState>, id: &RepoId) -> anyhow::Result<Uni
 /// One pass: one unit per assigned repository.
 pub async fn run_pass(state: &Arc<AppState>) -> anyhow::Result<PassReport> {
     let mut report = PassReport::default();
+    // D51: the account log is not a repository (never listed); every maintainer folds it into
+    // a checkpoint when due, like a repository's log (the CAS settles a race).
+    match state.registry.open(&walgit_wal::accounts::log_id()).await {
+        Ok(log) => {
+            if let Err(e) = async {
+                drop(log.sync_refs().await?);
+                if let Some(trigger) = log.checkpoint_due() {
+                    let cp = log.write_checkpoint().await?;
+                    info!(
+                        seq = cp.seq,
+                        ?trigger,
+                        "maintenance: account log checkpointed"
+                    );
+                }
+                Ok::<(), walgit_wal::WalError>(())
+            }
+            .await
+            {
+                warn!(error = %e, "maintenance: account log checkpoint failed");
+            }
+        }
+        Err(walgit_wal::WalError::NotFound) => {}
+        Err(e) => warn!(error = %e, "maintenance: account log unavailable"),
+    }
     let repos = state.registry.list().await?;
     for id in repos {
         if !state.cfg.placement.maintains(id.owner(), id.name()) {

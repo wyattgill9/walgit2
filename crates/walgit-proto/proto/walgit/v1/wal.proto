@@ -63,6 +63,42 @@ message Manifest {
   // D50: the next issue/PR number (0 = the forge was never used). Allocated by the publisher
   // under this CAS, one per `ForgeOpened`.
   uint64 forge_next_number = 14;
+  // D51: who may read and write this repository (latest). Inline like `settings`: every
+  // refs-level sync sees it without another GET. Absent = public, no collaborators.
+  // History = ACCESS log entries.
+  RepoAccess access = 15;
+}
+
+// D51: repository visibility. The zero value is public (an absent `RepoAccess`).
+enum Visibility {
+  VISIBILITY_PUBLIC = 0;
+  // Any signed-in account on the host may read.
+  VISIBILITY_INTERNAL = 1;
+  // Only collaborators, the namespace owner and site admins.
+  VISIBILITY_PRIVATE = 2;
+}
+
+// D51: a repository role, ordered: each includes the ones below it.
+enum AccessRole {
+  ACCESS_ROLE_NONE = 0;
+  ACCESS_ROLE_READ = 1;
+  ACCESS_ROLE_TRIAGE = 2;
+  ACCESS_ROLE_WRITE = 3;
+  ACCESS_ROLE_MAINTAIN = 4;
+  ACCESS_ROLE_ADMIN = 5;
+}
+
+// D51: visibility and collaborators of one repository (whole-document replace).
+message RepoAccess {
+  Visibility visibility = 1;
+  // Account `user_id` -> role.
+  map<string, AccessRole> collaborators = 2;
+  // Monotonic per-repo access revision (1 = first publish).
+  uint64 revision = 3;
+  // `user_id` of who published (empty for the repository's creation).
+  string author = 4;
+  google.protobuf.Timestamp updated_at = 5;
+  string message = 6;
 }
 
 // D24: per-repository settings — a TOML document restricted to the sections a
@@ -177,6 +213,10 @@ enum EntryKind {
   ENTRY_KIND_SETTINGS = 5;
   // D50: forge events only (`forge`); refs and packs unchanged.
   ENTRY_KIND_FORGE = 6;
+  // D51: account events (`account`), only in the account log (`system/accounts/`).
+  ENTRY_KIND_ACCOUNT = 7;
+  // D51: `access` changed (the manifest carries the latest; this is history).
+  ENTRY_KIND_ACCESS = 8;
 }
 
 message LogEntry {
@@ -199,6 +239,10 @@ message LogEntry {
   // D50: issue/PR changes. On FORGE entries, and on PUSH when a ref change and a forge change
   // must commit together (a merge).
   repeated ForgeEvent forge = 11;
+  // D51: `ENTRY_KIND_ACCOUNT`: account changes, applied in order, all or none.
+  repeated AccountEvent account = 12;
+  // D51: `ENTRY_KIND_ACCESS`: the access document as published at this seq.
+  RepoAccess access = 13;
 }
 
 // D50: one issue/PR change. Its time is the entry's `created_at`; a comment's id is
@@ -206,8 +250,10 @@ message LogEntry {
 message ForgeEvent {
   // The item. Requests send 0 with `opened`; the publisher assigns the number.
   uint64 number = 1;
-  // Principal that made the change.
+  // Principal that made the change (D51: the account's login, for display).
   string actor = 2;
+  // D51: the account's `user_id`, stamped by the publisher; empty on events before D51.
+  string actor_id = 3;
   oneof body {
     ForgeOpened opened = 10;
     ForgeComment comment = 11;
@@ -328,6 +374,94 @@ message ForgeRecord {
   repeated ForgeEvent events = 3;
 }
 
+// ---------------------------------------------------------------------------
+// D51: the account log, a WAL of its own at `system/accounts/` (same manifest/log/checkpoint
+// layout). Its fold is the user directory: users, identity links, minimal orgs and reserved
+// namespaces. Every index is derived from these events.
+// ---------------------------------------------------------------------------
+
+message AccountEvent {
+  oneof body {
+    AccountGenesis genesis = 1;
+    UserCreated user_created = 2;
+    IdentityLinked identity_linked = 3;
+    ProfileChanged profile_changed = 4;
+    NamespaceReserved namespace_reserved = 5;
+    OrgCreated org_created = 6;
+    OrgOwnersChanged org_owners_changed = 7;
+    PasswordSet password_set = 8;
+  }
+}
+
+// D52: a password account's credential: an Argon2id PHC string (salted, memory-hard). The log keeps
+// every entry, so an old hash outlives a password change: changing it limits what a stolen
+// *current* hash opens, not what a copy of the bucket's history holds. Empty `phc` = no password.
+message PasswordSet {
+  string user_id = 1;
+  string phc = 2;
+}
+
+// The log's first event: the namespaces that held repositories when accounts began. They
+// are reserved: sign-up can never take them, only an org created by a site admin can.
+message AccountGenesis {
+  repeated string reserved = 1;
+}
+
+message UserCreated {
+  // Immutable, never reused (uuid v4).
+  string user_id = 1;
+  // The `<owner>` namespace. Unique across users, orgs and reserved namespaces.
+  string login = 2;
+  string email = 3;
+  string name = 4;
+  string avatar_url = 5;
+}
+
+// A sign-in identity that resolves to `user_id`. `(issuer, subject)` is unique.
+message IdentityLinked {
+  string user_id = 1;
+  string issuer = 2;
+  string subject = 3;
+}
+
+// Profile attributes; an empty field is unchanged.
+message ProfileChanged {
+  string user_id = 1;
+  string email = 2;
+  string name = 3;
+  string avatar_url = 4;
+}
+
+// A namespace that holds repositories but has no account.
+message NamespaceReserved {
+  string login = 1;
+}
+
+// A minimal org: a namespace whose owners administer its repositories.
+message OrgCreated {
+  string org_id = 1;
+  string login = 2;
+  // `user_id`s.
+  repeated string owners = 3;
+}
+
+message OrgOwnersChanged {
+  string org_id = 1;
+  repeated string owners = 2;
+}
+
+// checkpoints/accounts/<sha256>.pb: every account record up to `seq`, in WAL order.
+message AccountHistory {
+  uint64 seq = 1;
+  repeated AccountRecord records = 2;
+}
+
+message AccountRecord {
+  uint64 seq = 1;
+  google.protobuf.Timestamp at = 2;
+  repeated AccountEvent events = 3;
+}
+
 message RefUpdate {
   // Full ref name, e.g. "refs/heads/main" or "HEAD" (symbolic target update).
   string name = 1;
@@ -382,6 +516,8 @@ message CheckpointRef {
   string refs_key = 6;
   // D50: the `ForgeHistory` at `seq`; empty when the forge was never used.
   string forge_key = 7;
+  // D51: the `AccountHistory` at `seq`; only on the account log.
+  string accounts_key = 8;
 }
 
 message RefSnapshot {

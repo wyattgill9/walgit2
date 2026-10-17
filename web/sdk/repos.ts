@@ -286,11 +286,51 @@ export interface RepoSummary {
   clone_url: string;
   html_url: string;
   api_url: string;
+  /** D51: `public` | `internal` | `private`. */
+  visibility: Visibility;
+  /** D51: what the caller may do here. */
+  role: Role;
 }
+/** D51: repository roles, each including the ones before it. */
+export type Role = "read" | "triage" | "write" | "maintain" | "admin";
+export const ROLES: readonly Role[] = ["read", "triage", "write", "maintain", "admin"];
+/** `role` is at least `need`. */
+export const atLeast = (role: Role | undefined, need: Role): boolean =>
+  role !== undefined && ROLES.indexOf(role) >= ROLES.indexOf(need);
+export type Visibility = "public" | "internal" | "private";
+/** D51: the caller: an account (or anonymous) and its host flags. */
 export interface Me {
-  principal: string;
-  write: boolean;
+  login: string;
+  user_id: string | null;
+  name: string | null;
+  email: string | null;
+  avatar_url: string | null;
+  /** May create repositories under its own login. */
+  can_create: boolean;
+  /** Admin on every repository. */
+  site_admin: boolean;
   anonymous: boolean;
+  /** `none` = no credentials, the local site admin (loopback only). */
+  auth_mode: "none" | "token" | "oidc";
+  /** Orgs this account owns: where it may create repositories besides its own login. */
+  orgs: string[];
+  /** How a browser signs in here (D52). */
+  sign_in: { available: boolean; passwords: "off" | "admin" | "open"; oidc: boolean; tokens: boolean };
+}
+/** A user of the directory (pickers, collaborators). */
+export interface Person {
+  login: string;
+  name?: string;
+  avatar_url?: string;
+}
+export interface RepoAccessDoc {
+  visibility: Visibility;
+  /** 0 = never set (public, no collaborators). */
+  revision: number;
+  owner: { kind: "user" | "org" | "none"; login: string; owners?: Person[] };
+  collaborators: (Person & { role: Role })[];
+  /** The caller's role. */
+  role: Role;
 }
 export interface TaskProgress {
   label: string;
@@ -491,6 +531,39 @@ export class ReposClient {
   /** Who am I (401 → ReposError). */
   me(opts?: CallOptions) {
     return this.json<Me>("me", opts);
+  }
+
+  /** D51: the user directory by login or name prefix (any account), for pickers. */
+  users(q: string, opts?: CallOptions & { n?: number }) {
+    const n = opts?.n ? `&n=${opts.n}` : "";
+    return this.json<Person[]>(`users?q=${encodeURIComponent(q)}${n}`, opts);
+  }
+
+  /** D52, site admins: create an account (a password lets it sign in; none = a robot for tokens). */
+  createUser(user: { login: string; email?: string; name?: string; password?: string }, opts?: CallOptions) {
+    return this.json<{ login: string }>("users", opts, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(user),
+    });
+  }
+
+  /** D52, site admins: set someone's password. */
+  setPassword(login: string, password: string, opts?: CallOptions) {
+    return this.json<void>(`users/${encodeURIComponent(login)}/password`, opts, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password }),
+    });
+  }
+
+  /** D51, site admins: an org (a namespace and its owners), e.g. to claim a reserved namespace. */
+  createOrg(org: { login: string; owners: string[] }, opts?: CallOptions) {
+    return this.json<unknown>("orgs", opts, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(org),
+    });
   }
 
   /**
@@ -754,9 +827,10 @@ export class RepoClient {
   get(opts?: CallOptions) {
     return this.client.json<RepoSummary>(this.p, opts);
   }
-  /** Create the repository (write permission). */
-  async create(opts?: CallOptions): Promise<void> {
-    await this.client.json<unknown>(this.p, opts, { method: "PUT" });
+  /** Create the repository: under your own login or an org you own (D51); `visibility` defaults to public. */
+  async create(opts?: CallOptions, visibility?: Visibility): Promise<void> {
+    const q = visibility ? `?visibility=${visibility}` : "";
+    await this.client.json<unknown>(`${this.p}${q}`, opts, { method: "PUT" });
   }
   /** Delete the repository (admin permission). Irreversible. */
   async delete(opts?: CallOptions): Promise<void> {
@@ -934,6 +1008,21 @@ export class RepoClient {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: policy === null || policy === undefined || policy === "" ? "" : typeof policy === "string" ? policy : JSON.stringify(policy),
+      }),
+  };
+
+  /** D51: visibility and collaborators. Reading needs write; replacing needs admin. */
+  readonly access = {
+    get: (opts?: CallOptions) => this.client.json<RepoAccessDoc>(`${this.p}/access`, opts),
+    /** Whole-document replace; `revision` = the one you edited (409 when it moved). */
+    put: (
+      doc: { visibility: Visibility; collaborators: { login: string; role: Role }[]; revision?: number; message?: string },
+      opts?: CallOptions,
+    ) =>
+      this.client.json<{ revision: number }>(`${this.p}/access`, opts, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(doc),
       }),
   };
 

@@ -1,5 +1,6 @@
 //! Git LFS batch API + basic transfer (download/upload/verify). Objects live at
 //! `lfs/objects/<oid[0:2]>/<oid[2:4]>/<oid>` in the repo-scoped store.
+use crate::access::{Role, auth_err};
 use std::collections::HashMap;
 
 use axum::body::Body;
@@ -12,7 +13,6 @@ use walgit_proto::keys;
 use crate::AppState;
 use crate::error::ApiError;
 use crate::repo::RepoRoute;
-use crate::smart::open_repo;
 use crate::stream::body_to_async_read;
 use walgit_store::{ObjectStore, ObjectStoreExt, PutBody, PutMode};
 
@@ -84,14 +84,17 @@ pub async fn batch(
     if !st.cfg.lfs.enabled {
         return Err(ApiError::NotFound("lfs disabled".into()));
     }
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let subject = crate::access::authenticate(st, headers)
+        .await
+        .map_err(auth_err)?;
     not_served_here(st, &route.id)?;
-    let handle = open_repo(st, &route.id, false).await?;
+    let is_upload = body.operation == "upload";
+    let need = if is_upload { Role::Write } else { Role::Read };
+    let (handle, _) = crate::access::repo(st, &route.id, &subject, need).await?;
     let store = handle.store().clone();
     let base = base_url(st, route, headers);
     let cfg = handle.effective_config();
 
-    let is_upload = body.operation == "upload";
     for o in &body.objects {
         require_lfs_oid(&o.oid)?;
     }
@@ -224,11 +227,13 @@ pub async fn get_object(
     if !st.cfg.lfs.enabled {
         return Err(ApiError::NotFound("lfs disabled".into()));
     }
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let subject = crate::access::authenticate(st, headers)
+        .await
+        .map_err(auth_err)?;
     not_served_here(st, &route.id)?;
     let oid = route_sub_last(&route.subpath)?;
     require_lfs_oid(oid)?;
-    let handle = open_repo(st, &route.id, false).await?;
+    let (handle, _) = crate::access::repo(st, &route.id, &subject, Role::Read).await?;
     let store = handle.store().clone();
     let key = keys::lfs_key(oid);
     let cfg = handle.effective_config();
@@ -248,6 +253,7 @@ pub async fn get_object(
         method,
         headers,
         crate::static_object::ServeOptions {
+            cache_control: crate::access::immutable_cache_control(st, &handle),
             accel: st.cfg.server.accel_redirect,
             peer,
             ..Default::default()
@@ -396,11 +402,13 @@ pub async fn put_object(
     if !st.cfg.lfs.enabled {
         return Err(ApiError::NotFound("lfs disabled".into()));
     }
-    let _ = st.auth.require_write(headers).await.map_err(auth_err)?;
+    let subject = crate::access::authenticate(st, headers)
+        .await
+        .map_err(auth_err)?;
     not_served_here(st, &route.id)?;
     let oid = route_sub_last(&route.subpath)?;
     require_lfs_oid(oid)?;
-    let handle = open_repo(st, &route.id, false).await?;
+    let (handle, _) = crate::access::repo(st, &route.id, &subject, Role::Write).await?;
     let store = handle.store().clone();
     let key = keys::lfs_key(oid);
     let max = st.cfg.lfs.max_object_bytes.as_u64();
@@ -462,8 +470,7 @@ pub async fn verify(
     let body: BatchObject = serde_json::from_slice(&body_bytes)
         .map_err(|e| ApiError::BadRequest(format!("invalid lfs verify: {e}")))?;
     require_lfs_oid(&body.oid)?;
-    let _ = st.auth.require_write(headers).await.map_err(auth_err)?;
-    let handle = open_repo(st, &route.id, false).await?;
+    let (handle, _) = crate::access::request_repo(st, headers, &route.id, Role::Write).await?;
     let store = handle.store().clone();
     let key = keys::lfs_key(&body.oid);
     let meta = store.head(&key).await.map_err(store_err)?;
@@ -511,17 +518,6 @@ fn base_url(st: &AppState, route: &RepoRoute, headers: &HeaderMap) -> String {
     )
 }
 
-fn auth_err(e: crate::auth::AuthError) -> ApiError {
-    match e {
-        crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
-            ApiError::Unauthorized
-        }
-        crate::auth::AuthError::Forbidden => ApiError::Forbidden,
-        crate::auth::AuthError::Unavailable => {
-            ApiError::ServiceUnavailable("auth provider unavailable".into())
-        }
-    }
-}
 fn store_err(e: walgit_store::StoreError) -> ApiError {
     e.into()
 }

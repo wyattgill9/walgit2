@@ -17,12 +17,13 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use walgit_proto::v1::{ForgeMerged, RefTransaction, RefUpdate, forge_event::Body};
-use walgit_wal::forge::{Actor, Item};
+use walgit_wal::forge::Item;
 
 use super::forge::{closing_event, detail_of, event, open, tips};
 use crate::AppState;
+use crate::access::Role;
 use crate::error::ApiError;
-use crate::web::api::{auth_err, json_swr};
+use crate::web::api::json_swr;
 
 fn internal(e: impl std::fmt::Display) -> ApiError {
     ApiError::Internal(e.to_string())
@@ -274,7 +275,7 @@ pub(super) async fn mergeability(
     headers: HeaderMap,
     UrlPath((owner, repo, number)): UrlPath<(String, String, u64)>,
 ) -> Result<Response, ApiError> {
-    let handle = open(&st, &headers, &owner, &repo).await?;
+    let (handle, _) = open(&st, &headers, &owner, &repo, Role::Read).await?;
     let (guard, access) = handle.sync_objects().await.map_err(crate::smart::wal_err)?;
     if access.is_remote() {
         return Err(ApiError::ServiceUnavailable(
@@ -334,14 +335,13 @@ pub(super) async fn merge(
     UrlPath((owner, repo, number)): UrlPath<(String, String, u64)>,
     Json(req): Json<MergeRequest>,
 ) -> Result<Response, ApiError> {
-    let principal = st.auth.require_write(&headers).await.map_err(auth_err)?;
     let method = req.method.unwrap_or_else(|| "merge".into());
     if !matches!(method.as_str(), "merge" | "squash" | "rebase") {
         return Err(ApiError::BadRequest(format!(
             "{method:?} is not merge, squash or rebase"
         )));
     }
-    let handle = open(&st, &headers, &owner, &repo).await?;
+    let (handle, grant) = open(&st, &headers, &owner, &repo, Role::Write).await?;
     let (guard, access) = handle.sync_objects().await.map_err(crate::smart::wal_err)?;
     if access.is_remote() {
         return Err(ApiError::ServiceUnavailable(
@@ -369,7 +369,13 @@ pub(super) async fn merge(
         )));
     }
 
-    let me = (principal.name.as_str(), email_of(&principal.name));
+    let subject = &grant.subject;
+    let email = if subject.email.is_empty() {
+        email_of(&subject.name)
+    } else {
+        subject.email.clone()
+    };
+    let me = (subject.name.as_str(), email);
     let me = (me.0, me.1.as_str());
     let message = req.message.unwrap_or_else(|| match method.as_str() {
         "squash" => format!("{} (#{number})\n\n{}", item.title, item.body),
@@ -436,7 +442,7 @@ pub(super) async fn merge(
     let policy = crate::policy::load(&st.store, handle.id())
         .await
         .map_err(|e| internal(format!("load policy: {e}")))?;
-    let ev = crate::policy::evaluate(&policy, &principal.name, &txn, |_| false);
+    let ev = crate::policy::evaluate(&policy, &subject.names(), &txn, |_| false);
     if let Some((_, Err(why))) = ev.per_ref.iter().find(|(_, r)| r.is_err()) {
         return Err(ApiError::BadRequest(format!("push policy: {why}")));
     }
@@ -465,12 +471,8 @@ pub(super) async fn merge(
             .into_iter()
             .map(|k| closing_event(k, "completed")),
     );
-    let actor = Actor {
-        name: principal.name.clone(),
-        write: principal.write,
-    };
     let res = handle
-        .publish_forge_push(actor, events, ingested, txn)
+        .publish_forge_push(grant.actor(), events, ingested, txn)
         .await
         .map_err(crate::smart::wal_err)?;
     if let Some(msg) = res.forge_error {
@@ -491,8 +493,8 @@ pub(super) async fn delete_branch(
     headers: HeaderMap,
     UrlPath((owner, repo, number)): UrlPath<(String, String, u64)>,
 ) -> Result<Response, ApiError> {
-    let principal = st.auth.require_write(&headers).await.map_err(auth_err)?;
-    let handle = super::forge::synced(&st, &headers, &owner, &repo).await?;
+    let (handle, grant) = open(&st, &headers, &owner, &repo, Role::Write).await?;
+    handle.forge_ensure().await.map_err(crate::smart::wal_err)?;
     let item = handle
         .forge_read(|s| s.items.get(&number).filter(|i| i.kind == "pull").cloned())
         .ok_or_else(|| ApiError::NotFound(format!("pull #{number}")))?;
@@ -517,11 +519,12 @@ pub(super) async fn delete_branch(
     let policy = crate::policy::load(&st.store, handle.id())
         .await
         .map_err(|e| internal(format!("load policy: {e}")))?;
-    let ev = crate::policy::evaluate(&policy, &principal.name, &txn, |_| false);
+    let ev = crate::policy::evaluate(&policy, &grant.subject.names(), &txn, |_| false);
     if let Some((_, Err(why))) = ev.per_ref.iter().find(|(_, r)| r.is_err()) {
         return Err(ApiError::BadRequest(format!("push policy: {why}")));
     }
-    let meta = std::collections::HashMap::from([("principal".to_string(), principal.name)]);
+    let meta =
+        std::collections::HashMap::from([("principal".to_string(), grant.subject.name.clone())]);
     let res = handle
         .publish_ref_update(txn, meta)
         .await

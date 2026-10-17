@@ -14,6 +14,8 @@ async fn ambiguous_delivery_and_gateway_responses_never_publish_locally() -> any
     )?;
     let tip = git_in(&source, &["rev-parse", "HEAD"])?;
     let initial_log = writer.read_log("o", "forward").await?;
+    // D51: a front forwarding pushes authenticates its users and presents a broker token.
+    writer.create_users(&["alice"]).await?;
     for (name, reply, expected) in [
         ("lost", "", 502),
         (
@@ -48,6 +50,15 @@ async fn ambiguous_delivery_and_gateway_responses_never_publish_locally() -> any
         let front = writer
             .start_sibling_with(|cfg| {
                 cfg.wal.push_broker_url = Some(format!("http://{address}"));
+                cfg.wal.push_broker_token = Some("broker-token".into());
+                cfg.server.auth.mode = walgit_config::AuthMode::Token;
+                cfg.server.auth.tokens = vec![walgit_config::StaticToken {
+                    user: "alice".into(),
+                    token: "alice-token".into(),
+                    token_env: None,
+                    write: true,
+                    admin: false,
+                }];
             })
             .await?;
         let command = format!(
@@ -64,6 +75,7 @@ async fn ambiguous_delivery_and_gateway_responses_never_publish_locally() -> any
                     front.repo_url("o", "forward")
                 ))
                 .header("content-type", "application/x-git-receive-pack-request")
+                .bearer_auth("alice-token")
                 .body(body)
                 .send(),
         )
