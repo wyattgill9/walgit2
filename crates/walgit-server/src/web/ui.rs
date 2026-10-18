@@ -158,6 +158,20 @@ async fn index_route(req: Request<Body>) -> Response {
     index(req.method(), req.headers())
 }
 
+/// The SPA's `<link rel="stylesheet">` tags, so the server-rendered `/_auth/*` pages wear the
+/// same stylesheet as the app instead of a lookalike.
+pub(crate) fn stylesheets() -> &'static str {
+    static LINKS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LINKS.get_or_init(|| {
+        let html = embedded(INDEX).map_or_else(String::new, |f| {
+            String::from_utf8_lossy(&f.data).into_owned()
+        });
+        html.match_indices("<link rel=\"stylesheet\"")
+            .filter_map(|(i, _)| html[i..].find('>').map(|end| &html[i..=i + end]))
+            .collect()
+    })
+}
+
 fn index(method: &Method, headers: &HeaderMap) -> Response {
     match embedded(INDEX) {
         Some(file) => embedded_response(INDEX, file, method, headers, "no-cache"),
