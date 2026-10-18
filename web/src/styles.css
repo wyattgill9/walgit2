@@ -152,7 +152,6 @@ textarea:focus { border-color: var(--l7); background: var(--l2); }
 .topnav-link.active { color: var(--la); }
 .topnav-link:hover::after,
 .topnav-link.active::after { width: 100%; }
-.theme-toggle { background: none; border: 0; padding: 0; font: inherit; font-size: 12px; cursor: pointer; }
 
 .container {
   max-width: var(--w);
@@ -1248,7 +1247,7 @@ input.text.small { font-size: 11px; padding: 2px 6px; margin-left: 8px; }
 
 /* D51/D52: the signed-in menu in the top bar (a native <details>). */
 .user-menu { position: relative; }
-.user-menu > summary { list-style: none; cursor: pointer; }
+.user-menu > summary { list-style: none; cursor: pointer; margin-top: 0; } /* not `details summary`'s 8px */
 .user-menu > summary::-webkit-details-marker { display: none; }
 .user-pop {
   position: absolute;

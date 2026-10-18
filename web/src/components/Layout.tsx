@@ -1,5 +1,5 @@
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
-import { useState, type ReactNode } from "react";
+import type { ReactNode } from "react";
 import { RouteBoundary, TopProgress, useBusy } from "./Loading";
 import { ErrorTray } from "./ErrorTray";
 import { InstanceFooter } from "./InstanceFooter";
@@ -20,7 +20,6 @@ export function Layout() {
           <NavLink to={apiHref} className={({ isActive }) => (isActive ? "topnav-link active" : "topnav-link")}>
             /api
           </NavLink>
-          <ThemeToggle />
           <UserMenu />
         </nav>
       </header>
@@ -33,30 +32,6 @@ export function Layout() {
       <ErrorTray />
       <InstanceFooter />
     </>
-  );
-}
-
-/** Dark is the default; the choice is kept per browser (index.html applies it before paint). */
-function ThemeToggle() {
-  const [theme, setTheme] = useState(() => document.documentElement.dataset.theme ?? "dark");
-  const next = theme === "dark" ? "light" : "dark";
-  return (
-    <button
-      type="button"
-      className="topnav-link theme-toggle"
-      aria-label={`Switch to ${next} theme`}
-      onClick={() => {
-        document.documentElement.dataset.theme = next;
-        try {
-          localStorage.setItem("theme", next);
-        } catch {
-          // storage blocked (private mode): the choice lasts for this page only
-        }
-        setTheme(next);
-      }}
-    >
-      /{next}
-    </button>
   );
 }
 
