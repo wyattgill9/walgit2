@@ -52,8 +52,8 @@ fn needs_token(cfg: &Config) -> bool {
 pub struct Recipes {
     pub base_url: String,
     pub host: String,
-    /// Where a signed-in browser mints an access token (`oidc` mode with a session secret),
-    /// `None` when tokens come from the server's config or no credential is needed.
+    /// Where a signed-in browser mints an access token (OIDC or password sign-in, with a session
+    /// secret); `None` when tokens come from the server's config or no credential is needed.
     pub token_url: Option<String>,
     /// `sh -c "$(curl … /services/public/install.sh[?repo=owner/name])"` — installs the helper
     /// and, with `repo`, execs straight into `git clone`.
@@ -86,14 +86,15 @@ pub fn host_of(base_url: &str) -> &str {
 pub fn recipes(cfg: &Config, base_url: &str, repo: Option<&str>) -> Recipes {
     let base_url = base_url.trim_end_matches('/').to_string();
     let host = host_of(&base_url).to_string();
-    let token_url = (cfg.server.auth.mode == AuthMode::Oidc
-        && cfg
-            .server
-            .auth
+    // Tokens are minted (session_secret) by a browser that can sign in: OIDC or, D52, a password.
+    let auth = &cfg.server.auth;
+    let token_url = (auth.mode != AuthMode::None
+        && auth
             .session_secret
             .as_deref()
-            .is_some_and(|s| !s.is_empty()))
-    .then(|| format!("{base_url}/_auth/tokens"));
+            .is_some_and(|s| !s.is_empty())
+        && (auth.mode == AuthMode::Oidc || auth.passwords != walgit_config::PasswordAccounts::Off))
+        .then(|| format!("{base_url}/_auth/tokens"));
     let install_url = match repo {
         Some(r) => format!("{base_url}/services/public/install.sh?repo={r}"),
         None => format!("{base_url}/services/public/install.sh"),
@@ -106,9 +107,11 @@ pub fn recipes(cfg: &Config, base_url: &str, repo: Option<&str>) -> Recipes {
     // The URL is single-quoted inside the substitution: an unquoted `?repo=` is a glob in zsh.
     let install = format!("sh -c \"$(curl -fsSL{insecure} '{install_url}')\"");
     let ca_url = self_signed(cfg).then(|| format!("{base_url}/services/public/ca.pem"));
+    // Pasted into whatever shell the person uses (bash, zsh, fish): `~` and `&&` only, no
+    // `${…:-…}` or `$(…)`.
     let trust = ca_url.as_ref().map(|ca| {
-        let file = format!("${{XDG_CONFIG_HOME:-$HOME/.config}}/git/{}", ca_file(&host));
-        format!("mkdir -p \"$(dirname \"{file}\")\" && curl -fsSk \"{ca}\" -o \"{file}\" && git config --global http.https://{host}/.sslCAInfo \"{file}\"")
+        let file = format!("~/.config/git/{}", ca_file(&host));
+        format!("curl --create-dirs -fsSk {ca} -o {file} && git config --global http.https://{host}/.sslCAInfo {file}")
     });
     let url = match repo {
         Some(r) => format!("{base_url}/{r}.git"),
@@ -257,17 +260,26 @@ pub fn install_script(cfg: &Config, base_url: &str, repo: Option<&str>) -> Strin
              \x20   echo \"  or re-run the installer from a terminal\" >&2\n\
              \x20   exit 2\n\
              \x20 fi\n\
-             \x20 printf '%s: paste an access token (%s): ' \"$HOST\" \"{token_from}\" >>\"$TTY\"\n\
+             \x20 printf '%s: paste an access token ({wgt}%s): ' \"$HOST\" \"{token_from}\" >>\"$TTY\"\n\
              \x20 stty -echo <\"$TTY\" 2>/dev/null || true\n\
              \x20 IFS= read -r T <\"$TTY\" || T=\"\"\n\
              \x20 stty echo <\"$TTY\" 2>/dev/null || true\n\
              \x20 echo >>\"$TTY\"\n\
+             \x20 # The paste is hidden: forgive a whole pasted command line or stray whitespace.\n\
+             \x20 W=\"$(printf '%s\\n' \"$T\" | sed -n 's/.*\\(wgt_[A-Za-z0-9._-]*\\).*/\\1/p')\"\n\
+             \x20 if [ -n \"$W\" ]; then T=\"$W\"; else T=\"$(printf '%s' \"$T\" | tr -d ' \\t\\r')\"; fi\n\
              \x20 [ -n \"$T\" ] || {{ echo \"$HOST: no token given\" >&2; exit 1; }}\n\
              \x20 ( umask 077; printf '%s\\n' \"$T\" > \"$TF.tmp\" && mv \"$TF.tmp\" \"$TF\" )\n\
              fi\n\
              TOKEN=\"${{WALGIT_TOKEN:-$(cat \"$TF\")}}\"\n\
              AUTH=\"Authorization: Bearer $TOKEN\"\n",
             token_file = token_file(host),
+            // Issued tokens look like this; static ones are whatever the operator chose.
+            wgt = if r.token_url.is_some() {
+                "wgt_…; "
+            } else {
+                ""
+            },
             // Inside a double-quoted sh string: the command carries `"`, `$(` and `'`.
             reinstall = r
                 .install
@@ -286,8 +298,8 @@ pub fn install_script(cfg: &Config, base_url: &str, repo: Option<&str>) -> Strin
         ),
         None => format!(
             "# Self-test: the token against the server (repository-independent, so it holds on an empty server).\n\
-             WHO=\"$(curl -fsS {curl_ca} -H \"$AUTH\" \"{base}/api/v1/me\")\" || {{ echo \"$HOST: self-test failed — {base}/api/v1/me refused the token ({token_from})\" >&2; exit 1; }}\n\
-             ACCOUNT=\"$(printf '%s' \"$WHO\" | sed -n 's/.*\"principal\":\"\\([^\"]*\\)\".*/\\1/p')\"\n",
+             WHO=\"$(curl -fsS {curl_ca} -H \"$AUTH\" \"{base}/api/v1/me\")\" || {{ echo \"$HOST: self-test failed — {base}/api/v1/me refused the token ({token_from}); it was removed, re-run to paste another\" >&2; case \"${{TOKEN:-}}\" in wgt_*) echo \"$HOST: (it was a wgt_ token of ${{#TOKEN}} characters: expired, or for an account this server no longer has)\" >&2 ;; ?*) echo \"$HOST: (it was ${{#TOKEN}} characters and does not start with wgt_ — not a token from the token page)\" >&2 ;; esac; [ -z \"${{TF:-}}\" ] || [ -n \"${{WALGIT_TOKEN:-}}\" ] || rm -f \"$TF\"; exit 1; }}\n\
+             ACCOUNT=\"$(printf '%s' \"$WHO\" | sed -n 's/.*\"login\":\"\\([^\"]*\\)\".*/\\1/p')\"\n",
             base = r.base_url,
         ),
     };
@@ -316,7 +328,12 @@ pub fn install_script(cfg: &Config, base_url: &str, repo: Option<&str>) -> Strin
              \x20  fi\n\
              \x20  ;;\n\
              esac\n",
-            install = r.install,
+            // Inside a double-quoted sh string: print the command, don't run its `$(curl …)`.
+            install = r
+                .install
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('$', "\\$"),
             base = r.base_url,
         ),
     };
@@ -445,6 +462,11 @@ mod tests {
         let r = recipes(&st, BASE, None);
         assert!(r.token_url.is_none());
         assert!(r.setup_text.contains("issued by whoever runs this server"));
+        // D52: password sign-in on that server mints them at the token page.
+        st.server.auth.passwords = walgit_config::PasswordAccounts::Open;
+        st.server.auth.session_secret = Some("x".repeat(32));
+        let r = recipes(&st, BASE, None);
+        assert_eq!(r.token_url, Some(format!("{BASE}/_auth/tokens")));
 
         // No auth at all: nothing about tokens.
         let r = recipes(&Config::default(), "http://localhost:8080", None);
@@ -466,6 +488,7 @@ mod tests {
             trust.contains("http.https://walgit.localhost:8888/.sslCAInfo"),
             "{trust}"
         );
+        assert!(!trust.contains('$'), "any shell (fish too): {trust}");
         assert!(
             r.install.starts_with("sh -c \"$(curl -fsSLk "),
             "{}",
@@ -614,6 +637,13 @@ mod tests {
             std::fs::read_to_string(&gitconfig).unwrap()
         };
         let first = run();
+        let out = run_installer(&dir, &install_script(&oidc_cfg(), BASE, None), &[]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("git authenticates as dev"), "{stdout}");
+        assert!(
+            stdout.contains("From a local git tree: sh -c \"$(curl -fsSL"),
+            "the hint prints the command instead of running it: {stdout}"
+        );
         let second = run();
         assert_eq!(first, second, "a second run must change nothing");
         let tf = dir.path().join("xdg/git").join(token_file(HOST));
@@ -654,6 +684,40 @@ mod tests {
         );
     }
 
+    /// A token the server refuses (a typo, an expired one) must not stick: the run fails, the
+    /// token is gone, and the next run asks again instead of failing the same way forever.
+    #[test]
+    fn installer_drops_a_refused_token_and_asks_again() {
+        let dir = installer_harness();
+        let curl = dir.path().join("bin/curl");
+        let ok = std::fs::read_to_string(&curl).unwrap();
+        std::fs::write(&curl, "#!/bin/sh\nexit 22\n").unwrap();
+        std::fs::write(dir.path().join("tty"), "root\n").unwrap();
+        let script = install_script(&oidc_cfg(), BASE, None);
+        let out = run_installer(&dir, &script, &[]);
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("re-run to paste another"), "{err}");
+        assert!(err.contains("does not start with wgt_"), "{err}");
+        let tf = dir.path().join("xdg/git").join(token_file(HOST));
+        assert!(!tf.exists(), "the refused token was kept");
+
+        std::fs::write(&curl, ok).unwrap();
+        // The token page's whole command pasted at the prompt: the token is picked out of it.
+        std::fs::write(
+            dir.path().join("tty"),
+            "WALGIT_TOKEN=wgt_good sh -c \"$(curl -fsSL x)\"\n",
+        )
+        .unwrap();
+        let out = run_installer(&dir, &script, &[]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(&tf).unwrap(), "wgt_good\n");
+    }
+
     /// Fake `curl` (the self-test's server) under `<dir>/bin`; real git throughout.
     fn installer_harness() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -661,7 +725,7 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::write(
             bin.join("curl"),
-            "#!/bin/sh\necho '{\"principal\":\"dev@example.com\",\"write\":true}'\nexit 0\n",
+            "#!/bin/sh\necho '{\"login\":\"dev\",\"can_create\":true}'\nexit 0\n",
         )
         .unwrap();
         #[cfg(unix)]

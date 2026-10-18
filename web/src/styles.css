@@ -152,7 +152,6 @@ textarea:focus { border-color: var(--l7); background: var(--l2); }
 .topnav-link.active { color: var(--la); }
 .topnav-link:hover::after,
 .topnav-link.active::after { width: 100%; }
-.theme-toggle { background: none; border: 0; padding: 0; font: inherit; font-size: 12px; cursor: pointer; }
 
 .container {
   max-width: var(--w);
@@ -1248,7 +1247,7 @@ input.text.small { font-size: 11px; padding: 2px 6px; margin-left: 8px; }
 
 /* D51/D52: the signed-in menu in the top bar (a native <details>). */
 .user-menu { position: relative; }
-.user-menu > summary { list-style: none; cursor: pointer; }
+.user-menu > summary { list-style: none; cursor: pointer; margin-top: 0; } /* not `details summary`'s 8px */
 .user-menu > summary::-webkit-details-marker { display: none; }
 .user-pop {
   position: absolute;
@@ -1268,3 +1267,15 @@ input.text.small { font-size: 11px; padding: 2px 6px; margin-left: 8px; }
 .form-grid { display: grid; gap: 10px; max-width: 32rem; }
 .form-grid label { display: grid; gap: 4px; font-size: 12.5px; }
 .form-grid input, .form-grid select { font: inherit; padding: 6px 8px; background: var(--l1); color: inherit; border: 1px solid var(--l4); }
+
+/* The server-rendered /_auth/* pages (sign in, sign up, password, token; crates/walgit-server/src/web/login.rs)
+   link this stylesheet and wrap their form in `.auth`. */
+.auth { max-width: 26rem; margin: 24px auto 0; }
+.auth .page-title { margin-bottom: 16px; }
+.auth form { display: grid; gap: 12px; }
+.auth label { display: grid; gap: 4px; font-size: 12.5px; color: var(--l8); }
+.auth input:not([type="hidden"]) { width: 100%; padding: 7px 9px; }
+.auth .btn { justify-content: center; padding: 7px 10px; font-size: 12px; }
+.auth p:first-child { margin-top: 0; }
+.auth pre { white-space: pre-wrap; word-break: break-all; }
+.auth-alt { margin: 16px 0 0; font-size: 12px; }

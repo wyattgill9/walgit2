@@ -544,44 +544,23 @@ fn welcome_page(
     } else {
         login.to_string()
     };
-    let html = WELCOME_PAGE
-        .replace("{{email}}", &html_escape(&id.email))
-        .replace("{{pending}}", &html_escape(pending))
-        .replace("{{next}}", &html_escape(next))
-        .replace("{{login}}", &html_escape(&suggestion))
-        .replace(
-            "{{error}}",
-            &if error.is_empty() {
-                String::new()
-            } else {
-                format!("<p class=\"err\">{}</p>", html_escape(error))
-            },
-        );
-    let mut r = (status, axum::response::Html(html)).into_response();
-    r.headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    r
-}
-
-const WELCOME_PAGE: &str = r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>walgit · choose a username</title>
-<style>
-body{font:15px/1.5 system-ui,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem;color:#1a1a1a}
-input{font:inherit;padding:.45rem .6rem;border:1px solid #999;border-radius:6px;width:100%;box-sizing:border-box}
-button{font:inherit;padding:.5rem 1rem;border-radius:6px;border:1px solid #999;background:#fff;cursor:pointer;margin-top:.8rem}
-.muted{color:#666}.err{color:#b00020}
-</style></head><body>
-<h1>Welcome to walgit</h1>
-<p>You signed in as <b>{{email}}</b>. Choose your username: it is your namespace (<code>/username/repository</code>) and how others mention and assign you.</p>
-{{error}}
+    let body = format!(
+        r#"<p class="muted">Signed in as <strong>{email}</strong>. Your username is your namespace (<code>/username/repository</code>) and how others mention and assign you.</p>
 <form method="post" action="/_auth/welcome">
-<input type="hidden" name="pending" value="{{pending}}">
-<input type="hidden" name="next" value="{{next}}">
-<label for="login">Username</label>
-<input id="login" name="login" value="{{login}}" required maxlength="39" pattern="[a-z0-9]+(-[a-z0-9]+)*" autocomplete="username" autofocus>
-<p class="muted">Lowercase letters, digits and single hyphens, up to 39 characters.</p>
-<button type="submit">Create account</button>
-</form></body></html>"#;
+<input type="hidden" name="pending" value="{pending}">
+<input type="hidden" name="next" value="{next}">
+<label>Username
+<input name="login" value="{login}" required maxlength="39" pattern="[a-z0-9]+(-[a-z0-9]+)*" autocomplete="username" autofocus>
+<span class="muted small">Lowercase letters, digits and single hyphens, up to 39 characters.</span></label>
+<button type="submit" class="btn primary">Create account</button>
+</form>"#,
+        email = html_escape(&id.email),
+        pending = html_escape(pending),
+        next = html_escape(next),
+        login = html_escape(&suggestion),
+    );
+    page("Choose a username", error, &body, status)
+}
 
 #[derive(serde::Deserialize, Default)]
 struct ClaimedQuery {
@@ -775,13 +754,10 @@ async fn tokens_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Res
         .trim_end_matches('/')
         .to_string();
     let ttl_days = st.auth.access_token_ttl().as_secs() / 86400;
-    let html = TOKENS_PAGE
+    let body = TOKENS_BODY
         .replace("{{host}}", &html_escape(&host))
         .replace("{{ttl_days}}", &ttl_days.to_string());
-    let mut r = axum::response::Html(html).into_response();
-    r.headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    r
+    page("Access token", "", &body, StatusCode::OK)
 }
 
 fn html_escape(s: &str) -> String {
@@ -791,37 +767,37 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-const TOKENS_PAGE: &str = r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>walgit · access token</title>
-<style>
-body{font:15px/1.5 system-ui,sans-serif;max-width:44rem;margin:4rem auto;padding:0 1rem;color:#1a1a1a}
-pre{background:#f4f4f5;padding:.8rem 1rem;border-radius:6px;overflow:auto;white-space:pre-wrap;word-break:break-all}
-button{font:inherit;padding:.5rem 1rem;border-radius:6px;border:1px solid #999;background:#fff;cursor:pointer}
-.muted{color:#666}
-</style></head><body>
-<h1>Access token for <code>{{host}}</code></h1>
-<p>A token lets <code>git</code> and scripts act as you for {{ttl_days}} days. It is shown once; walgit does not store it.</p>
-<p><button id="mint">Create a token</button></p>
+const TOKENS_BODY: &str = r#"<p class="muted">A token lets <code>git</code> and scripts on <code>{{host}}</code> act as you for {{ttl_days}} days. It is shown once; walgit does not store it.</p>
+<form id="mint-form"><button id="mint" type="submit" class="btn primary">Create a token</button></form>
+<p id="mint-err" class="flash error" hidden></p>
 <div id="out" hidden>
-<p>Store it for git (uses <code>git credential-store</code>; the token is the password):</p>
-<pre id="cmd"></pre>
-<p class="muted">Or send it as <code>Authorization: Bearer &lt;token&gt;</code>. Tokens cannot be listed or revoked one by one; rotating the server's <code>session_secret</code> revokes them all.</p>
+<div class="row gap"><input id="token" readonly aria-label="Access token" style="flex:1"><button id="copy" type="button" class="btn primary">Copy</button></div>
+<p>Copy it now. When <code>git push</code> asks:</p>
+<pre class="code-block">Username: <span id="login"></span>
+Password: &lt;paste the token&gt;</pre>
+<p class="muted small">Git keeps it in its credential store, so it asks once (if <code>git config --global credential.helper</code> prints nothing, set it to <code>store</code>).</p>
+<p class="muted small">Or send it as <code>Authorization: Bearer &lt;token&gt;</code>. Tokens cannot be listed or revoked one by one; rotating the server's <code>session_secret</code> revokes them all.</p>
 </div>
 <script>
-document.getElementById('mint').onclick = async () => {
+document.getElementById('mint-form').onsubmit = async (e) => {
+  e.preventDefault();
   const r = await fetch('/_auth/tokens', {method:'POST', credentials:'same-origin'});
-  if (!r.ok) { alert('could not mint a token: HTTP ' + r.status); return; }
+  if (!r.ok) { const p = document.getElementById('mint-err'); p.textContent = 'Could not create a token: HTTP ' + r.status; p.hidden = false; return; }
   const j = await r.json();
-  const host = location.host;
-  document.getElementById('cmd').textContent =
-    `git config --global credential.https://${host}.helper store
-` +
-    `printf 'protocol=https\nhost=${host}\nusername=${j.login}\npassword=${j.token}\n' | git credential approve
-`;
+  // An input, not a <pre>: selecting a block copies its line ending too, and git refuses a
+  // password with a carriage return. Copy puts exactly the token on the clipboard.
+  const t = document.getElementById('token');
+  t.value = j.token;
+  t.onfocus = () => t.select();
+  document.getElementById('copy').onclick = async (ev) => {
+    try { await navigator.clipboard.writeText(j.token); ev.target.textContent = 'Copied'; }
+    catch { t.focus(); ev.target.textContent = 'Press Ctrl+C'; }
+  };
+  document.getElementById('login').textContent = j.login;
   document.getElementById('out').hidden = false;
   document.getElementById('mint').disabled = true;
 };
-</script></body></html>"#;
+</script>"#;
 
 fn cookie_site(st: &AppState, secure: bool) -> &'static str {
     if !st.cfg.server.cors_origins.is_empty() && secure {
@@ -843,22 +819,25 @@ fn cross_site(headers: &HeaderMap) -> bool {
         .is_some_and(|v| v != "same-origin" && v != "none")
 }
 
-fn page(title: &str, body: &str, status: StatusCode) -> Response {
+/// Every `/_auth/*` page: the SPA's stylesheet and top bar around one narrow column.
+fn page(title: &str, error: &str, body: &str, status: StatusCode) -> Response {
+    let error = if error.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<p class=\"flash error\" role=\"alert\">{}</p>",
+            html_escape(error)
+        )
+    };
     let html = AUTH_PAGE
+        .replace("{{styles}}", crate::web::ui::stylesheets())
         .replace("{{title}}", &html_escape(title))
+        .replace("{{error}}", &error)
         .replace("{{body}}", body);
     let mut r = (status, axum::response::Html(html)).into_response();
     r.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     r
-}
-
-fn error_line(error: &str) -> String {
-    if error.is_empty() {
-        String::new()
-    } else {
-        format!("<p class=\"err\">{}</p>", html_escape(error))
-    }
 }
 
 fn login_page(st: &AppState, next: &str, login: &str, error: &str, status: StatusCode) -> Response {
@@ -875,22 +854,23 @@ fn login_page(st: &AppState, next: &str, login: &str, error: &str, status: Statu
         ));
     }
     let body = format!(
-        r#"<h1>Sign in to walgit</h1>{error}
-<form method="post" action="/_auth/login">
+        r#"<form method="post" action="/_auth/login">
 <input type="hidden" name="next" value="{next}">
-<label for="login">Username</label>
-<input id="login" name="login" value="{login}" required autocomplete="username" autofocus>
-<label for="password">Password</label>
-<input id="password" name="password" type="password" required autocomplete="current-password">
-<button type="submit">Sign in</button>
+<label>Username
+<input name="login" value="{login}" required autocomplete="username"{focus_login}></label>
+<label>Password
+<input name="password" type="password" required autocomplete="current-password"{focus_password}></label>
+<button type="submit" class="btn primary">Sign in</button>
 </form>
-<p class="muted">{links}</p>"#,
-        error = error_line(error),
+<p class="auth-alt muted">{links}</p>"#,
         next = html_escape(next),
         login = html_escape(login),
         links = links.join(" · "),
+        // Back with an error: the username is filled in, so type the password again.
+        focus_login = if login.is_empty() { " autofocus" } else { "" },
+        focus_password = if login.is_empty() { "" } else { " autofocus" },
     );
-    page("Sign in", &body, status)
+    page("Sign in to walgit", error, &body, status)
 }
 
 #[derive(serde::Deserialize)]
@@ -959,28 +939,26 @@ async fn password_login(
 
 fn signup_page(next: &str, login: &str, email: &str, error: &str, status: StatusCode) -> Response {
     let body = format!(
-        r#"<h1>Create your account</h1>{error}
-<form method="post" action="/_auth/signup">
+        r#"<form method="post" action="/_auth/signup">
 <input type="hidden" name="next" value="{next}">
-<label for="login">Username</label>
-<input id="login" name="login" value="{login}" required maxlength="39" pattern="[a-z0-9]+(-[a-z0-9]+)*" autocomplete="username" autofocus>
-<p class="muted">Your namespace (<code>/username/repository</code>): lowercase letters, digits and single hyphens.</p>
-<label for="email">Email <span class="muted">(optional)</span></label>
-<input id="email" name="email" type="email" value="{email}" autocomplete="email">
-<label for="password">Password</label>
-<input id="password" name="password" type="password" required minlength="8" autocomplete="new-password">
-<label for="confirm">Password again</label>
-<input id="confirm" name="confirm" type="password" required minlength="8" autocomplete="new-password">
-<button type="submit">Create account</button>
+<label>Username
+<input name="login" value="{login}" required maxlength="39" pattern="[a-z0-9]+(-[a-z0-9]+)*" autocomplete="username" autofocus>
+<span class="muted small">Your namespace (<code>/username/repository</code>): lowercase letters, digits and single hyphens.</span></label>
+<label><span>Email <span class="muted">(optional)</span></span>
+<input name="email" type="email" value="{email}" autocomplete="email"></label>
+<label>Password
+<input name="password" type="password" required minlength="8" autocomplete="new-password"></label>
+<label>Password again
+<input name="confirm" type="password" required minlength="8" autocomplete="new-password"></label>
+<button type="submit" class="btn primary">Create account</button>
 </form>
-<p class="muted">Already have one? <a href="/_auth/login?next={next_q}">Sign in</a>.</p>"#,
-        error = error_line(error),
+<p class="auth-alt muted">Already have one? <a href="/_auth/login?next={next_q}">Sign in</a>.</p>"#,
         next = html_escape(next),
         next_q = urlencode(next),
         login = html_escape(login),
         email = html_escape(email),
     );
-    page("Create your account", &body, status)
+    page("Create your account", error, &body, status)
 }
 
 /// `GET /_auth/signup` (`passwords = "open"`).
@@ -1119,22 +1097,22 @@ pub(crate) async fn set_password(
 }
 
 fn password_page(error: &str, done: bool, status: StatusCode) -> Response {
-    let body = if done {
-        "<h1>Password changed</h1><p><a href=\"/\">Back to walgit</a></p>".to_string()
-    } else {
-        format!(
-            r#"<h1>Change your password</h1>{error}
-<form method="post" action="/_auth/password">
-<label for="current">Current password <span class="muted">(if you have one)</span></label>
-<input id="current" name="current" type="password" autocomplete="current-password">
-<label for="password">New password</label>
-<input id="password" name="password" type="password" required minlength="8" autocomplete="new-password">
-<button type="submit">Change password</button>
-</form>"#,
-            error = error_line(error)
-        )
-    };
-    page("Change your password", &body, status)
+    if done {
+        return page(
+            "Password changed",
+            "",
+            "<p><a href=\"/settings\">Back to settings</a></p>",
+            status,
+        );
+    }
+    let body = r#"<form method="post" action="/_auth/password">
+<label><span>Current password <span class="muted">(if you have one)</span></span>
+<input name="current" type="password" autocomplete="current-password"></label>
+<label>New password
+<input name="password" type="password" required minlength="8" autocomplete="new-password"></label>
+<button type="submit" class="btn primary">Change password</button>
+</form>"#;
+    page("Change your password", error, body, status)
 }
 
 async fn password_form(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -1206,16 +1184,19 @@ async fn change_password(
     }
 }
 
+/// Same head as `web/index.html` (pre-paint theme, color-scheme) and the app's top bar.
 const AUTH_PAGE: &str = r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>walgit · {{title}}</title>
-<style>
-:root{color-scheme:light dark;--fg:#1a1a1a;--muted:#666;--line:#999;--bg:#fff;--err:#b00020}
-@media (prefers-color-scheme: dark){:root{--fg:#e8e8e8;--muted:#9a9a9a;--line:#555;--bg:#151515;--err:#ff6b81}}
-body{font:15px/1.5 system-ui,sans-serif;max-width:26rem;margin:4rem auto;padding:0 1rem;color:var(--fg);background:var(--bg)}
-label{display:block;margin-top:.8rem}
-input{font:inherit;padding:.45rem .6rem;border:1px solid var(--line);border-radius:6px;width:100%;box-sizing:border-box;background:transparent;color:inherit}
-button{font:inherit;padding:.5rem 1rem;border-radius:6px;border:1px solid var(--line);background:transparent;color:inherit;cursor:pointer;margin-top:1rem}
-a{color:inherit}.muted{color:var(--muted)}.err{color:var(--err)}
-</style></head><body>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="dark light">
+<script>try { var t = localStorage.getItem("theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<title>walgit · {{title}}</title>
+{{styles}}
+</head><body>
+<header class="topbar"><a href="/" class="brand">walgit/</a></header>
+<main class="container"><div class="auth">
+<h1 class="page-title">{{title}}</h1>
+{{error}}
+<div class="box"><div class="pad">
 {{body}}
+</div></div>
+</div></main>
 </body></html>"#;

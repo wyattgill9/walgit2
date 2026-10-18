@@ -219,6 +219,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             ),
         )
         .fallback(dispatch)
+        .layer(axum::middleware::from_fn(git_basic_challenge))
         // D51: one revalidation per repository per request (`access::authorize` syncs; the
         // handler's own sync reuses it).
         .layer(axum::middleware::from_fn(
@@ -284,6 +285,26 @@ async fn host_from_authority(mut req: Request<Body>) -> Request<Body> {
         req.headers_mut().insert(axum::http::header::HOST, v);
     }
     req
+}
+
+/// Plain `git` answers only a Basic challenge (its username/password prompt, then its own
+/// credential store), so a 401 on git's URLs also offers Basic: the password is a walgit
+/// access token, the username is ignored. Pages and the API keep Bearer only — a browser
+/// would pop its native password dialog there.
+async fn git_basic_challenge(req: Request<Body>, next: axum::middleware::Next) -> Response {
+    let p = req.uri().path();
+    let git = p.ends_with("/info/refs")
+        || p.ends_with("/git-upload-pack")
+        || p.ends_with("/git-receive-pack")
+        || p.contains("/info/lfs/");
+    let mut resp = next.run(req).await;
+    if git && resp.status() == axum::http::StatusCode::UNAUTHORIZED {
+        resp.headers_mut().append(
+            axum::http::header::WWW_AUTHENTICATE,
+            axum::http::HeaderValue::from_static("Basic realm=\"walgit\""),
+        );
+    }
+    resp
 }
 
 fn panic_response(err: Box<dyn std::any::Any + Send + 'static>) -> Response {

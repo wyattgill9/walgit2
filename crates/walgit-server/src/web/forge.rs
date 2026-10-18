@@ -23,7 +23,7 @@ use walgit_wal::forge::{Item, SearchPage, TimelineItem};
 use crate::AppState;
 use crate::access::{Role, auth_err};
 use crate::error::ApiError;
-use crate::web::api::{REPO_API_BASES, json_swr};
+use crate::web::api::{REPO_API_BASES, json_fresh};
 
 pub fn router(state: Arc<AppState>) -> Router {
     let mut r = Router::new();
@@ -243,7 +243,7 @@ async fn list<const PULL: bool>(
     let kind = if PULL { "is:pr" } else { "is:issue" };
     let query = format!("{kind} {}", q.q.as_deref().unwrap_or("is:open"));
     let page: SearchPage = handle.forge_read(|s| s.search(&query, q.page.unwrap_or(1)));
-    Ok(json_swr(&page, None).into_response(&headers))
+    Ok(json_fresh(&page).into_response(&headers))
 }
 
 async fn detail<const PULL: bool>(
@@ -252,7 +252,7 @@ async fn detail<const PULL: bool>(
     Path((owner, repo, number)): Path<(String, String, u64)>,
 ) -> Result<Response, ApiError> {
     let handle = synced(&st, &headers, &owner, &repo).await?;
-    Ok(json_swr(&detail_of(&handle, number, PULL)?, None).into_response(&headers))
+    Ok(json_fresh(&detail_of(&handle, number, PULL)?).into_response(&headers))
 }
 
 /// Publishes `events` as the signed-in account (D51 security 2: reading a public repository
@@ -604,7 +604,7 @@ async fn summary(
             open_pulls: open("pull"),
         }
     });
-    Ok(json_swr(&s, None).into_response(&headers))
+    Ok(json_fresh(&s).into_response(&headers))
 }
 
 #[derive(Serialize)]
@@ -646,7 +646,7 @@ async fn labels(
             })
             .collect()
     });
-    Ok(json_swr(&rows, None).into_response(&headers))
+    Ok(json_fresh(&rows).into_response(&headers))
 }
 
 #[derive(Deserialize)]

@@ -2,28 +2,54 @@ import { Link, useParams } from "react-router-dom";
 import { api } from "../api";
 import { useResolved } from "../use-resolved";
 import { useRepo } from "./RepoLayout";
+import { useData } from "../data";
 import { Box } from "../components/Layout";
 import { relTime } from "../format";
 import { RefBar } from "../components/RefBar";
 import { Markdown } from "../components/Markdown";
 import { Avatar } from "../components/CommitRow";
+import { useRecipes } from "../components/CloneSetup";
 
 export function TreePage() {
   const { full, refs } = useRepo();
   const rest = useParams()["*"] ?? "";
-  if (!refs.head) {
-    return (
-      <Box title="Setup">
-        <div className="pad">
-          <p>This repository is empty. Push to <code>{full}.git</code>:</p>
-          <pre className="code-block">
-            git remote add origin {location.origin}/{full}.git{"\n"}git push -u origin HEAD
-          </pre>
-        </div>
-      </Box>
-    );
-  }
+  if (!refs.head) return <EmptyRepo full={full} />;
   return <TreeView full={full} rest={rest} />;
+}
+
+/** Plain git, nothing installed: git prompts on the 401 and keeps the token in its own
+ * credential store. Commands are the server's recipes (`setup.rs`), safe in any shell. */
+function EmptyRepo({ full }: { full: string }) {
+  const r = useRecipes();
+  const me = useData("me", () => api.me(), 60_000);
+  let step = 0;
+  return (
+    <Box title="Push your code">
+      <div className="pad">
+        <p>This repository is empty. In your project folder (with at least one commit):</p>
+        {r.trust && (
+          <>
+            <p className="muted small">{++step}. Once per computer: trust this host's self-signed certificate.</p>
+            <pre className="code-block">{r.trust}</pre>
+          </>
+        )}
+        {r.token_url && (
+          <p className="muted small">
+            {++step}. <a href={r.token_url}>Create an access token</a> and copy it.
+          </p>
+        )}
+        <p className="muted small">{++step}. Push:</p>
+        <pre className="code-block">
+          git remote add origin {r.base_url}/{full}.git{"\n"}git push -u origin HEAD
+        </pre>
+        {r.token_url && (
+          <p className="muted small">
+            When git asks: <strong>Username</strong> {me.anonymous ? "your username" : me.login}, <strong>Password</strong> the token.
+          </p>
+        )}
+      </div>
+    </Box>
+  );
 }
 
 function TreeView({ full, rest }: { full: string; rest: string }) {

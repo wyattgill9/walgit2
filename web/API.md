@@ -123,6 +123,11 @@ sha-addressed call (immutable — usually a cache hit on revisits, back
 button, ref switch that lands on the same commit). `refs` is fetched once
 per repository visit.
 
+Read your writes: for 60 s (the SWR window) after a successful write, a client
+revalidates its ref-dependent reads (`fetch(…, {cache: "no-cache"})`) instead of
+taking the browser's stale copy — `repos.js` does this, so a merge shows the
+moved branch at once.
+
 **Guidance for implementers** (this is where a monorepo-scale host wins or
 loses):
 
@@ -510,7 +515,8 @@ list by `commit_date` day and shows `subject` + `author`.
 ### Issues (D50, `docs/FORGE.md`)
 
 Issues are WAL forge events; every answer folds them at refs level (no objects), so a
-read after an acknowledged write sees it on any instance. Cache: SWR.
+read after an acknowledged write sees it on any instance. Cache: `private, no-cache` (no
+sha-addressed second step makes a stale copy safe, so the browser revalidates every read).
 
 - `GET /{owner}/{repo}/api/issues?q=&page=` — one page of 25 plus GitHub's
   counts for the same query without its state filter:

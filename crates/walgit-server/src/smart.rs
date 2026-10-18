@@ -1160,6 +1160,9 @@ async fn receive_pack_process(
     }
     let mut txn = ev.publish;
     let mut per_ref_policy = ev.per_ref;
+    if let Ok(snap) = local.refs() {
+        default_branch_from_first_push(&snap, &mut txn);
+    }
 
     // Release the sync read guard before publishing. `publish_push_as`
     // reuses this request's freshness check while still syncing after CAS
@@ -1191,6 +1194,10 @@ async fn receive_pack_process(
         }
     };
     for (name, res) in per_ref_pub {
+        // Our own HEAD update (`default_branch_from_first_push`): git didn't send it.
+        if name == "HEAD" {
+            continue;
+        }
         if let Some(slot) = per_ref_policy.iter_mut().find(|(n, _)| *n == name) {
             slot.1 = res;
         } else {
@@ -1202,6 +1209,47 @@ async fn receive_pack_process(
 
     let report = build_report(&caps, unpack_result, &per_ref).await;
     Ok(report)
+}
+
+/// GitHub's rule: while HEAD names a branch that doesn't exist (a new repository's `main`),
+/// a push to branches makes one of them the default — `main` if it is among them,
+/// else the first. Without it a `master` push leaves the repository looking empty.
+fn default_branch_from_first_push(
+    snap: &walgit_git::RefSnapshotData,
+    txn: &mut walgit_proto::v1::RefTransaction,
+) {
+    if snap.refs.iter().any(|r| r.name == snap.head_target)
+        || txn.updates.iter().any(|u| u.name == "HEAD")
+    {
+        return;
+    }
+    let pushed: Vec<&str> = txn
+        .updates
+        .iter()
+        .filter(|u| {
+            u.name.starts_with("refs/heads/")
+                && u.new_symbolic_target.is_empty()
+                && !u.new_oid.is_empty()
+                && !u.new_oid.bytes().all(|b| b == b'0')
+        })
+        .map(|u| u.name.as_str())
+        .collect();
+    // Pushing the branch HEAD already names brings it into existence: nothing to move.
+    if pushed.contains(&snap.head_target.as_str()) {
+        return;
+    }
+    let Some(&branch) = pushed
+        .iter()
+        .find(|n| **n == "refs/heads/main")
+        .or(pushed.first())
+    else {
+        return;
+    };
+    txn.updates.push(walgit_proto::v1::RefUpdate {
+        name: "HEAD".into(),
+        new_symbolic_target: branch.into(),
+        ..Default::default()
+    });
 }
 
 async fn build_report(
@@ -1615,5 +1663,78 @@ pub(crate) fn wal_err(e: walgit_wal::WalError) -> ApiError {
             ApiError::ServiceUnavailable(format!("object store: {se}"))
         }
         _ => ApiError::Internal(format!("wal: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod default_branch_tests {
+    use super::default_branch_from_first_push;
+    use walgit_git::{Ref, RefSnapshotData};
+    use walgit_proto::v1::{RefTransaction, RefUpdate};
+
+    fn push(names: &[&str]) -> RefTransaction {
+        RefTransaction {
+            updates: names
+                .iter()
+                .map(|n| RefUpdate {
+                    name: (*n).into(),
+                    old_oid: "0".repeat(40),
+                    new_oid: "a".repeat(40),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+    fn head_of(txn: &RefTransaction) -> Option<&str> {
+        txn.updates
+            .iter()
+            .find(|u| u.name == "HEAD")
+            .map(|u| u.new_symbolic_target.as_str())
+    }
+    fn empty_repo() -> RefSnapshotData {
+        RefSnapshotData {
+            refs: vec![],
+            head_target: "refs/heads/main".into(),
+        }
+    }
+
+    #[test]
+    fn a_first_master_push_becomes_the_default_branch() {
+        let mut txn = push(&["refs/heads/master"]);
+        default_branch_from_first_push(&empty_repo(), &mut txn);
+        assert_eq!(head_of(&txn), Some("refs/heads/master"));
+    }
+
+    #[test]
+    fn main_wins_among_several_and_tags_never_do() {
+        let mut txn = push(&["refs/tags/v1", "refs/heads/dev", "refs/heads/main"]);
+        default_branch_from_first_push(&empty_repo(), &mut txn);
+        assert_eq!(head_of(&txn), None, "HEAD already names main: no update");
+        let snap = RefSnapshotData {
+            head_target: "refs/heads/trunk".into(),
+            ..empty_repo()
+        };
+        let mut txn = push(&["refs/tags/v1", "refs/heads/dev", "refs/heads/main"]);
+        default_branch_from_first_push(&snap, &mut txn);
+        assert_eq!(head_of(&txn), Some("refs/heads/main"));
+        let mut txn = push(&["refs/tags/v1"]);
+        default_branch_from_first_push(&empty_repo(), &mut txn);
+        assert_eq!(head_of(&txn), None);
+    }
+
+    #[test]
+    fn an_existing_default_branch_is_left_alone() {
+        let snap = RefSnapshotData {
+            refs: vec![Ref {
+                name: "refs/heads/main".into(),
+                oid: "b".repeat(40),
+                peeled: String::new(),
+            }],
+            head_target: "refs/heads/main".into(),
+        };
+        let mut txn = push(&["refs/heads/master"]);
+        default_branch_from_first_push(&snap, &mut txn);
+        assert_eq!(head_of(&txn), None);
     }
 }

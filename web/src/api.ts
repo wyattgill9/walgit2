@@ -148,13 +148,6 @@ export const api = {
     if (!r.ok) throw new Error(`setup.json: HTTP ${r.status}`);
     return r.json();
   },
-  /** The installer script text (`/services/public/*` — open, no credential). */
-  installScript: async (repo?: string): Promise<string> => {
-    const u = repo ? `/services/public/install.sh?repo=${enc(repo)}` : "/services/public/install.sh";
-    const r = await track(fetch(u, { headers: { Accept: "text/x-shellscript, text/plain" } }));
-    if (!r.ok) throw new Error(`install.sh: HTTP ${r.status}`);
-    return r.text();
-  },
 };
 
 /** Mirror of crates/walgit-server/src/setup.rs `Recipes`. */

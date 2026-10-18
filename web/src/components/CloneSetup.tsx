@@ -1,6 +1,6 @@
 import { api, type SetupRecipes } from "../api";
 import { useData } from "../data";
-import { CodeSample, CopyButton } from "./CopyButton";
+import { CodeSample } from "./CopyButton";
 
 /**
  * Clone/setup recipes for this host, rendered by the server at
@@ -22,38 +22,25 @@ export function CloneSetup({ repo, compact = false }: { repo: string; compact?: 
   const url = `${r.base_url}/${repo}.git`;
   return (
     <div className="clone-setup">
-      <div className="small strong">Run once per machine, then git just works</div>
-      <div className="small muted">
-        Asks for an access token once
-        {r.token_url && (
-          <>
-            {" "}
-            (create one at{" "}
-            <a href={r.token_url} target="_blank" rel="noreferrer">
-              {r.token_url.replace(/^https?:\/\//, "")}
-            </a>
-            )
-          </>
-        )}
-        , stores it in a file only you can read, installs a git credential helper that hands it to git, and clones. Idempotent: re-run any time. Needs git ≥ 2.46 and curl.
-      </div>
-      <CodeSample code={r.install} />
-      <div className="small strong">Already set up</div>
-      <CodeSample code={r.plain_clone} />
-      <div className="small strong">CI — no helper, the token from the environment</div>
-      <CodeSample code={r.manual_clone} />
-      <div className="clone-actions">
-        <CopyButton text={() => api.installScript(repo)} label="Copy installer script" />
-        <a className="btn btn-small" href={`/services/public/install.sh?repo=${repo}`} download="install.sh">
-          Download install.sh
-        </a>
-      </div>
-      {!compact && (
-        <p className="small muted">
-          The credential helper authenticates clones, fetches and pushes. When the server rejects the
-          token (a real 401) git erases it from the helper, which tells you where to get a new one.
-        </p>
+      {r.trust && (
+        <>
+          <div className="small strong">Once per computer: trust this host's certificate</div>
+          <CodeSample code={r.trust} />
+        </>
       )}
+      <div className="small strong">Clone</div>
+      <CodeSample code={r.plain_clone} />
+      {r.token_url && (
+        <div className="small muted">
+          When git asks: Username = your username, Password = an access token (
+          <a href={r.token_url} target="_blank" rel="noreferrer">
+            create one
+          </a>
+          ). Git keeps it in its credential store; a rejected token is forgotten and git asks again.
+        </div>
+      )}
+      <div className="small strong">CI — the token from the environment</div>
+      <CodeSample code={r.manual_clone} />
       {!compact && (
         <>
           <p className="small muted">
