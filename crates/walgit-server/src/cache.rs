@@ -177,11 +177,21 @@ impl RefIndex {
         }
     }
 
-    /// Default branch (short name, sha) if HEAD points at an existing branch.
+    /// Default branch (short name, sha): the branch HEAD names, or — while HEAD names one that
+    /// doesn't exist (pushed before a first push could name it, or deleted) — `main`, `master`,
+    /// else the first branch, so every page still opens on code with a branch picker.
+    /// `None` only when there are no branches.
     pub fn head(&self) -> Option<(String, String)> {
-        let short = self.head_target.strip_prefix("refs/heads/")?;
-        let (oid, _) = self.by_name.get(&self.head_target)?;
-        Some((short.to_string(), oid.clone()))
+        if let Some(short) = self.head_target.strip_prefix("refs/heads/")
+            && let Some((oid, _)) = self.by_name.get(&self.head_target)
+        {
+            return Some((short.to_string(), oid.clone()));
+        }
+        ["main", "master"]
+            .iter()
+            .find_map(|n| self.branches.iter().find(|(b, _)| b == n))
+            .or(self.branches.first())
+            .cloned()
     }
 
     /// Commit sha for a short branch name.
@@ -532,5 +542,35 @@ mod tests {
         );
         assert!(cache_ms <= render_ms, "cache should be faster");
         assert_eq!(cached.len(), advert_bytes);
+    }
+
+    #[test]
+    fn a_missing_default_branch_falls_back_to_one_that_exists() {
+        let snap = |head: &str, branches: &[&str]| walgit_git::RefSnapshotData {
+            refs: branches
+                .iter()
+                .map(|b| walgit_git::Ref {
+                    name: format!("refs/heads/{b}"),
+                    oid: format!("{b}-sha"),
+                    peeled: String::new(),
+                })
+                .collect(),
+            head_target: head.into(),
+        };
+        let head = |s| RefIndex::build(&s).head().map(|(n, _)| n);
+        assert_eq!(
+            head(snap("refs/heads/main", &["dev", "main"])).as_deref(),
+            Some("main")
+        );
+        // HEAD → main, only master pushed (a repository from before first-push naming).
+        assert_eq!(
+            head(snap("refs/heads/main", &["master", "a"])).as_deref(),
+            Some("master")
+        );
+        assert_eq!(
+            head(snap("refs/heads/main", &["zeta", "beta"])).as_deref(),
+            Some("beta")
+        );
+        assert_eq!(head(snap("refs/heads/main", &[])), None);
     }
 }
