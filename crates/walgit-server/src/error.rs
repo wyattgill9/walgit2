@@ -68,8 +68,8 @@ impl IntoResponse for ApiError {
         let mut resp = (status, msg).into_response();
         // RFC 6750: a 401 from a Bearer-protected resource MUST include
         // WWW-Authenticate. Auth failures (JWKS) surface as 401/503.
-        // RFC 6750: Bearer only. Never offer Basic: browsers would show a
-        // password dialog and there is no password-based way in.
+        // Bearer only here: a browser would show a password dialog. Git's URLs add
+        // Basic (`git_basic_challenge` in lib.rs) so plain git prompts for a token.
         if self.status() == StatusCode::UNAUTHORIZED {
             resp.headers_mut().insert(
                 axum::http::header::WWW_AUTHENTICATE,

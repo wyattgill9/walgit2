@@ -559,6 +559,15 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
   - **Not covered.** The OIDC welcome flow is still not exercised end to end by a test (its issuer must be
     https).
 
+- **D53 (2026-10-18): Plain git is the way in; the installer is for scripts.** A 401 on git's URLs
+  (`info/refs`, `git-upload-pack`, `git-receive-pack`, `info/lfs/`) offers `Basic realm="walgit"` beside
+  Bearer, so stock git prompts (username ignored, password = a walgit access token) and keeps it in the
+  user's own credential store; pages and the API stay Bearer-only (no browser password dialog). The UI
+  (empty repository, Clone menu, token page) shows only shell-agnostic commands — the certificate pin for
+  a self-signed host, `git clone`/`push` — never `$(…)`/`VAR=… cmd` forms that break in fish. The
+  installer (`/services/public/install.sh`) stays for CI and agents. Measured: a wrong paste in the
+  installer's hidden prompt, and its bash-only one-liner in fish, each blocked a first push.
+
 ## 5. Working rules
 
 - **No backwards compatibility (pre-1.0, banner at top):** change the shape and delete the old one in the same
