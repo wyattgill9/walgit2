@@ -488,6 +488,7 @@ export class ReposClient {
   readonly base: string;
   private opts: ClientOptions;
   private authInFlight: Promise<boolean> | null = null;
+  private wroteAt = 0;
 
   constructor(opts: ClientOptions = {}) {
     this.opts = { ...opts };
@@ -696,7 +697,14 @@ export class ReposClient {
       // `manual` turns that into an `opaqueredirect` we can act on.
       redirect = "manual";
     }
-    return f(url, { ...init, headers, credentials, redirect: redirect ?? init.redirect, mode: "cors" });
+    const write = !!init.method && init.method !== "GET" && init.method !== "HEAD";
+    // Read your writes: ref-dependent answers are `stale-while-revalidate=60` (API.md §2a), so
+    // for one such window after this client changed something its reads revalidate instead of
+    // taking the browser's stale copy (a merged branch, a renamed label).
+    const cache = init.cache ?? (!write && Date.now() - this.wroteAt < 60_000 ? "no-cache" : undefined);
+    const r = await f(url, { ...init, headers, credentials, cache, redirect: redirect ?? init.redirect, mode: "cors" });
+    if (write && r.ok) this.wroteAt = Date.now();
+    return r;
   }
 
   /** Read an SSE stream (GET/POST) and dispatch raw events. */

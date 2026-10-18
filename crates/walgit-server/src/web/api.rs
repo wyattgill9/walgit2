@@ -432,6 +432,11 @@ pub(crate) fn etag_for(sha: &str) -> String {
 pub(crate) fn json_swr<T: Serialize>(value: &T, etag: Option<&str>) -> Rendered {
     Rendered::json(json_bytes(value), SWR, etag.map(str::to_string))
 }
+/// Mutable state with no sha-addressed second step (forge): the browser revalidates every
+/// read, so a comment shows the moment it is acknowledged, wherever it was written.
+pub(crate) fn json_fresh<T: Serialize>(value: &T) -> Rendered {
+    Rendered::json(json_bytes(value), "private, no-cache", None)
+}
 fn json_bytes<T: Serialize>(value: &T) -> bytes::Bytes {
     bytes::Bytes::from(serde_json::to_vec(value).unwrap_or_default())
 }
